@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.1
+
+- Исправлены реальные entity_id силовых logical switch:
+  `switch.grid_power` и `switch.use_generator_as_power_source`.
+- Учтена положительная полярность `switch.grid_power`:
+  ON подключает Grid, OFF отключает Grid.
+- Добавлен adapter-тест инверсии `grid_power -> grid_disconnected`.
+
 ## 0.2.0
 
 - AppDaemon удалён из runtime-архитектуры.

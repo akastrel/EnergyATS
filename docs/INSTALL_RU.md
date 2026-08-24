@@ -22,7 +22,7 @@ homeassistant/packages/energy/automations.yaml
 
 в существующий `/config/packages/energy/`.
 
-В `energy.yaml` добавляются четыре ATS helper-а:
+В `energy.yaml` добавляются пять ATS helper-ов:
 
 ```text
 input_boolean.automatic_generator_transfer
@@ -102,8 +102,8 @@ EStop=False
 Особенно проверить семантику:
 
 ```text
-switch.disconnect_grid_power = OFF  -> Grid подключён
-switch.switch_power_to_generator = OFF -> selector Grid
+switch.grid_power = ON -> Grid подключён
+switch.use_generator_as_power_source = OFF -> selector Grid
 ```
 
 и заслонку:

@@ -392,9 +392,9 @@ class ATSController:
                 self.phase_started = now
                 self.deadline = now + self.cfg.transfer_confirmation_timeout
                 return [
-                    Action("switch_on", target="switch.switch_power_to_generator"),
+                    Action("switch_on", target="switch.use_generator_as_power_source"),
                     Action("log", message="Основная сеть отключена; силовой источник переключается на генератор.",
-                           entity_id="switch.switch_power_to_generator"),
+                           entity_id="switch.use_generator_as_power_source"),
                 ]
             if self.deadline is not None and now >= self.deadline:
                 return self._terminal(now, "Не подтверждено отключение дома от основной сети перед вводом генератора.",
@@ -485,9 +485,9 @@ class ATSController:
                 self.phase_started = now
                 self.deadline = now + self.cfg.transfer_confirmation_timeout
                 return [
-                    Action("switch_off", target="switch.disconnect_grid_power"),
+                    Action("switch_on", target="switch.grid_power"),
                     Action("log", message="Источник установлен в GRID; подключаем основную сеть.",
-                           entity_id="switch.disconnect_grid_power"),
+                           entity_id="switch.grid_power"),
                 ]
             if self.deadline is not None and now >= self.deadline:
                 return self._terminal(now, "Не подтверждено отключение питания дома от генератора при возврате на сеть.",
@@ -584,7 +584,7 @@ class ATSController:
                     return [
                         Action("switch_on", target=self._remote_entity()),
                         Action("set_session_mode", value="automatic"),
-                        Action("switch_on", target="switch.disconnect_grid_power"),
+                        Action("switch_off", target="switch.grid_power"),
                         Action("log", message="Сеть снова пропала во время остановки генератора; остановка отменена, возвращаем резерв.",
                                entity_id="binary_sensor.grid_input_ready"),
                     ]
@@ -786,9 +786,9 @@ class ATSController:
         self.phase_started = now
         self.deadline = now + self.cfg.transfer_confirmation_timeout
         return [
-            Action("switch_on", target="switch.disconnect_grid_power"),
+            Action("switch_off", target="switch.grid_power"),
             Action("log", message="Начат ввод резерва: сначала отключаем Grid перед силовым переключателем.",
-                   entity_id="switch.disconnect_grid_power"),
+                   entity_id="switch.grid_power"),
         ]
 
     def _begin_return_to_grid(self, now: float, s: Snapshot) -> List[Action]:
@@ -797,9 +797,9 @@ class ATSController:
         self.phase_started = now
         self.deadline = now + self.cfg.transfer_confirmation_timeout
         return [
-            Action("switch_off", target="switch.switch_power_to_generator"),
+            Action("switch_off", target="switch.use_generator_as_power_source"),
             Action("log", message="Сеть стабильна. Силовой переключатель переводится в положение GRID.",
-                   entity_id="switch.switch_power_to_generator"),
+                   entity_id="switch.use_generator_as_power_source"),
         ]
 
     def _abort_pretransfer_for_restored_grid(self, now: float, s: Snapshot) -> List[Action]:
@@ -866,8 +866,8 @@ class ATSController:
             # находимся в терминальной неопределённой аварии.
             Action("switch_off", target="switch.generator_a_remote_start"),
             Action("switch_off", target="switch.generator_b_remote_start"),
-            Action("switch_off", target="switch.switch_power_to_generator"),
-            Action("switch_off", target="switch.disconnect_grid_power"),
+            Action("switch_off", target="switch.use_generator_as_power_source"),
+            Action("switch_on", target="switch.grid_power"),
             # Последний аппаратный эшелон — общий Emergency Stop.
             # Если генератор работает: он будет остановлен, DKG116 уйдёт в EMERG.
             # Если генератор уже стоит: дальнейший REMOTE START будет аппаратно

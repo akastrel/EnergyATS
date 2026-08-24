@@ -33,8 +33,13 @@ ENTITIES = {
     "garage_temperature": "sensor.garage_temperature",
     "remote_a": "switch.generator_a_remote_start",
     "remote_b": "switch.generator_b_remote_start",
-    "grid_disconnected": "switch.disconnect_grid_power",
-    "source_generator": "switch.switch_power_to_generator",
+    # Логический switch назван положительно:
+    #   ON  = Grid подключён;
+    #   OFF = Grid отключён.
+    # В Snapshot ниже он инвертируется в удобный для core признак
+    # grid_disconnected.
+    "grid_power": "switch.grid_power",
+    "source_generator": "switch.use_generator_as_power_source",
     "ats_enabled": "input_boolean.automatic_generator_transfer",
     "session_active": "input_boolean.generator_reserve_session_active",
     "session_mode": "input_select.generator_reserve_session_mode",
@@ -310,7 +315,7 @@ class EnergyATSApp:
             ENTITIES["emergency_stop"],
             ENTITIES["remote_a"],
             ENTITIES["remote_b"],
-            ENTITIES["grid_disconnected"],
+            ENTITIES["grid_power"],
             ENTITIES["source_generator"],
             ENTITIES["ats_enabled"],
             ENTITIES["session_active"],
@@ -344,7 +349,10 @@ class EnergyATSApp:
             garage_temperature=self._float_state(ENTITIES["garage_temperature"]),
             remote_a=self._bool_state(ENTITIES["remote_a"]),
             remote_b=self._bool_state(ENTITIES["remote_b"]),
-            grid_disconnected=self._bool_state(ENTITIES["grid_disconnected"]),
+            # В HA switch.grid_power использует положительную семантику
+            # (ON = Grid подключён), тогда как чистый core ожидает признак
+            # grid_disconnected. Инверсию выполняем только на границе адаптера.
+            grid_disconnected=self._inverted_bool_state(ENTITIES["grid_power"]),
             source_generator=self._bool_state(ENTITIES["source_generator"]),
             ats_enabled=self._bool_state(ENTITIES["ats_enabled"]) is True,
             session_active=self._bool_state(ENTITIES["session_active"]) is True,
@@ -358,6 +366,11 @@ class EnergyATSApp:
         if state == "off":
             return False
         return None
+
+    def _inverted_bool_state(self, entity_id: str) -> bool | None:
+        """Прочитать логический switch, сохранив unknown как None, и инвертировать."""
+        value = self._bool_state(entity_id)
+        return None if value is None else not value
 
     def _float_state(self, entity_id: str) -> float | None:
         state = self.client.get_state(entity_id)

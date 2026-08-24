@@ -55,6 +55,27 @@ def test_app_options_map_to_core_config():
     assert cfg.preheat_very_cold_seconds == 333
 
 
+def test_snapshot_inverts_positive_grid_power_switch():
+    """HA ON means Grid connected; core must receive grid_disconnected=False."""
+    app = EnergyATSApp(DEFAULT_OPTIONS, token="test")
+    fake = FakeClient()
+    fake.states = {
+        ENTITIES["grid_power"]: "on",
+        ENTITIES["source_generator"]: "off",
+    }
+    app.client = fake
+
+    snapshot = app._snapshot()
+    assert snapshot.grid_disconnected is False
+    assert snapshot.source_generator is False
+
+    fake.states[ENTITIES["grid_power"]] = "off"
+    assert app._snapshot().grid_disconnected is True
+
+    fake.states[ENTITIES["grid_power"]] = "unavailable"
+    assert app._snapshot().grid_disconnected is None
+
+
 @pytest.mark.asyncio
 async def test_disarmed_never_executes_service_call():
     app = EnergyATSApp({**DEFAULT_OPTIONS, "armed": False}, token="test")
@@ -73,8 +94,8 @@ async def test_terminal_action_mapping_preserves_declared_order():
     actions = [
         Action("switch_off", target="switch.generator_a_remote_start"),
         Action("switch_off", target="switch.generator_b_remote_start"),
-        Action("switch_off", target="switch.switch_power_to_generator"),
-        Action("switch_off", target="switch.disconnect_grid_power"),
+        Action("switch_off", target="switch.use_generator_as_power_source"),
+        Action("switch_on", target="switch.grid_power"),
         Action("switch_on", target="switch.generators_emergency_stop"),
     ]
     for action in actions:
@@ -83,8 +104,8 @@ async def test_terminal_action_mapping_preserves_declared_order():
     assert fake.calls == [
         ("switch", "turn_off", {"entity_id": "switch.generator_a_remote_start"}),
         ("switch", "turn_off", {"entity_id": "switch.generator_b_remote_start"}),
-        ("switch", "turn_off", {"entity_id": "switch.switch_power_to_generator"}),
-        ("switch", "turn_off", {"entity_id": "switch.disconnect_grid_power"}),
+        ("switch", "turn_off", {"entity_id": "switch.use_generator_as_power_source"}),
+        ("switch", "turn_on", {"entity_id": "switch.grid_power"}),
         ("switch", "turn_on", {"entity_id": "switch.generators_emergency_stop"}),
     ]
 
