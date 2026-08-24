@@ -1,0 +1,58 @@
+configuration:
+  armed:
+    name: "Arm hardware control"
+    description: "Master deployment safety switch. Keep disabled for the first run."
+  startup_delay:
+    name: "Startup delay, s"
+    description: "Wait for Home Assistant, ESPHome and Bolid entities before reading the physical state."
+  tick_seconds:
+    name: "ATS tick, s"
+    description: "State-machine evaluation interval."
+  log_level:
+    name: "Log level"
+    description: "Use info normally and debug for diagnostics."
+  grid_failure_delay:
+    name: "Grid failure delay, s"
+    description: "How long Grid Input Ready must stay OFF before a generator start is initiated."
+  grid_restore_stable_time:
+    name: "Grid restore stability time, s"
+    description: "How long Grid Input Ready must stay ON before returning the house to Grid."
+  generator_start_timeout:
+    name: "Generator start timeout, s"
+    description: "Maximum wait for generator_*_is_running after REMOTE START."
+  generator_stop_timeout:
+    name: "Generator stop timeout, s"
+    description: "Maximum wait for generator_*_is_running to become OFF after REMOTE START is removed."
+  generator_stop_delay:
+    name: "No-load cooldown before stop, s"
+    description: "Generator cooldown after the house has returned to Grid."
+  transfer_confirmation_timeout:
+    name: "Transfer confirmation timeout, s"
+    description: "Maximum wait for physical house_powered_by_* feedback after a power transfer step."
+  choke_temperature:
+    name: "Choke threshold temperature, °C"
+    description: "Until an engine temperature sensor exists, cold start is selected below this garage temperature."
+  choke_hold_time:
+    name: "Choke hold after RUNNING, s"
+    description: "How long to keep the choke closed after the engine RUNNING signal appears."
+  preheat_warm_temperature:
+    name: "Warm preheat threshold, °C"
+    description: "T >= this value uses the shortest preheat time."
+  preheat_cool_temperature:
+    name: "Cool preheat threshold, °C"
+    description: "Lower boundary of the medium preheat range."
+  preheat_cold_temperature:
+    name: "Cold preheat threshold, °C"
+    description: "At or below this value the longest preheat time is used."
+  preheat_warm_seconds:
+    name: "Warm preheat, s"
+    description: "Preheat duration at warm temperature."
+  preheat_cool_seconds:
+    name: "Cool preheat, s"
+    description: "Preheat duration in the cool temperature range."
+  preheat_cold_seconds:
+    name: "Cold preheat, s"
+    description: "Preheat duration in the cold temperature range."
+  preheat_very_cold_seconds:
+    name: "Maximum preheat, s"
+    description: "Used at very low or unknown garage temperature."

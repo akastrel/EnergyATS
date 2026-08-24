@@ -1,19 +1,22 @@
+# Python
 __pycache__/
 *.py[cod]
-*$py.class
-
+*.pyo
 .pytest_cache/
 .coverage
 htmlcov/
 
+# Virtual environments
 .venv/
 venv/
-env/
 
-.idea/
+# IDE / OS
 .vscode/
-*.swp
-*.swo
-
+.idea/
 .DS_Store
 Thumbs.db
+
+# Local build / temp
+build/
+dist/
+*.log

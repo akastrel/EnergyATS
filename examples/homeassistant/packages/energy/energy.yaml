@@ -1,0 +1,474 @@
+# Package управления электроснабжением.
+#
+# Содержит:
+#   - вычисляемые состояния UPS и генераторных аккумуляторов;
+#   - признаки готовности внешней сети, UPS и генераторов;
+#   - логические UI-переключатели зарядки основной и запасной генераторных АКБ;
+#   - автоматизацию периодической подзарядки запасной генераторной АКБ
+#     из соседнего файла automations.yaml.
+#
+# Физические сущности остаются в своих интеграциях (ESPHome, Bolid и т.п.).
+# Этот package содержит именно логический уровень электроснабжения дома.
+#
+# ВАЖНО:
+# Исходную ESPHome-сущность
+#   sensor.generator_controller_generator_aux_battery_voltage
+# нужно один раз переименовать в реестре сущностей Home Assistant в
+#   sensor.generator_aux_battery_voltage
+#
+# Ниже уже везде используется новое entity_id.
+
+# ============================================================================
+# АВР ГЕНЕРАТОРОВ: UI, РАЗРЕШЕНИЕ И СЛУЖЕБНОЕ ВЛАДЕНИЕ СЕССИЕЙ
+# ============================================================================
+#
+# Сложный алгоритм АВР находится НЕ в YAML, а в отдельном Home Assistant App
+# `Energy ATS`. Package хранит только пользовательское намерение и минимальное
+# служебное состояние, которое невозможно надёжно вывести только из железа.
+#
+# ВАЖНОЕ РАЗДЕЛЕНИЕ:
+#
+#   input_boolean.automatic_generator_transfer
+#       Штатный разрешатель АВР в UI.
+#       OFF = автоматический запуск по пропаданию Grid запрещён.
+#       Ручные команды резерва/возврата продолжают работать.
+#
+#   input_boolean.generator_reserve_session_active
+#   input_select.generator_reserve_session_mode
+#       Служебные признаки того, что текущая резервная сессия принадлежит
+#       нашему ATS и была automatic/manual.
+#
+# Эти helper-ы НЕ являются источником истины о положении силовой схемы.
+# После restart App всегда заново читает физические датчики:
+#   Grid Ready, House Powered by Grid/Generator, Running A/B и реле.
+#
+# `initial` у persistent helper-ов намеренно не задаётся: Home Assistant
+# восстанавливает последнее значение, что позволяет пережить restart HA/App.
+# ============================================================================
+
+input_boolean:
+  automatic_generator_transfer:
+    name: "Автоматический ввод резерва"
+    icon: mdi:transmission-tower-import
+
+  generator_reserve_session_active:
+    name: "Generator Reserve Session Active"
+    icon: mdi:state-machine
+
+input_select:
+  generator_reserve_session_mode:
+    name: "Generator Reserve Session Mode"
+    icon: mdi:source-branch
+    options:
+      - "none"
+      - "automatic"
+      - "manual"
+
+input_button:
+  # Ручной ввод генераторного резерва.
+  # Работает независимо от automatic_generator_transfer, но НЕ обходит
+  # switch.generators_emergency_stop и остальные safety-проверки ATS.
+  generator_reserve_start:
+    name: "Включить резервное питание"
+    icon: mdi:generator-portable
+
+  # Ручной возврат на Grid. Использует ту же проверку стабильности сети,
+  # что и автоматический возврат.
+  generator_return_to_grid:
+    name: "Вернуться на основную сеть"
+    icon: mdi:transmission-tower
+
+# ============================================================================
+# ВЫЧИСЛЯЕМЫЕ СЕНСОРЫ И ЛОГИЧЕСКИЕ UI-ПЕРЕКЛЮЧАТЕЛИ
+# ============================================================================
+
+template:
+  # ==========================================================================
+  # UPS
+  # ==========================================================================
+  - sensor:
+      # Положительная часть мощности АКБ UPS.
+      # Используется как отдельная сущность мощности заряда.
+      - name: "UPS Battery Charging Power"
+        unique_id: ups_battery_charging_power
+        unit_of_measurement: "W"
+        device_class: power
+        state_class: measurement
+        state: >
+          {% set p = states('sensor.ups_battery_power') | float(0) %}
+          {{ [p, 0] | max }}
+
+      # Отрицательную мощность АКБ UPS преобразуем в положительную величину.
+      # Получаем отдельную сущность мощности разряда.
+      - name: "UPS Battery Discharging Power"
+        unique_id: ups_battery_discharging_power
+        unit_of_measurement: "W"
+        device_class: power
+        state_class: measurement
+        state: >
+          {% set p = states('sensor.ups_battery_power') | float(0) %}
+          {{ [-p, 0] | max }}
+
+      # Человеко-читаемое состояние аккумуляторной батареи UPS.
+      - name: "UPS Battery State"
+        unique_id: ups_battery_state
+        availability: >
+          {{ states('sensor.ups_battery_power')
+             not in ['unknown', 'unavailable', 'none']
+             and states('sensor.ups_battery_charge_level_soc')
+             not in ['unknown', 'unavailable', 'none'] }}
+        state: >
+          {% set p = states('sensor.ups_battery_power') | float(0) %}
+          {% set soc = states('sensor.ups_battery_charge_level_soc') | float(0) %}
+          {% if p < -20 %}
+            Разряжается
+          {% elif soc >= 99.5 %}
+            Поддержание
+          {% elif p > 20 %}
+            Заряжается
+          {% else %}
+            Ожидание
+          {% endif %}
+        icon: >
+          {% set p = states('sensor.ups_battery_power') | float(0) %}
+          {% set soc = states('sensor.ups_battery_charge_level_soc') | float(0) %}
+          {% if p < -20 %}
+            mdi:battery-minus
+          {% elif soc >= 99.5 %}
+            mdi:battery-check
+          {% elif p > 20 %}
+            mdi:battery-charging
+          {% else %}
+            mdi:battery
+          {% endif %}
+
+      # ======================================================================
+      # ОСНОВНАЯ ГЕНЕРАТОРНАЯ АКБ
+      # ======================================================================
+      #
+      # ВАЖНО:
+      # Теперь одного состояния физического зарядного устройства недостаточно.
+      # Зарядка считается подключённой к основной АКБ только если:
+      #
+      #   switch.generator_battery_charger = ON
+      #   switch.bolid_generator_battery_charger_switch = OFF
+      #
+      # OFF селектора соответствует основной генераторной АКБ.
+      # ======================================================================
+
+      - name: "Generator Battery State"
+        unique_id: generator_battery_state
+        availability: >
+          {{
+            states('sensor.generator_battery_power')
+              not in ['unknown', 'unavailable', 'none']
+            and
+            states('sensor.generator_battery_voltage')
+              not in ['unknown', 'unavailable', 'none']
+            and
+            has_value('switch.generator_battery_charger')
+            and
+            has_value('switch.bolid_generator_battery_charger_switch')
+          }}
+        state: >
+          {% set charger_on =
+              is_state('switch.generator_battery_charger', 'on')
+              and
+              is_state('switch.bolid_generator_battery_charger_switch', 'off') %}
+          {% set p =
+              states('sensor.generator_battery_power') | float(0) %}
+          {% set voltage =
+              states('sensor.generator_battery_voltage') | float(0) %}
+          {% if charger_on and p > 5 %}
+            Заряжается
+          {% elif charger_on and voltage >= 13.2 %}
+            Поддержание
+          {% elif charger_on %}
+            Заряжается
+          {% elif p < -5 %}
+            Разряжается
+          {% elif voltage < 12.4 %}
+            Требуется заряд
+          {% else %}
+            Ожидание
+          {% endif %}
+        icon: >
+          {% set charger_on =
+              is_state('switch.generator_battery_charger', 'on')
+              and
+              is_state('switch.bolid_generator_battery_charger_switch', 'off') %}
+          {% set p =
+              states('sensor.generator_battery_power') | float(0) %}
+          {% set voltage =
+              states('sensor.generator_battery_voltage') | float(0) %}
+          {% if charger_on and p > 5 %}
+            mdi:battery-charging
+          {% elif charger_on and voltage >= 13.2 %}
+            mdi:battery-check
+          {% elif charger_on %}
+            mdi:battery-charging
+          {% elif p < -5 %}
+            mdi:battery-minus
+          {% elif voltage < 12.4 %}
+            mdi:battery-alert
+          {% else %}
+            mdi:battery
+          {% endif %}
+
+      # ======================================================================
+      # ЗАПАСНАЯ ГЕНЕРАТОРНАЯ АКБ
+      # ======================================================================
+      #
+      # Для запасной АКБ сейчас известны только:
+      #   - напряжение;
+      #   - факт подключения зарядного устройства.
+      #
+      # Поэтому по мгновенному напряжению нельзя надёжно отличить фазу заряда
+      # от float/поддержания: при нормальном цикле напряжение проходит через
+      # 13.x В и по пути вверх.
+      #
+      # Здесь состояние намеренно остаётся простым:
+      #   Заряжается      — зарядное устройство подключено к запасной АКБ;
+      #   Требуется заряд — зарядка не подключена и напряжение < 12.4 В;
+      #   Ожидание        — остальные штатные состояния.
+      #
+      # Окончание заряда определяется отдельно автоматизацией по переходу
+      # напряжения СВЕРХУ вниз в область буферного напряжения.
+      # ======================================================================
+
+      - name: "Generator Aux Battery State"
+        unique_id: generator_aux_battery_state
+        default_entity_id: sensor.generator_aux_battery_state
+        availability: >
+          {{
+            has_value('sensor.generator_aux_battery_voltage')
+            and
+            has_value('switch.generator_battery_charger')
+            and
+            has_value('switch.bolid_generator_battery_charger_switch')
+          }}
+        state: >
+          {% set charger_on =
+              is_state('switch.generator_battery_charger', 'on')
+              and
+              is_state('switch.bolid_generator_battery_charger_switch', 'on') %}
+          {% set voltage =
+              states('sensor.generator_aux_battery_voltage') | float(0) %}
+          {% if charger_on %}
+            Заряжается
+          {% elif voltage < 12.4 %}
+            Требуется заряд
+          {% else %}
+            Ожидание
+          {% endif %}
+        icon: >
+          {% set charger_on =
+              is_state('switch.generator_battery_charger', 'on')
+              and
+              is_state('switch.bolid_generator_battery_charger_switch', 'on') %}
+          {% set voltage =
+              states('sensor.generator_aux_battery_voltage') | float(0) %}
+          {% if charger_on %}
+            mdi:battery-charging
+          {% elif voltage < 12.4 %}
+            mdi:battery-alert
+          {% else %}
+            mdi:battery
+          {% endif %}
+
+  # ==========================================================================
+  # СОСТОЯНИЯ / ГОТОВНОСТЬ ИСТОЧНИКОВ ПИТАНИЯ
+  # ==========================================================================
+  - binary_sensor:
+      - name: "UPS Running On Battery"
+        unique_id: ups_running_on_battery
+        state: >
+          {{ states('sensor.ups_battery_power') | float(0) < -20 }}
+
+      - name: "Grid Input Ready"
+        unique_id: grid_input_ready
+        availability: >
+          {{
+            has_value('binary_sensor.grid_meter_status') and
+            has_value('sensor.grid_l1_voltage') and
+            has_value('sensor.grid_l2_voltage') and
+            has_value('sensor.grid_l3_voltage')
+          }}
+        state: >
+          {{
+            is_state('binary_sensor.grid_meter_status', 'on') and
+            states('sensor.grid_l1_voltage') | float(0) > 160 and
+            states('sensor.grid_l2_voltage') | float(0) > 160 and
+            states('sensor.grid_l3_voltage') | float(0) > 160
+          }}
+        icon: >
+          {% if is_state(this.entity_id, 'on') %}
+            mdi:transmission-tower
+          {% else %}
+            mdi:transmission-tower-off
+          {% endif %}
+
+      - name: "Generator Ready"
+        unique_id: generator_ready
+        state: >
+          {{
+            is_state('binary_sensor.generator_a_is_running', 'on')
+            or
+            is_state('binary_sensor.generator_b_is_running', 'on')
+          }}
+        icon: >
+          {% if is_state(this.entity_id, 'on') %}
+            mdi:generator-portable
+          {% else %}
+            mdi:generator-portable-off
+          {% endif %}
+
+      - name: "UPS Ready"
+        unique_id: ups_ready
+        state: >
+          {{
+            states('sensor.ups_battery_charge_level_soc') | float(0) > 10 and
+            is_state('binary_sensor.ups_battery_alarm', 'off')
+          }}
+        icon: mdi:car-battery
+
+  # ==========================================================================
+  # UI: ЗАРЯДКА ГЕНЕРАТОРНЫХ АККУМУЛЯТОРОВ
+  # ==========================================================================
+  #
+  # Физические реле:
+  #
+  # switch.generator_battery_charger
+  #   ON  — зарядное устройство включено
+  #   OFF — зарядное устройство выключено
+  #
+  # switch.bolid_generator_battery_charger_switch
+  #   OFF — зарядка подключена к основной генераторной АКБ
+  #   ON  — зарядка подключена к запасной генераторной АКБ
+  #
+  # На dashboard физические реле не нужны.
+  # Вместо них используются два логических switch "Зарядка":
+  #
+  #   switch.generator_battery_charging
+  #   switch.backup_generator_battery_charging
+  #
+  # Их состояние ВСЕГДА вычисляется из реальных реле.
+  #
+  # При включении другой АКБ:
+  #   1. выключаем зарядное устройство;
+  #   2. ждём 1 секунду;
+  #   3. переключаем селектор;
+  #   4. ждём 1 секунду;
+  #   5. снова включаем зарядное устройство.
+  #
+  # Никакой дополнительной "умной" логики здесь нет:
+  # это только безопасный UI-слой над двумя физическими реле.
+  # ==========================================================================
+
+  - switch:
+      # ----------------------------------------------------------------------
+      # Основная генераторная АКБ
+      # ----------------------------------------------------------------------
+      - name: "Generator Battery Charging"
+        unique_id: generator_battery_charging
+        default_entity_id: switch.generator_battery_charging
+        icon: mdi:ev-station
+
+        availability: >
+          {{
+            has_value('switch.generator_battery_charger')
+            and
+            has_value('switch.bolid_generator_battery_charger_switch')
+          }}
+
+        state: >
+          {{
+            is_state('switch.generator_battery_charger', 'on')
+            and
+            is_state('switch.bolid_generator_battery_charger_switch', 'off')
+          }}
+
+        turn_on:
+          - action: switch.turn_off
+            target:
+              entity_id: switch.generator_battery_charger
+
+          - delay:
+              seconds: 1
+
+          - action: switch.turn_off
+            target:
+              entity_id: switch.bolid_generator_battery_charger_switch
+
+          - delay:
+              seconds: 1
+
+          - action: switch.turn_on
+            target:
+              entity_id: switch.generator_battery_charger
+
+        turn_off:
+          # Общую зарядку выключаем только если селектор действительно
+          # сейчас стоит на основной АКБ.
+          - condition: state
+            entity_id: switch.bolid_generator_battery_charger_switch
+            state: "off"
+
+          - action: switch.turn_off
+            target:
+              entity_id: switch.generator_battery_charger
+
+      # ----------------------------------------------------------------------
+      # Запасная генераторная АКБ
+      # ----------------------------------------------------------------------
+      - name: "Backup Generator Battery Charging"
+        unique_id: backup_generator_battery_charging
+        default_entity_id: switch.backup_generator_battery_charging
+        icon: mdi:ev-station
+
+        availability: >
+          {{
+            has_value('switch.generator_battery_charger')
+            and
+            has_value('switch.bolid_generator_battery_charger_switch')
+          }}
+
+        state: >
+          {{
+            is_state('switch.generator_battery_charger', 'on')
+            and
+            is_state('switch.bolid_generator_battery_charger_switch', 'on')
+          }}
+
+        turn_on:
+          - action: switch.turn_off
+            target:
+              entity_id: switch.generator_battery_charger
+
+          - delay:
+              seconds: 1
+
+          - action: switch.turn_on
+            target:
+              entity_id: switch.bolid_generator_battery_charger_switch
+
+          - delay:
+              seconds: 1
+
+          - action: switch.turn_on
+            target:
+              entity_id: switch.generator_battery_charger
+
+        turn_off:
+          # Общую зарядку выключаем только если селектор действительно
+          # сейчас стоит на запасной АКБ.
+          - condition: state
+            entity_id: switch.bolid_generator_battery_charger_switch
+            state: "on"
+
+          - action: switch.turn_off
+            target:
+              entity_id: switch.generator_battery_charger
+
+# Автоматизации этого package находятся в отдельном файле.
+automation: !include automations.yaml

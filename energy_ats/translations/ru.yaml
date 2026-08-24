@@ -1,0 +1,65 @@
+configuration:
+  armed:
+    name: "Разрешить управление оборудованием"
+    description: >-
+      Главный deployment-предохранитель. При выключенном параметре приложение
+      только наблюдает за состояниями и не выполняет никаких управляющих service calls.
+      Для первого запуска обязательно оставить выключенным.
+  startup_delay:
+    name: "Задержка после запуска App, с"
+    description: "Время на восстановление Home Assistant, ESPHome и Bolid перед чтением физической картины."
+  tick_seconds:
+    name: "Период цикла ATS, с"
+    description: "Период вызова конечного автомата в рабочем режиме."
+  log_level:
+    name: "Уровень логирования"
+    description: "info рекомендуется для эксплуатации; debug — для диагностики."
+
+  grid_failure_delay:
+    name: "Задержка пропадания Grid, с"
+    description: "Сколько Grid Input Ready должен непрерывно быть OFF до начала запуска генератора."
+  grid_restore_stable_time:
+    name: "Стабилизация вернувшейся Grid, с"
+    description: "Сколько Grid Input Ready должен непрерывно быть ON перед возвратом дома на сеть."
+
+  generator_start_timeout:
+    name: "Timeout запуска генератора, с"
+    description: "Максимальное ожидание физического generator_*_is_running после REMOTE START."
+  generator_stop_timeout:
+    name: "Timeout остановки генератора, с"
+    description: "Максимальное ожидание исчезновения generator_*_is_running после снятия REMOTE START."
+  generator_stop_delay:
+    name: "Работа без нагрузки перед остановкой, с"
+    description: "Cooldown после возврата дома на Grid."
+  transfer_confirmation_timeout:
+    name: "Timeout подтверждения силового переключения, с"
+    description: "Ожидание физических house_powered_by_* после каждого шага силовой коммутации."
+
+  choke_temperature:
+    name: "Температура применения заслонки, °C"
+    description: "Пока нет датчика двигателя, ниже этого порога используется cold start по температуре гаража."
+  choke_hold_time:
+    name: "Удержание заслонки после RUNNING, с"
+    description: "После запуска двигатель ещё это время работает с закрытой заслонкой, затем она открывается."
+
+  preheat_warm_temperature:
+    name: "Граница тёплого прогрева, °C"
+    description: "T >= этого значения использует минимальное время прогрева."
+  preheat_cool_temperature:
+    name: "Граница прохладного прогрева, °C"
+    description: "Нижняя граница диапазона среднего прогрева."
+  preheat_cold_temperature:
+    name: "Граница холодного прогрева, °C"
+    description: "Ниже этой температуры используется максимальный прогрев."
+  preheat_warm_seconds:
+    name: "Прогрев при тёплой температуре, с"
+    description: "Время прогрева при T >= warm temperature."
+  preheat_cool_seconds:
+    name: "Прогрев при прохладной температуре, с"
+    description: "Время прогрева в диапазоне cool..warm."
+  preheat_cold_seconds:
+    name: "Прогрев при холодной температуре, с"
+    description: "Время прогрева в диапазоне cold..cool."
+  preheat_very_cold_seconds:
+    name: "Максимальный прогрев, с"
+    description: "Используется при очень низкой или неизвестной температуре гаража."

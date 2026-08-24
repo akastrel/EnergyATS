@@ -1,0 +1,78 @@
+name: "Energy ATS"
+version: "0.2.0"
+slug: "energy_ats"
+description: >-
+  Автоматический ввод генераторного резерва с физической обратной связью,
+  fallback Generator A -> B, безопасным возвратом Grid и terminal fail-safe.
+url: "https://github.com/akastrel/EnergyATS"
+arch:
+  - amd64
+  - aarch64
+
+# ATS зависит от уже запущенного Home Assistant и его entity/state machine.
+startup: application
+boot: auto
+init: false
+stage: experimental
+
+# Единственное специальное разрешение App: доступ к Home Assistant Core API.
+# Supervisor передаст SUPERVISOR_TOKEN внутрь контейнера, вручную токен создавать не нужно.
+homeassistant_api: true
+
+options:
+  # ========================================================================
+  # ПЕРВЫЙ ЗАПУСК: ОБЯЗАТЕЛЬНО FALSE
+  # ========================================================================
+  armed: false
+  startup_delay: 30
+  tick_seconds: 1.0
+  log_level: "info"
+
+  # Пропадание / возврат основной сети.
+  grid_failure_delay: 5
+  grid_restore_stable_time: 60
+
+  # Генераторы.
+  generator_start_timeout: 90
+  generator_stop_timeout: 90
+  generator_stop_delay: 300
+
+  # Силовая коммутация.
+  transfer_confirmation_timeout: 60
+
+  # Заслонка.
+  choke_temperature: 10
+  choke_hold_time: 10
+
+  # Прогрев перед нагрузкой.
+  preheat_warm_temperature: 10
+  preheat_cool_temperature: -5
+  preheat_cold_temperature: -10
+  preheat_warm_seconds: 30
+  preheat_cool_seconds: 60
+  preheat_cold_seconds: 180
+  preheat_very_cold_seconds: 300
+
+schema:
+  armed: bool
+  startup_delay: "int(0,300)"
+  tick_seconds: "float(0.2,10)"
+  log_level: "list(debug|info|warning|error)"
+
+  grid_failure_delay: "float(0,300)"
+  grid_restore_stable_time: "float(0,900)"
+  generator_start_timeout: "float(1,300)"
+  generator_stop_timeout: "float(1,300)"
+  generator_stop_delay: "float(0,1800)"
+  transfer_confirmation_timeout: "float(1,300)"
+
+  choke_temperature: "float(-30,40)"
+  choke_hold_time: "float(0,60)"
+
+  preheat_warm_temperature: "float(-30,40)"
+  preheat_cool_temperature: "float(-30,40)"
+  preheat_cold_temperature: "float(-30,40)"
+  preheat_warm_seconds: "float(0,600)"
+  preheat_cool_seconds: "float(0,600)"
+  preheat_cold_seconds: "float(0,900)"
+  preheat_very_cold_seconds: "float(0,1800)"
