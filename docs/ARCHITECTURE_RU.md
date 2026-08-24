@@ -10,8 +10,8 @@ ATS не хранит положение силовой системы в соб
 - `binary_sensor.house_powered_by_generator`
 - `binary_sensor.generator_a_is_running`
 - `binary_sensor.generator_b_is_running`
-- `switch.disconnect_grid_power`
-- `switch.switch_power_to_generator`
+- `switch.grid_power` — ON = Grid подключён, OFF = Grid отключён
+- `switch.use_generator_as_power_source` — ON = Generator, OFF = Grid
 - `switch.generator_a_remote_start`
 - `switch.generator_b_remote_start`
 - `switch.generators_emergency_stop`
@@ -102,8 +102,8 @@ cooldown 300 s.
 ```text
 REMOTE A -> OFF
 REMOTE B -> OFF
-силовой selector -> GRID
-Grid disconnect -> OFF  (нормальное положение — Grid подключён)
+силовой selector -> GRID (`switch.use_generator_as_power_source` -> OFF)
+Grid power -> ON  (нормальное положение — Grid подключён)
 Generators Emergency Stop -> ON
 CRITICAL notification
 Logbook

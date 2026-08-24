@@ -80,6 +80,6 @@ pytest -q
 
 ## Текущий статус
 
-Версия App: **0.2.0**  
+Версия App: **0.2.1**  
 ATS core: **v1.1**  
 Stage: **experimental**

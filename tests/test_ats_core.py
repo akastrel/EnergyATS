@@ -62,13 +62,13 @@ def test_happy_path_generator_a_and_return_to_grid():
     # Preheat completes while Grid still absent -> disconnect Grid.
     actions = c.step(40, s)
     assert c.phase == Phase.TRANSFER_DISCONNECT_GRID
-    assert ("switch_on", "switch.disconnect_grid_power", None) in kinds(actions)
+    assert ("switch_off", "switch.grid_power", None) in kinds(actions)
 
     # Grid isolation confirmed -> select generator.
     s = replace(s, grid_disconnected=True, source_generator=False, house_grid=False)
     actions = c.step(41, s)
     assert c.phase == Phase.TRANSFER_SELECT_GENERATOR
-    assert ("switch_on", "switch.switch_power_to_generator", None) in kinds(actions)
+    assert ("switch_on", "switch.use_generator_as_power_source", None) in kinds(actions)
 
     # Generator supply confirmed.
     s = replace(s, source_generator=True, house_generator=True)
@@ -83,13 +83,13 @@ def test_happy_path_generator_a_and_return_to_grid():
     assert c.phase == Phase.GRID_RESTORE_WAIT
     actions = c.step(160, s)
     assert c.phase == Phase.RETURN_SELECT_GRID
-    assert ("switch_off", "switch.switch_power_to_generator", None) in kinds(actions)
+    assert ("switch_off", "switch.use_generator_as_power_source", None) in kinds(actions)
 
     # Generator feed gone -> connect Grid.
     s = replace(s, source_generator=False, house_generator=False)
     actions = c.step(161, s)
     assert c.phase == Phase.RETURN_CONNECT_GRID
-    assert ("switch_off", "switch.disconnect_grid_power", None) in kinds(actions)
+    assert ("switch_on", "switch.grid_power", None) in kinds(actions)
 
     # House on Grid -> 5 min cooldown.
     s = replace(s, grid_disconnected=False, house_grid=True)
@@ -148,7 +148,7 @@ def test_grid_returns_during_preheat_and_flaps_before_60_seconds():
     s = replace(s, grid_ready=False, house_grid=False)
     actions = c.step(43, s)
     assert c.phase == Phase.TRANSFER_DISCONNECT_GRID
-    assert ("switch_on", "switch.disconnect_grid_power", None) in kinds(actions)
+    assert ("switch_off", "switch.grid_power", None) in kinds(actions)
 
 
 def test_grid_stable_during_preheat_cancels_transfer_and_cools_generator():
@@ -166,7 +166,7 @@ def test_grid_stable_during_preheat_cancels_transfer_and_cools_generator():
     actions = c.step(70, s)
     assert c.phase == Phase.COOLDOWN
     assert any(a.kind == "notify_warning" for a in actions)
-    assert not any(a.target == "switch.disconnect_grid_power" and a.kind == "switch_on" for a in actions)
+    assert not any(a.target == "switch.grid_power" and a.kind == "switch_off" for a in actions)
 
 
 def test_a_start_failure_falls_back_to_b():
@@ -194,8 +194,8 @@ def test_b_failure_after_a_failure_is_terminal_and_engages_estop():
     actions = c.step(22, s)  # B fails
     assert c.phase == Phase.TERMINAL
     assert ("switch_on", "switch.generators_emergency_stop", None) in kinds(actions)
-    assert ("switch_off", "switch.switch_power_to_generator", None) in kinds(actions)
-    assert ("switch_off", "switch.disconnect_grid_power", None) in kinds(actions)
+    assert ("switch_off", "switch.use_generator_as_power_source", None) in kinds(actions)
+    assert ("switch_on", "switch.grid_power", None) in kinds(actions)
 
 
 def test_running_generator_loses_house_power_for_a_minute_is_terminal():
@@ -289,7 +289,7 @@ def test_grid_fails_again_during_cooldown_reuses_running_hot_generator():
     c.step(0, s)
     actions = c.step(5, s)
     assert c.phase == Phase.TRANSFER_DISCONNECT_GRID
-    assert ("switch_on", "switch.disconnect_grid_power", None) in kinds(actions)
+    assert ("switch_off", "switch.grid_power", None) in kinds(actions)
     assert not any(a.kind == "button" for a in actions)  # no choke / restart path
 
 
@@ -366,7 +366,7 @@ def test_manual_session_does_not_auto_return_when_grid_is_present():
              session_mode="manual")
     actions = c.step(120, s)
     assert c.phase == Phase.ON_GENERATOR
-    assert not any(a.target == "switch.switch_power_to_generator" for a in actions)
+    assert not any(a.target == "switch.use_generator_as_power_source" for a in actions)
 
 
 def test_manual_return_uses_same_60_second_grid_stability_wait():
@@ -386,7 +386,7 @@ def test_manual_return_uses_same_60_second_grid_stability_wait():
     assert c.phase == Phase.GRID_RESTORE_WAIT
     actions = c.step(61, s)
     assert c.phase == Phase.RETURN_SELECT_GRID
-    assert ("switch_off", "switch.switch_power_to_generator", None) in kinds(actions)
+    assert ("switch_off", "switch.use_generator_as_power_source", None) in kinds(actions)
 
 
 def test_restart_on_grid_with_running_owned_generator_restarts_full_cooldown():
@@ -407,8 +407,8 @@ def test_terminal_actions_normalize_to_grid_before_estop_in_declared_order():
     assert seq == [
         ("switch_off", "switch.generator_a_remote_start"),
         ("switch_off", "switch.generator_b_remote_start"),
-        ("switch_off", "switch.switch_power_to_generator"),
-        ("switch_off", "switch.disconnect_grid_power"),
+        ("switch_off", "switch.use_generator_as_power_source"),
+        ("switch_on", "switch.grid_power"),
         ("switch_on", "switch.generators_emergency_stop"),
     ]
 

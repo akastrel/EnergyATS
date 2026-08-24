@@ -1,11 +1,11 @@
-# Energy ATS App 0.2.0 — результаты тестирования
+# Energy ATS App 0.2.1 — результаты тестирования
 
 Дата: 2026-08-24
 
 ## Автоматические тесты
 
 ```text
-29 passed
+30 passed
 ```
 
 Проверены 23 сценария чистого ATS state machine из версии v1.1:
@@ -34,7 +34,7 @@
 22. terminal actions идут в фиксированном безопасном порядке;
 23. неизвестная температура -> cold choke + максимальный preheat.
 
-Дополнительно проверены 6 тестов standalone App/адаптера:
+Дополнительно проверены 7 тестов standalone App/адаптера:
 
 24. `/data/options.json` корректно объединяется с defaults;
 25. App options правильно преобразуются в `ats_core.Config`;
@@ -42,6 +42,8 @@
 27. terminal Action преобразуются в HA service calls без изменения порядка;
 28. `logbook.log` всегда получает `entity_id`;
 29. реальный mock WebSocket round-trip: auth -> get_states -> subscribe_events -> state_changed -> call_service.
+30. положительный `switch.grid_power` корректно инвертируется во внутренний
+    признак `grid_disconnected`, включая сохранение `unavailable -> None`.
 
 ## Статические проверки
 

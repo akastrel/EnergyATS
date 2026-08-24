@@ -17,8 +17,8 @@
 - `button.generator_a_choke_close` — физически ОТКРЫТЬ choke
 - `button.generator_b_choke_open` — физически ЗАКРЫТЬ choke
 - `button.generator_b_choke_close` — физически ОТКРЫТЬ choke
-- `switch.disconnect_grid_power`
-- `switch.switch_power_to_generator`
+- `switch.grid_power` — ON = Grid подключён, OFF = Grid отключён
+- `switch.use_generator_as_power_source` — ON = Generator, OFF = Grid
 - `switch.generators_emergency_stop`
 
 ## UI / session helpers
