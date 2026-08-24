@@ -1,5 +1,5 @@
 name: "Energy ATS"
-version: "0.2.1"
+version: "0.2.2"
 slug: "energy_ats"
 description: >-
   Автоматический ввод генераторного резерва с физической обратной связью,
@@ -41,6 +41,11 @@ options:
   transfer_confirmation_timeout: 60
 
   # Заслонка.
+  # Текущая фактическая картина:
+  #   A / Elemax — всегда стартует с физически закрытой заслонкой;
+  #   B / Вепрь  — заслонка закрывается только ниже choke_temperature.
+  generator_a_choke_mode: "always"
+  generator_b_choke_mode: "temperature"
   choke_temperature: 10
   choke_hold_time: 10
 
@@ -66,6 +71,8 @@ schema:
   generator_stop_delay: "float(0,1800)"
   transfer_confirmation_timeout: "float(1,300)"
 
+  generator_a_choke_mode: "list(always|temperature|never)"
+  generator_b_choke_mode: "list(always|temperature|never)"
   choke_temperature: "float(-30,40)"
   choke_hold_time: "float(0,60)"
 

@@ -35,7 +35,8 @@ def test_happy_path_generator_a_and_return_to_grid():
     cfg = Config(grid_failure_delay=5, generator_start_timeout=90,
                  preheat_warm_seconds=30, grid_restore_stable_time=60,
                  generator_stop_delay=300, generator_stop_timeout=90,
-                 transfer_confirmation_timeout=60, choke_temperature=10)
+                 transfer_confirmation_timeout=60, choke_temperature=10,
+                 generator_a_choke_mode="temperature")
     c = ATSController(cfg)
     s = snap()
     first_boot(c, s)
@@ -108,7 +109,8 @@ def test_happy_path_generator_a_and_return_to_grid():
 
 
 def test_cold_start_uses_choke_then_opens_after_10_seconds():
-    c = ATSController(Config(grid_failure_delay=0, choke_temperature=10, choke_hold_time=10,
+    c = ATSController(Config(grid_failure_delay=0, choke_temperature=10,
+                             generator_a_choke_mode="temperature", choke_hold_time=10,
                              preheat_cold_seconds=180))
     s = snap(grid_ready=False, house_grid=False, garage_temperature=-7)
     first_boot(c, s)
@@ -128,7 +130,8 @@ def test_cold_start_uses_choke_then_opens_after_10_seconds():
 
 def test_grid_returns_during_preheat_and_flaps_before_60_seconds():
     c = ATSController(Config(grid_failure_delay=0, preheat_warm_seconds=30,
-                             grid_restore_stable_time=60))
+                             grid_restore_stable_time=60,
+                             generator_a_choke_mode="temperature"))
     s = snap(grid_ready=False, house_grid=False)
     first_boot(c, s)
     c.step(1, s)
@@ -153,7 +156,8 @@ def test_grid_returns_during_preheat_and_flaps_before_60_seconds():
 
 def test_grid_stable_during_preheat_cancels_transfer_and_cools_generator():
     c = ATSController(Config(grid_failure_delay=0, preheat_warm_seconds=120,
-                             grid_restore_stable_time=60, generator_stop_delay=300))
+                             grid_restore_stable_time=60, generator_stop_delay=300,
+                             generator_a_choke_mode="temperature"))
     s = snap(grid_ready=False, house_grid=False)
     first_boot(c, s)
     c.step(1, s)
@@ -413,7 +417,16 @@ def test_terminal_actions_normalize_to_grid_before_estop_in_declared_order():
     ]
 
 
-def test_unknown_garage_temperature_uses_choke_and_max_preheat():
+def test_per_generator_choke_policy_and_unknown_temperature():
     c = ATSController(Config())
-    assert c._needs_choke(None) is True
+    # Текущее as-is: Elemax всегда с закрытой заслонкой.
+    assert c._needs_choke("A", 25) is True
+    # Вепрь при тёплой температуре запускается с открытой заслонкой.
+    assert c._needs_choke("B", 25) is False
+    # При похолодании или неизвестной температуре temperature-mode выбирает choke.
+    assert c._needs_choke("B", 0) is True
+    assert c._needs_choke("B", None) is True
+    # Явный never доступен для будущих физических экспериментов.
+    c.cfg = Config(generator_b_choke_mode="never")
+    assert c._needs_choke("B", None) is False
     assert c._preheat_seconds(None) == 300
