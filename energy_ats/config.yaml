@@ -1,5 +1,5 @@
 name: "Energy ATS"
-version: "0.2.2"
+version: "0.2.3"
 slug: "energy_ats"
 description: >-
   Автоматический ввод генераторного резерва с физической обратной связью,
