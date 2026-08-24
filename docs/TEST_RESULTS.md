@@ -1,14 +1,14 @@
-# Energy ATS App 0.2.2 — результаты тестирования
+# Energy ATS App 0.2.3 — результаты тестирования
 
 Дата: 2026-08-24
 
 ## Автоматические тесты
 
 ```text
-30 passed
+31 passed
 ```
 
-Проверены 23 сценария чистого ATS state machine из версии v1.1:
+Проверены 24 сценария чистого ATS state machine из версии v1.2:
 
 1. happy path Generator A + нормальный возврат Grid;
 2. cold start с заслонкой и открытием через 10 s;
@@ -27,23 +27,25 @@
 15. температурная таблица preheat;
 16. Grid disconnect не подтвердился -> terminal;
 17. Generator power после transfer не подтвердился -> terminal;
-18. A заглох под нагрузкой -> один fallback на B;
-19. manual session не возвращается на Grid автоматически;
-20. ручной возврат использует тот же 60 s hysteresis;
-21. restart на Grid при owned running generator -> полный cooldown заново;
-22. terminal actions идут в фиксированном безопасном порядке;
-23. отдельные режимы заслонки A/B; неизвестная температура в режиме
+18. A заглох под нагрузкой -> сначала подтверждённая изоляция генераторной
+    шины, затем fallback на B без нагрузки;
+19. изоляция шины перед fallback не подтвердилась -> terminal без запуска B;
+20. manual session не возвращается на Grid автоматически;
+21. ручной возврат использует тот же 60 s hysteresis;
+22. restart на Grid при owned running generator -> полный cooldown заново;
+23. terminal actions идут в фиксированном безопасном порядке;
+24. отдельные режимы заслонки A/B; неизвестная температура в режиме
     `temperature` -> cold choke + максимальный preheat.
 
 Дополнительно проверены 7 тестов standalone App/адаптера:
 
-24. `/data/options.json` корректно объединяется с defaults;
-25. App options правильно преобразуются в `ats_core.Config`;
-26. `armed=false` физически подавляет любой Action на нижнем слое;
-27. terminal Action преобразуются в HA service calls без изменения порядка;
-28. `logbook.log` всегда получает `entity_id`;
-29. реальный mock WebSocket round-trip: auth -> get_states -> subscribe_events -> state_changed -> call_service.
-30. положительный `switch.grid_power` корректно инвертируется во внутренний
+25. `/data/options.json` корректно объединяется с defaults;
+26. App options правильно преобразуются в `ats_core.Config`;
+27. `armed=false` физически подавляет любой Action на нижнем слое;
+28. terminal Action преобразуются в HA service calls без изменения порядка;
+29. `logbook.log` всегда получает `entity_id`;
+30. реальный mock WebSocket round-trip: auth -> get_states -> subscribe_events -> state_changed -> call_service.
+31. положительный `switch.grid_power` корректно инвертируется во внутренний
     признак `grid_disconnected`, включая сохранение `unavailable -> None`.
 
 ## Статические проверки

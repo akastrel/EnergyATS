@@ -25,6 +25,7 @@ class Phase(str, Enum):
           -> TRANSFER_DISCONNECT_GRID
           -> TRANSFER_SELECT_GENERATOR
           -> ON_GENERATOR
+          -> FAILOVER_ISOLATE (только при отказе активного генератора)
           -> GRID_RESTORE_WAIT
           -> RETURN_SELECT_GRID
           -> RETURN_CONNECT_GRID
@@ -45,6 +46,7 @@ class Phase(str, Enum):
     TRANSFER_DISCONNECT_GRID = "transfer_disconnect_grid"
     TRANSFER_SELECT_GENERATOR = "transfer_select_generator"
     ON_GENERATOR = "on_generator"
+    FAILOVER_ISOLATE = "failover_isolate"
     GRID_RESTORE_WAIT = "grid_restore_wait"
     RETURN_SELECT_GRID = "return_select_grid"
     RETURN_CONNECT_GRID = "return_connect_grid"
@@ -181,6 +183,7 @@ class ATSController:
     cfg: Config = field(default_factory=Config)
     phase: Phase = Phase.WAITING
     active_generator: Optional[str] = None  # "A" / "B"
+    failover_generator: Optional[str] = None  # ожидающий безопасного запуска backup
     session_mode: str = "none"
     failed_generators: Set[str] = field(default_factory=set)
     phase_started: float = 0.0
@@ -304,6 +307,43 @@ class ATSController:
                                entity_id="input_boolean.automatic_generator_transfer")]
             if self.deadline is not None and now >= self.deadline:
                 return self._begin_session_and_start(now, s, "automatic", "A")
+            return actions
+
+        # ------------------------------------------------------------------
+        # FAILOVER_ISOLATE — активный генератор остановился, когда силовой
+        # селектор ещё находился в положении GENERATOR. Перед запуском второго
+        # агрегата обязательно уводим селектор в GRID, но сам внешний Grid
+        # оставляем отключённым. Так backup запускается и прогревается без
+        # нагрузки, а дом не может получить его напряжение раньше штатного
+        # подтверждаемого TRANSFER_*.
+        # ------------------------------------------------------------------
+        if self.phase == Phase.FAILOVER_ISOLATE:
+            failed_remote_off = (
+                s.remote_a is False
+                if self.active_generator == "A"
+                else s.remote_b is False
+            )
+            if (
+                failed_remote_off
+                and s.source_generator is False
+                and s.house_generator is False
+            ):
+                backup = self.failover_generator
+                self.failover_generator = None
+                if backup not in ("A", "B"):
+                    return self._terminal(
+                        now,
+                        "После отказа активного генератора потеряно назначение резервного агрегата.",
+                        "binary_sensor.house_powered_by_generator",
+                    )
+                return self._begin_start(now, s, backup)
+
+            if self.deadline is not None and now >= self.deadline:
+                return self._terminal(
+                    now,
+                    "Не подтверждены снятие REMOTE и отключение дома от генераторной шины перед запуском резервного агрегата.",
+                    "binary_sensor.house_powered_by_generator",
+                )
             return actions
 
         # ------------------------------------------------------------------
@@ -835,24 +875,53 @@ class ATSController:
         if failed:
             self.failed_generators.add(failed)
 
+        # Сначала исполняются только локальные аппаратные команды. Уведомление
+        # намеренно добавляется позже: вызов notify в HA может занять секунды и
+        # не должен задерживать снятие REMOTE, изоляцию шины или запуск backup.
         actions: List[Action] = [
             Action("switch_off", target=self._remote_entity(failed)),
-            Action("button", target=self._choke_run_button(failed)),
-            Action("notify_critical", message=reason),
-            Action("log", message=reason, entity_id=self._running_entity(failed)),
         ]
 
         backup = "B" if failed == "A" else "A"
         if backup in self.failed_generators:
-            actions.extend(self._terminal(now, f"Резервный генератор {backup} уже отмечен как отказавший; дальнейшие автоматические попытки прекращены.",
+            actions.append(Action("button", target=self._choke_run_button(failed)))
+            actions.extend([
+                Action("notify_critical", message=reason),
+                Action("log", message=reason, entity_id=self._running_entity(failed)),
+            ])
+            actions.extend(self._terminal(now, f"Оба генератора недоступны: генератор {failed} отказал, а генератор {backup} уже отмечен как отказавший; дальнейшие автоматические попытки прекращены.",
                                           self._running_entity(backup)))
             return actions
 
-        # Отказ A при первоначальном старте или остановка активного генератора
-        # под нагрузкой -> пробуем второй генератор. Каждый агрегат в одной
-        # резервной сессии пробуется максимум один раз. Уже отказавший агрегат
-        # повторно не трогаем: это предотвращает бесконечный A<->B ping-pong.
+        # Если силовой тракт ещё выбран в GENERATOR, второй агрегат нельзя
+        # запускать сразу: иначе при появлении его напряжения дом получит нагрузку
+        # до завершения choke/preheat. Сначала уводим селектор в GRID, сохраняя
+        # switch.grid_power=OFF, и ждём двух подтверждений изоляции.
+        if s.source_generator is not False or s.house_generator is not False:
+            self.phase = Phase.FAILOVER_ISOLATE
+            self.phase_started = now
+            self.deadline = now + self.cfg.transfer_confirmation_timeout
+            self.failover_generator = backup
+            actions.append(Action("switch_off", target="switch.use_generator_as_power_source"))
+            actions.append(Action("button", target=self._choke_run_button(failed)))
+            actions.extend([
+                Action("notify_critical", message=reason),
+                Action("log", message=(
+                    f"{reason} Перед запуском генератора {backup} отключаем дом "
+                    "от генераторной шины."
+                ), entity_id=self._running_entity(failed)),
+            ])
+            return actions
+
+        # До ввода нагрузки силовой тракт уже изолирован — backup можно запускать
+        # сразу. Каждый агрегат в одной резервной сессии пробуется максимум один
+        # раз, что предотвращает бесконечный A<->B ping-pong.
+        actions.append(Action("button", target=self._choke_run_button(failed)))
         actions.extend(self._begin_start(now, s, backup))
+        actions.extend([
+            Action("notify_critical", message=reason),
+            Action("log", message=reason, entity_id=self._running_entity(failed)),
+        ])
         return actions
 
     def _terminal(self, now: float, reason: str, entity_id: str) -> List[Action]:
@@ -869,6 +938,7 @@ class ATSController:
         self.deadline = None
         self.session_mode = "none"
         self.active_generator = None
+        self.failover_generator = None
         return [
             # Сначала best-effort возвращаем обычные органы управления в
             # максимально штатное положение: REMOTE сняты, источник = GRID,
@@ -896,6 +966,7 @@ class ATSController:
         self.phase_started = now
         self.deadline = None
         self.active_generator = None
+        self.failover_generator = None
         self.session_mode = "none"
         self.failed_generators.clear()
         self.grid_ready_since = now

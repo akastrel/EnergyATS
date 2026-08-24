@@ -166,7 +166,7 @@ class EnergyATSApp:
         Это важное safety-свойство: после сетевого сбоя старая фаза автомата не
         считается достоверной.
         """
-        self.log.info("Energy ATS App запущен. Версия алгоритма: ATS v1.1.")
+        self.log.info("Energy ATS App запущен. Версия алгоритма: ATS v1.2.")
         self.log.info(
             "Режим: %s.",
             "ARMED — реальные команды разрешены"
@@ -234,6 +234,17 @@ class EnergyATSApp:
                 raise HomeAssistantConnectionError("WebSocket HA потерян")
 
             snapshot = self._snapshot()
+            signature = self._snapshot_signature(snapshot)
+            if self._last_snapshot_signature is None:
+                # Исходная картина уже записана перед входом в ARMED loop.
+                self._last_snapshot_signature = signature
+            elif signature != self._last_snapshot_signature:
+                self._last_snapshot_signature = signature
+                self.log.info(
+                    "Физическое состояние изменилось: %s",
+                    self._snapshot_text(snapshot),
+                )
+
             now = asyncio.get_running_loop().time()
             phase_before = self.controller.phase
             actions = self.controller.step(now, snapshot)
