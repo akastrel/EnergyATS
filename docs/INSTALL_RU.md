@@ -113,6 +113,14 @@ button.generator_*_choke_open  -> физически ЗАКРЫТЬ choke
 button.generator_*_choke_close -> физически ОТКРЫТЬ choke
 ```
 
+Текущая политика App:
+
+```text
+generator_a_choke_mode = always       # Elemax
+generator_b_choke_mode = temperature  # Вепрь
+choke_temperature = 10 °C             # экспериментальный порог
+```
+
 ## 5. Пока НЕ делать
 
 Не менять `armed` на `true` до отдельного согласованного сценария первого физического теста.

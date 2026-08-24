@@ -67,6 +67,8 @@ DEFAULT_OPTIONS: dict[str, Any] = {
     "generator_stop_delay": 300,
 
     # Заслонка.
+    "generator_a_choke_mode": "always",
+    "generator_b_choke_mode": "temperature",
     "choke_temperature": 10,
     "choke_hold_time": 10,
 
@@ -482,6 +484,10 @@ class EnergyATSApp:
             except (TypeError, ValueError):
                 return float(default)
 
+        def choke_mode(key: str, default: str) -> str:
+            value = str(o.get(key, default)).lower()
+            return value if value in {"always", "temperature", "never"} else default
+
         defaults = Config()
         return Config(
             grid_failure_delay=num("grid_failure_delay", defaults.grid_failure_delay),
@@ -502,6 +508,12 @@ class EnergyATSApp:
                 "generator_stop_delay", defaults.generator_stop_delay
             ),
             choke_temperature=num("choke_temperature", defaults.choke_temperature),
+            generator_a_choke_mode=choke_mode(
+                "generator_a_choke_mode", defaults.generator_a_choke_mode
+            ),
+            generator_b_choke_mode=choke_mode(
+                "generator_b_choke_mode", defaults.generator_b_choke_mode
+            ),
             choke_hold_time=num("choke_hold_time", defaults.choke_hold_time),
             preheat_warm_temp=num(
                 "preheat_warm_temperature", defaults.preheat_warm_temp

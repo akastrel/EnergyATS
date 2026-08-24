@@ -35,9 +35,15 @@ configuration:
     name: "Timeout подтверждения силового переключения, с"
     description: "Ожидание физических house_powered_by_* после каждого шага силовой коммутации."
 
+  generator_a_choke_mode:
+    name: "Режим заслонки Generator A / Elemax"
+    description: "always — всегда закрывать; temperature — по температуре гаража; never — всегда оставлять открытой."
+  generator_b_choke_mode:
+    name: "Режим заслонки Generator B / Вепрь"
+    description: "always — всегда закрывать; temperature — по температуре гаража; never — всегда оставлять открытой."
   choke_temperature:
     name: "Температура применения заслонки, °C"
-    description: "Пока нет датчика двигателя, ниже этого порога используется cold start по температуре гаража."
+    description: "Порог используется только для генератора с choke_mode=temperature; неизвестная температура означает cold start."
   choke_hold_time:
     name: "Удержание заслонки после RUNNING, с"
     description: "После запуска двигатель ещё это время работает с закрытой заслонкой, затем она открывается."

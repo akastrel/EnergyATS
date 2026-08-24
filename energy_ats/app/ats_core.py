@@ -120,6 +120,14 @@ class Config:
     # оценивается по температуре гаража. Ниже порога используем cold start.
     choke_temperature: float = 10.0
 
+    # Текущая эмпирическая политика запуска различается по генераторам:
+    #   always      — всегда физически закрывать заслонку перед запуском;
+    #   temperature — закрывать ниже choke_temperature, а при неизвестной
+    #                 температуре выбирать консервативный cold start;
+    #   never       — всегда запускать с физически открытой заслонкой.
+    generator_a_choke_mode: str = "always"
+    generator_b_choke_mode: str = "temperature"
+
     # После появления RUNNING держим закрытую заслонку ещё это время.
     choke_hold_time: float = 10.0
 
@@ -743,7 +751,8 @@ class ATSController:
         self.phase_started = now
         self.deadline = now + self.cfg.generator_start_timeout
         self.generator_power_lost_since = None
-        self.choke_used = self._needs_choke(s.garage_temperature)
+        choke_mode = self._choke_mode(generator)
+        self.choke_used = self._needs_choke(generator, s.garage_temperature)
 
         other = "B" if generator == "A" else "A"
         actions: List[Action] = [Action("switch_off", target=self._remote_entity(other))]
@@ -763,6 +772,7 @@ class ATSController:
             Action("log", message=(
                 f"Запуск генератора {generator}: "
                 + ("холодный старт с закрытой заслонкой" if self.choke_used else "старт с открытой заслонкой")
+                + f"; choke_mode={choke_mode}"
                 + f"; timeout {int(self.cfg.generator_start_timeout)} с."
             ), entity_id=self._remote_entity(generator)),
         ])
@@ -923,8 +933,25 @@ class ATSController:
             and now - self.grid_ready_since >= self.cfg.grid_restore_stable_time
         )
 
-    def _needs_choke(self, temp: Optional[float]) -> bool:
-        # Нет температуры -> считаем двигатель холодным и используем заслонку.
+    def _choke_mode(self, generator: Optional[str] = None) -> str:
+        """Вернуть нормализованную политику заслонки выбранного генератора."""
+        g = generator or self.active_generator
+        mode = (
+            self.cfg.generator_a_choke_mode
+            if g == "A"
+            else self.cfg.generator_b_choke_mode
+        )
+        mode = str(mode).lower()
+        # Неизвестное значение трактуем консервативно: заслонка закрывается.
+        return mode if mode in {"always", "temperature", "never"} else "always"
+
+    def _needs_choke(self, generator: str, temp: Optional[float]) -> bool:
+        mode = self._choke_mode(generator)
+        if mode == "always":
+            return True
+        if mode == "never":
+            return False
+        # temperature: нет температуры -> считаем двигатель холодным.
         return temp is None or temp < self.cfg.choke_temperature
 
     def _preheat_seconds(self, temp: Optional[float]) -> float:

@@ -29,9 +29,15 @@ configuration:
   transfer_confirmation_timeout:
     name: "Transfer confirmation timeout, s"
     description: "Maximum wait for physical house_powered_by_* feedback after a power transfer step."
+  generator_a_choke_mode:
+    name: "Generator A / Elemax choke mode"
+    description: "always closes the choke; temperature uses garage temperature; never keeps it open."
+  generator_b_choke_mode:
+    name: "Generator B / Vepr choke mode"
+    description: "always closes the choke; temperature uses garage temperature; never keeps it open."
   choke_temperature:
     name: "Choke threshold temperature, °C"
-    description: "Until an engine temperature sensor exists, cold start is selected below this garage temperature."
+    description: "Used only with choke_mode=temperature; an unknown temperature selects cold start."
   choke_hold_time:
     name: "Choke hold after RUNNING, s"
     description: "How long to keep the choke closed after the engine RUNNING signal appears."

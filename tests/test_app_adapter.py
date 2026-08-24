@@ -53,6 +53,8 @@ def test_app_options_map_to_core_config():
     assert cfg.grid_failure_delay == 8
     assert cfg.choke_hold_time == 12
     assert cfg.preheat_very_cold_seconds == 333
+    assert cfg.generator_a_choke_mode == "always"
+    assert cfg.generator_b_choke_mode == "temperature"
 
 
 def test_snapshot_inverts_positive_grid_power_switch():
