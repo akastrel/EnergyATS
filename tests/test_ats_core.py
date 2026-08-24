@@ -341,20 +341,77 @@ def test_generator_power_not_confirmed_after_transfer_is_terminal():
 
 
 def test_a_stops_under_load_falls_back_to_b_once():
-    c = ATSController(Config())
+    c = ATSController(Config(transfer_confirmation_timeout=60,
+                             preheat_warm_seconds=30))
     c.bootstrapped = True
     c.phase = Phase.ON_GENERATOR
     c.active_generator = "A"
     c.session_mode = "automatic"
-    s = snap(grid_ready=False, house_grid=False, house_generator=False,
+    s = snap(grid_ready=False, house_grid=False, house_generator=True,
              generator_a_running=False, generator_b_running=False,
              remote_a=True, grid_disconnected=True, source_generator=True,
              session_active=True, session_mode="automatic")
     actions = c.step(10, s)
+    assert c.phase == Phase.FAILOVER_ISOLATE
+    assert c.active_generator == "A"
+    assert c.failover_generator == "B"
+    assert "A" in c.failed_generators
+    assert ("switch_off", "switch.use_generator_as_power_source", None) in kinds(actions)
+    assert not any(
+        a.kind == "switch_on" and a.target == "switch.generator_b_remote_start"
+        for a in actions
+    )
+
+    # Аппаратные команды выполняются до потенциально медленного HA notify.
+    notify_index = next(i for i, a in enumerate(actions) if a.kind == "notify_critical")
+    assert next(i for i, a in enumerate(actions)
+                if a.target == "switch.generator_a_remote_start") < notify_index
+    assert next(i for i, a in enumerate(actions)
+                if a.target == "switch.use_generator_as_power_source") < notify_index
+
+    # Только после подтверждения снятия REMOTE и изоляции генераторной шины
+    # разрешается старт B. Grid при этом остаётся отключённым.
+    s = replace(s, house_generator=False, source_generator=False, remote_a=False)
+    actions = c.step(11, s)
     assert c.phase == Phase.STARTING
     assert c.active_generator == "B"
-    assert "A" in c.failed_generators
+    assert c.failover_generator is None
     assert ("switch_on", "switch.generator_b_remote_start", None) in kinds(actions)
+    assert not any(a.target == "switch.grid_power" and a.kind == "switch_on"
+                   for a in actions)
+
+    # Даже после запуска B дом не получает его напряжение до полного preheat.
+    s = replace(s, generator_b_running=True, remote_b=True)
+    c.step(12, s)
+    assert c.phase == Phase.PREHEATING
+    actions = c.step(41, s)
+    assert c.phase == Phase.PREHEATING
+    assert not any(a.target == "switch.use_generator_as_power_source"
+                   and a.kind == "switch_on" for a in actions)
+    actions = c.step(42, s)
+    assert c.phase == Phase.TRANSFER_DISCONNECT_GRID
+    assert ("switch_off", "switch.grid_power", None) in kinds(actions)
+
+
+def test_failover_isolation_timeout_is_terminal_and_never_starts_backup():
+    c = ATSController(Config(transfer_confirmation_timeout=60))
+    c.bootstrapped = True
+    c.phase = Phase.ON_GENERATOR
+    c.active_generator = "A"
+    c.session_mode = "automatic"
+    s = snap(grid_ready=False, house_grid=False, house_generator=True,
+             generator_a_running=False, generator_b_running=False,
+             remote_a=True, grid_disconnected=True, source_generator=True,
+             session_active=True, session_mode="automatic")
+    c.step(10, s)
+    assert c.phase == Phase.FAILOVER_ISOLATE
+
+    actions = c.step(70, s)
+    assert c.phase == Phase.TERMINAL
+    assert ("switch_on", "switch.generators_emergency_stop", None) in kinds(actions)
+    assert not any(a.kind == "switch_on"
+                   and a.target == "switch.generator_b_remote_start"
+                   for a in actions)
 
 
 def test_manual_session_does_not_auto_return_when_grid_is_present():
