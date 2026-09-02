@@ -66,16 +66,19 @@ def test_global_manual_return_interrupts_starting_and_isolates_generator_bus():
             session_mode="manual",
         ),
     )
-    assert c.phase == Phase.RETURN_SELECT_GRID
+    assert c.phase == Phase.MANUAL_ISOLATE_GENERATOR
     triplets = action_triplets(actions)
-    assert ("switch_off", "switch.generator_a_remote_start", None) in triplets
-    assert ("switch_off", "switch.generator_b_remote_start", None) in triplets
     assert ("switch_off", "switch.use_generator_as_power_source", None) in triplets
+    assert not any(target in {
+        "switch.generator_a_remote_start",
+        "switch.generator_b_remote_start",
+    } for _, target, _ in triplets)
 
 
-def test_global_manual_return_requires_grid_ready():
+def test_global_manual_return_without_grid_targets_map_battery():
     c = PolicyATSController()
     c.phase = Phase.STARTING
     actions = c._handle_manual_return(10, snap(grid_ready=False, house_grid=False))
-    assert c.phase == Phase.STARTING
-    assert any(a.kind == "notify_warning" for a in actions)
+    assert c.phase == Phase.MANUAL_ISOLATE_GENERATOR
+    assert c.manual_stop_destination == "battery"
+    assert not any(a.kind.startswith("notify_") for a in actions)

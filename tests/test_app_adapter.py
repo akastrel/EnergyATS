@@ -10,7 +10,7 @@ import pytest
 APP_DIR = Path(__file__).resolve().parents[1] / "energy_ats" / "app"
 sys.path.insert(0, str(APP_DIR))
 
-from ats_core import Action, Config  # noqa: E402
+from ats_core import Action, Config, Phase  # noqa: E402
 from main import DEFAULT_OPTIONS, ENTITIES, EnergyATSApp, load_options  # noqa: E402
 
 
@@ -121,6 +121,47 @@ async def test_logbook_action_always_has_entity_id():
     domain, service, data = fake.calls[0]
     assert (domain, service) == ("logbook", "log")
     assert data["entity_id"] == ENTITIES["ats_enabled"]
+
+
+@pytest.mark.asyncio
+async def test_status_helper_shows_starting_generator_name():
+    app = EnergyATSApp(
+        {**DEFAULT_OPTIONS, "armed": True, "generator_a_name": "Elemax"},
+        token="test",
+    )
+    fake = FakeClient()
+    fake.states[ENTITIES["status"]] = ""
+    app.client = fake
+    app.controller.phase = Phase.STARTING
+    app.controller.active_generator = "A"
+
+    await app._publish_status()
+    assert fake.calls == [
+        (
+            "input_text",
+            "set_value",
+            {
+                "entity_id": ENTITIES["status"],
+                "value": "Запускается: Elemax",
+            },
+        )
+    ]
+
+    # Одна и та же фаза не создаёт service call каждую секунду.
+    await app._publish_status()
+    assert len(fake.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_status_and_terminal_reset_helpers_are_backward_compatible_optional():
+    app = EnergyATSApp({**DEFAULT_OPTIONS, "armed": True}, token="test")
+    fake = FakeClient()
+    app.client = fake
+
+    await app._publish_status()
+    assert fake.calls == []
+    assert ENTITIES["status"] not in app._missing_required_entities()
+    assert ENTITIES["terminal_reset"] not in app._missing_required_entities()
 
 @pytest.mark.asyncio
 async def test_home_assistant_websocket_client_roundtrip():

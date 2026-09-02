@@ -22,7 +22,7 @@ homeassistant/packages/energy/automations.yaml
 
 в существующий `/config/packages/energy/`.
 
-В `energy.yaml` добавляются пять ATS helper-ов:
+В `energy.yaml` используются семь ATS helper-ов:
 
 ```text
 input_boolean.automatic_generator_transfer
@@ -30,7 +30,13 @@ input_boolean.generator_reserve_session_active
 input_select.generator_reserve_session_mode
 input_button.generator_reserve_start
 input_button.generator_return_to_grid
+input_button.generator_ats_reset
+input_text.generator_ats_status
 ```
+
+Последние два helper-а появились в 0.2.5. Они optional для запуска App ради
+обратной совместимости, но без них в dashboard не будет текущего статуса и
+кнопки выхода из TERMINAL.
 
 После проверки конфигурации перезапустить Home Assistant.
 

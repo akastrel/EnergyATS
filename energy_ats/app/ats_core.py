@@ -33,7 +33,20 @@ class Phase(str, Enum):
           -> STOPPING
           -> GRID
 
-    TERMINAL — конечная аварийная фаза. Из неё автоматика сама не выходит.
+    Ручная остановка использует отдельную подтверждаемую ветку:
+
+        MANUAL_ISOLATE_GENERATOR
+          -> MANUAL_CONNECT_NORMAL
+          -> MANUAL_COOLDOWN
+          -> MANUAL_STOPPING
+          -> GRID
+
+    Если Grid недоступен, нормальное положение силовой схемы после
+    MANUAL_CONNECT_NORMAL оставляет UPS-нагрузки на аккумуляторах МАП.
+
+    TERMINAL — аварийная фаза. Самостоятельно автоматика из неё не выходит,
+    но оператор может выполнить безопасный reset отдельной кнопкой после
+    снятия Emergency Stop и нормализации физических состояний.
     """
     WAITING = "waiting"
     GRID = "grid"
@@ -52,6 +65,10 @@ class Phase(str, Enum):
     RETURN_CONNECT_GRID = "return_connect_grid"
     COOLDOWN = "cooldown"
     STOPPING = "stopping"
+    MANUAL_ISOLATE_GENERATOR = "manual_isolate_generator"
+    MANUAL_CONNECT_NORMAL = "manual_connect_normal"
+    MANUAL_COOLDOWN = "manual_cooldown"
+    MANUAL_STOPPING = "manual_stopping"
     TERMINAL = "terminal"
 
 
@@ -194,6 +211,9 @@ class ATSController:
     choke_used: bool = False
     manual_start_pending: bool = False
     manual_return_pending: bool = False
+    terminal_reset_pending: bool = False
+    manual_stop_destination: Optional[str] = None  # "grid" / "battery"
+    manual_stop_latched_until_grid: bool = False
     bootstrapped: bool = False
 
     def request_manual_start(self) -> None:
@@ -201,6 +221,9 @@ class ATSController:
 
     def request_manual_return(self) -> None:
         self.manual_return_pending = True
+
+    def request_terminal_reset(self) -> None:
+        self.terminal_reset_pending = True
 
     # ==================================================================
     # ГЛАВНЫЙ ЦИКЛ КОНЕЧНОГО АВТОМАТА
@@ -216,6 +239,13 @@ class ATSController:
             actions.extend(self._bootstrap(now, s))
             self.bootstrapped = True
             return actions
+
+        # Reset TERMINAL — отдельное осознанное действие оператора. Обрабатываем
+        # его до раннего return из TERMINAL, но сам handler всё равно требует
+        # снятый Emergency Stop и безопасную физическую топологию.
+        if self.terminal_reset_pending and self.phase == Phase.TERMINAL:
+            self.terminal_reset_pending = False
+            return self._handle_terminal_reset(now, s)
 
         # Emergency Stop — жёсткая граница автоматики. Если он уже активен,
         # мы не имеем права выполнять НИКАКИЕ дальнейшие команды генераторам.
@@ -233,6 +263,10 @@ class ATSController:
 
         if self.phase == Phase.TERMINAL:
             return actions
+
+        if self.terminal_reset_pending:
+            self.terminal_reset_pending = False
+            return self._handle_terminal_reset(now, s)
 
         # Команды человека имеют приоритет над обычным продвижением автомата.
         # При этом ручной старт всё равно использует те же безопасные процедуры
@@ -282,6 +316,14 @@ class ATSController:
         # И разрешатель automatic_generator_transfer включён.
         # ------------------------------------------------------------------
         if self.phase == Phase.GRID:
+            # Явная ручная остановка при отсутствующей сети важнее включённого
+            # автоматического АВР. Не запускаем генератор снова через 5 секунд;
+            # latch снимается при возврате Grid либо новой ручной команде START.
+            if self.manual_stop_latched_until_grid:
+                if s.grid_ready is True:
+                    self.manual_stop_latched_until_grid = False
+                else:
+                    return actions
             if s.grid_ready is False and s.ats_enabled:
                 self.phase = Phase.GRID_FAILURE_DELAY
                 self.phase_started = now
@@ -492,7 +534,7 @@ class ATSController:
 
             # Только автоматическая сессия сама инициирует возврат на Grid.
             # В ручной сессии появление сети лишь наблюдается: решение о возврате
-            # остаётся за человеком и кнопкой «Вернуться на основную сеть».
+            # остаётся за человеком и кнопкой «Остановить генератор».
             if self.session_mode == "automatic" and s.grid_ready is True:
                 self.phase = Phase.GRID_RESTORE_WAIT
                 self.phase_started = now
@@ -646,6 +688,149 @@ class ATSController:
                                       self._running_entity())
             return actions
 
+        # ------------------------------------------------------------------
+        # MANUAL_ISOLATE_GENERATOR — оператор приказал прекратить резервную
+        # сессию. Первым и единственным силовым действием было отключение
+        # генераторной шины. REMOTE пока не снимаем: двигатель не должен
+        # остановиться под нагрузкой раньше подтверждения HouseGen=False.
+        # ------------------------------------------------------------------
+        if self.phase == Phase.MANUAL_ISOLATE_GENERATOR:
+            if s.source_generator is False and s.house_generator is False:
+                self.phase = Phase.MANUAL_CONNECT_NORMAL
+                self.phase_started = now
+                self.deadline = now + self.cfg.transfer_confirmation_timeout
+                return [
+                    Action("switch_on", target="switch.grid_power"),
+                    Action(
+                        "log",
+                        message=(
+                            "Генераторная шина изолирована. Возвращаем силовую "
+                            "схему в нормальное положение Grid; при отсутствии "
+                            "сети UPS-нагрузки продолжат работу от аккумуляторов МАП."
+                        ),
+                        entity_id="switch.grid_power",
+                    ),
+                ]
+            if self.deadline is not None and now >= self.deadline:
+                return self._terminal(
+                    now,
+                    "Ручная остановка: не подтверждено отключение дома от генераторной шины.",
+                    "binary_sensor.house_powered_by_generator",
+                )
+            return actions
+
+        # ------------------------------------------------------------------
+        # MANUAL_CONNECT_NORMAL — selector уже в GRID; подтверждаем, что
+        # switch.grid_power действительно вернулся в ON. При доступном Grid
+        # дополнительно ждём HouseGrid=True. Если Grid отсутствует, это штатный
+        # режим: критические нагрузки уже питаются от аккумуляторов МАП.
+        # ------------------------------------------------------------------
+        if self.phase == Phase.MANUAL_CONNECT_NORMAL:
+            normal_path_confirmed = s.grid_disconnected is False
+            if s.grid_ready is True:
+                self.manual_stop_destination = "grid"
+                self.manual_stop_latched_until_grid = False
+                normal_path_confirmed = normal_path_confirmed and s.house_grid is True
+            elif s.grid_ready is False:
+                self.manual_stop_destination = "battery"
+                self.manual_stop_latched_until_grid = True
+
+            if normal_path_confirmed:
+                if self._any_generator_running(s):
+                    self.phase = Phase.MANUAL_COOLDOWN
+                    self.phase_started = now
+                    self.deadline = now + self.cfg.generator_stop_delay
+                    destination = (
+                        "основной сети"
+                        if self.manual_stop_destination == "grid"
+                        else "аккумуляторов МАП"
+                    )
+                    return [
+                        Action(
+                            "log",
+                            message=(
+                                f"Дом переведён на питание от {destination}. "
+                                f"Генератор оставлен без нагрузки на охлаждение "
+                                f"{int(self.cfg.generator_stop_delay)} с."
+                            ),
+                            entity_id="input_button.generator_return_to_grid",
+                        )
+                    ]
+                self.phase = Phase.MANUAL_STOPPING
+                self.phase_started = now
+                self.deadline = now + self.cfg.generator_stop_timeout
+                return [
+                    Action("switch_off", target="switch.generator_a_remote_start"),
+                    Action("switch_off", target="switch.generator_b_remote_start"),
+                    Action(
+                        "log",
+                        message="Генераторы уже не работают; подтверждаем снятие обоих REMOTE START.",
+                        entity_id="input_button.generator_return_to_grid",
+                    ),
+                ]
+
+            if self.deadline is not None and now >= self.deadline:
+                return self._terminal(
+                    now,
+                    "Ручная остановка: не подтверждено нормальное положение силовой схемы после отключения генератора.",
+                    "switch.grid_power",
+                )
+            return actions
+
+        # ------------------------------------------------------------------
+        # MANUAL_COOLDOWN — подтверждённо сняли нагрузку и ждём штатное время
+        # охлаждения. Намерение оператора имеет приоритет: исчезновение Grid не
+        # отменяет остановку и не запускает повторный transfer на генератор.
+        # ------------------------------------------------------------------
+        if self.phase == Phase.MANUAL_COOLDOWN:
+            if not self._any_generator_running(s):
+                self.phase = Phase.MANUAL_STOPPING
+                self.phase_started = now
+                self.deadline = now + self.cfg.generator_stop_timeout
+                return [
+                    Action("switch_off", target="switch.generator_a_remote_start"),
+                    Action("switch_off", target="switch.generator_b_remote_start"),
+                    Action(
+                        "log",
+                        message="Генератор остановился во время охлаждения; снимаем и подтверждаем оба REMOTE START.",
+                        entity_id="input_button.generator_return_to_grid",
+                    ),
+                ]
+            if self.deadline is not None and now >= self.deadline:
+                self.phase = Phase.MANUAL_STOPPING
+                self.phase_started = now
+                self.deadline = now + self.cfg.generator_stop_timeout
+                return [
+                    Action("switch_off", target="switch.generator_a_remote_start"),
+                    Action("switch_off", target="switch.generator_b_remote_start"),
+                    Action(
+                        "log",
+                        message="Ручное охлаждение завершено; снимаем REMOTE START.",
+                        entity_id="input_button.generator_return_to_grid",
+                    ),
+                ]
+            return actions
+
+        # ------------------------------------------------------------------
+        # MANUAL_STOPPING — REMOTE сняты только после подтверждённой изоляции
+        # нагрузки. Таймаут остановки остаётся terminal-событием: это означает,
+        # что DKG/REMOTE не выполнили явную команду оператора.
+        # ------------------------------------------------------------------
+        if self.phase == Phase.MANUAL_STOPPING:
+            if (
+                not self._any_generator_running(s)
+                and s.remote_a is False
+                and s.remote_b is False
+            ):
+                return self._finish_session(now, "Генератор штатно остановлен по ручной команде.")
+            if self.deadline is not None and now >= self.deadline:
+                return self._terminal(
+                    now,
+                    f"Генератор не остановился за {int(self.cfg.generator_stop_timeout)} с после ручного снятия REMOTE START.",
+                    self._running_entity(),
+                )
+            return actions
+
         return actions
 
     # ==================================================================
@@ -752,24 +937,138 @@ class ATSController:
             return [Action("notify_warning", message="Ручной ввод резерва отклонён: обнаружен генератор, работающий вне сессии ATS."),
                     Action("log", message="Нельзя начать управляемый резерв при внешнем/ручном запуске генератора.",
                            entity_id="input_button.generator_reserve_start")]
+        self.manual_stop_latched_until_grid = False
         return self._begin_session_and_start(now, s, "manual", "A")
 
     def _handle_manual_return(self, now: float, s: Snapshot) -> List[Action]:
-        """Ручная команда возврата на Grid для manual-сессии."""
-        if self.phase not in (Phase.ON_GENERATOR, Phase.GRID_RESTORE_WAIT):
-            return [Action("log", message="Команда возврата на Grid проигнорирована: дом не находится в управляемом режиме питания от генератора.",
-                           entity_id="input_button.generator_return_to_grid")]
-        if s.grid_ready is not True:
-            return [Action("notify_warning", message="Возврат на основную сеть невозможен: Grid Input Ready = OFF."),
-                    Action("log", message="Ручной возврат на Grid отклонён: сеть не готова.",
-                           entity_id="binary_sensor.grid_input_ready")]
-        self.phase = Phase.GRID_RESTORE_WAIT
+        """Глобальная ручная команда «Остановить генератор».
+
+        Команда прерывает любую управляемую резервную процедуру. Она не требует
+        Grid Ready: при отсутствии внешней сети selector возвращается в GRID,
+        switch.grid_power включается, а МАП автоматически продолжает питание
+        своей UPS-линии от аккумуляторов.
+
+        Критически важный порядок действий:
+          1. selector -> GRID;
+          2. подтверждение SourceGenerator=False и HouseGen=False;
+          3. normal path / Grid power -> ON;
+          4. cooldown;
+          5. REMOTE -> OFF.
+        """
+        controllable = {
+            Phase.GRID_FAILURE_DELAY,
+            Phase.STARTING,
+            Phase.CHOKE_HOLD,
+            Phase.PREHEATING,
+            Phase.WAIT_GRID_DECISION,
+            Phase.FAILOVER_ISOLATE,
+            Phase.TRANSFER_DISCONNECT_GRID,
+            Phase.TRANSFER_SELECT_GENERATOR,
+            Phase.ON_GENERATOR,
+            Phase.GRID_RESTORE_WAIT,
+            Phase.RETURN_SELECT_GRID,
+            Phase.RETURN_CONNECT_GRID,
+            Phase.COOLDOWN,
+            Phase.STOPPING,
+        }
+        if self.phase not in controllable:
+            return [
+                Action(
+                    "log",
+                    message="Команда остановки проигнорирована: ATS не выполняет управляемую резервную сессию.",
+                    entity_id="input_button.generator_return_to_grid",
+                )
+            ]
+
+        self.manual_start_pending = False
+        self.failover_generator = None
+        self.manual_stop_destination = "grid" if s.grid_ready is True else "battery"
+        self.manual_stop_latched_until_grid = self.manual_stop_destination == "battery"
+        self.phase = Phase.MANUAL_ISOLATE_GENERATOR
         self.phase_started = now
-        self.grid_ready_since = now
-        # Сохраняем режим manual на время явного возврата. Это не даёт обычной
-        # автоматической логике принять параллельное решение до завершения команды.
-        return [Action("log", message="Запрошен ручной возврат на Grid. Начата выдержка стабильности сети.",
-                       entity_id="input_button.generator_return_to_grid")]
+        self.deadline = now + self.cfg.transfer_confirmation_timeout
+
+        destination = (
+            "основную сеть"
+            if self.manual_stop_destination == "grid"
+            else "аккумуляторы МАП"
+        )
+        return [
+            Action("switch_off", target="switch.use_generator_as_power_source"),
+            Action(
+                "log",
+                message=(
+                    "Команда оператора: остановить генератор. Сначала отключаем "
+                    f"дом от генераторной шины; назначение после переключения — {destination}."
+                ),
+                entity_id="input_button.generator_return_to_grid",
+            ),
+        ]
+
+    def _handle_terminal_reset(self, now: float, s: Snapshot) -> List[Action]:
+        """Сбросить TERMINAL только после ручной нормализации оборудования."""
+        if self.phase != Phase.TERMINAL:
+            return [
+                Action(
+                    "log",
+                    message="Сброс ATS не требуется: контроллер не находится в TERMINAL.",
+                    entity_id="input_button.generator_ats_reset",
+                )
+            ]
+
+        unsafe: List[str] = []
+        if s.emergency_stop is not False:
+            unsafe.append("Generators Emergency Stop должен быть OFF")
+        if s.generator_a_running is not False or s.generator_b_running is not False:
+            unsafe.append("оба генератора должны быть остановлены")
+        if s.remote_a is not False or s.remote_b is not False:
+            unsafe.append("оба REMOTE START должны быть OFF")
+        if s.source_generator is not False or s.house_generator is not False:
+            unsafe.append("генераторная шина должна быть отключена от дома")
+        if s.grid_disconnected is not False:
+            unsafe.append("switch.grid_power должен быть ON")
+
+        if unsafe:
+            reason = "; ".join(unsafe)
+            return [
+                Action(
+                    "notify_warning",
+                    message=f"Сброс TERMINAL пока невозможен: {reason}.",
+                ),
+                Action(
+                    "log",
+                    message=f"Сброс TERMINAL отклонён: {reason}.",
+                    entity_id="input_button.generator_ats_reset",
+                ),
+            ]
+
+        # Все необходимые физические состояния уже проверены этим Snapshot.
+        # Сразу возвращаемся в безопасную исходную фазу, не ожидая, пока HA
+        # успеет прислать state_changed для только что очищенных session helper-ов.
+        # Иначе устаревший Session=True мог бы на следующем tick ошибочно
+        # запустить recovery старой резервной сессии.
+        self.phase = Phase.GRID
+        self.phase_started = now
+        self.deadline = None
+        self.active_generator = None
+        self.failover_generator = None
+        self.session_mode = "none"
+        self.failed_generators.clear()
+        self.grid_ready_since = now if s.grid_ready is True else None
+        self.generator_power_lost_since = None
+        self.grid_failed_since = None
+        self.manual_stop_destination = None
+        self.manual_stop_latched_until_grid = False
+        self.bootstrapped = True
+        return [
+            Action("set_session", value="off"),
+            Action("set_session_mode", value="none"),
+            Action(
+                "log",
+                message="TERMINAL сброшен оператором после проверки физической обратной связи; ATS вернулся в рабочее состояние.",
+                entity_id="input_button.generator_ats_reset",
+            ),
+        ]
 
     def _begin_session_and_start(self, now: float, s: Snapshot, mode: str, generator: str) -> List[Action]:
         """Создать принадлежащую ATS сессию и начать запуск выбранного генератора."""
@@ -939,6 +1238,8 @@ class ATSController:
         self.session_mode = "none"
         self.active_generator = None
         self.failover_generator = None
+        self.manual_stop_destination = None
+        self.manual_stop_latched_until_grid = False
         return [
             # Сначала best-effort возвращаем обычные органы управления в
             # максимально штатное положение: REMOTE сняты, источник = GRID,
@@ -968,6 +1269,7 @@ class ATSController:
         self.active_generator = None
         self.failover_generator = None
         self.session_mode = "none"
+        self.manual_stop_destination = None
         self.failed_generators.clear()
         self.grid_ready_since = now
         return [

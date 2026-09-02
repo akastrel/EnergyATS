@@ -1,9 +1,9 @@
 name: "Energy ATS"
-version: "0.2.4"
+version: "0.2.5"
 slug: "energy_ats"
 description: >-
   Автоматический ввод генераторного резерва с физической обратной связью,
-  настраиваемым primary/backup, операторским abort-to-grid и terminal fail-safe.
+  настраиваемым primary/backup, безопасной ручной остановкой и terminal recovery.
 url: "https://github.com/akastrel/EnergyATS"
 arch:
   - amd64
