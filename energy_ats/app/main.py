@@ -45,6 +45,8 @@ ENTITIES = {
     "session_mode": "input_select.generator_reserve_session_mode",
     "manual_start": "input_button.generator_reserve_start",
     "manual_return": "input_button.generator_return_to_grid",
+    "terminal_reset": "input_button.generator_ats_reset",
+    "status": "input_text.generator_ats_status",
 }
 
 
@@ -57,6 +59,10 @@ DEFAULT_OPTIONS: dict[str, Any] = {
     "startup_delay": 30,
     "tick_seconds": 1.0,
     "log_level": "info",
+
+    # Человекочитаемые имена используются в UI-статусе и сообщениях runtime.
+    "generator_a_name": "Elemax",
+    "generator_b_name": "Вепрь",
 
     # Основные параметры алгоритма АВР.
     "grid_failure_delay": 5,
@@ -143,12 +149,16 @@ class EnergyATSApp:
         self._last_phase: Phase | None = None
         self._last_snapshot_signature: tuple[Any, ...] | None = None
         self._last_observer_log_at = 0.0
+        self._last_published_status: str | None = None
 
         self.client.add_state_listener(
             ENTITIES["manual_start"], self._manual_start_pressed
         )
         self.client.add_state_listener(
             ENTITIES["manual_return"], self._manual_return_pressed
+        )
+        self.client.add_state_listener(
+            ENTITIES["terminal_reset"], self._terminal_reset_pressed
         )
 
     def request_stop(self) -> None:
@@ -166,7 +176,7 @@ class EnergyATSApp:
         Это важное safety-свойство: после сетевого сбоя старая фаза автомата не
         считается достоверной.
         """
-        self.log.info("Energy ATS App запущен. Версия алгоритма: ATS v1.2.")
+        self.log.info("Energy ATS App запущен. Версия алгоритма: ATS v1.3.")
         self.log.info(
             "Режим: %s.",
             "ARMED — реальные команды разрешены"
@@ -197,6 +207,7 @@ class EnergyATSApp:
                 self.controller = ATSController(self._config_from_options())
                 self._last_phase = None
                 self._last_snapshot_signature = None
+                self._last_published_status = None
 
                 if self.armed:
                     await self._armed_loop()
@@ -257,6 +268,11 @@ class EnergyATSApp:
             # REMOTE OFF -> source GRID -> grid connected -> Emergency Stop.
             for action in actions:
                 await self._execute_action(action)
+
+            # Статус — UI-проекция фактической фазы контроллера, а не источник
+            # истины. Helper optional для обратной совместимости со старым
+            # package; после его добавления значение обновляется автоматически.
+            await self._publish_status()
 
             await self._sleep_or_stop(self.tick_seconds)
 
@@ -417,8 +433,89 @@ class EnergyATSApp:
                 entity_id,
             )
             return
-        self.log.info("Получена ручная команда: вернуться на основную сеть.")
+        self.log.info("Получена ручная команда: остановить генератор.")
         self.controller.request_manual_return()
+
+    async def _terminal_reset_pressed(
+        self, entity_id: str, old: str | None, new: str | None
+    ) -> None:
+        if old == new:
+            return
+        if not self.armed:
+            self.log.warning(
+                "Нажата '%s', но App DISARMED — команда сознательно проигнорирована.",
+                entity_id,
+            )
+            return
+        self.log.info("Получена ручная команда: сбросить состояние TERMINAL.")
+        self.controller.request_terminal_reset()
+
+    async def _publish_status(self) -> None:
+        """Опубликовать человекочитаемую фазу в optional input_text helper."""
+        if not self.client.has_entity(ENTITIES["status"]):
+            return
+
+        status = self._status_text()
+        if status == self._last_published_status:
+            return
+
+        try:
+            await self.client.call_service(
+                "input_text",
+                "set_value",
+                service_data={"entity_id": ENTITIES["status"], "value": status},
+            )
+        except Exception as exc:
+            # UI helper не относится к силовому контуру и не должен прерывать
+            # state machine. При реальной потере WebSocket основной loop всё
+            # равно обнаружит connected=False на следующем цикле.
+            self.log.warning("Не удалось обновить UI-статус ATS: %s", exc)
+            return
+        self._last_published_status = status
+
+    def _status_text(self) -> str:
+        """Преобразовать внутреннюю Phase в короткий статус для dashboard."""
+        generator = self.controller.active_generator
+        if generator == "A":
+            name = str(self.options.get("generator_a_name", "Elemax"))
+        elif generator == "B":
+            name = str(self.options.get("generator_b_name", "Вепрь"))
+        else:
+            name = "генератор"
+
+        phase = self.controller.phase
+        if phase == Phase.GRID:
+            grid_ready = self._bool_state(ENTITIES["grid_ready"])
+            if grid_ready is True:
+                return "Питание от основной сети"
+            if grid_ready is False:
+                return "Основная сеть OFF — UPS от МАП"
+            return "Нормальное положение Grid / МАП"
+
+        statuses = {
+            Phase.WAITING: "Ожидание данных",
+            Phase.EXTERNAL: "Внешнее управление генератором",
+            Phase.GRID_FAILURE_DELAY: "Ожидание перед запуском",
+            Phase.STARTING: f"Запускается: {name}",
+            Phase.CHOKE_HOLD: f"Запущен, заслонка закрыта: {name}",
+            Phase.PREHEATING: f"Прогрев: {name}",
+            Phase.WAIT_GRID_DECISION: "Ожидание решения по основной сети",
+            Phase.TRANSFER_DISCONNECT_GRID: f"Отключение основной сети: {name}",
+            Phase.TRANSFER_SELECT_GENERATOR: f"Переключение на генератор: {name}",
+            Phase.ON_GENERATOR: f"Питание от генератора: {name}",
+            Phase.FAILOVER_ISOLATE: "Изоляция отказавшего генератора",
+            Phase.GRID_RESTORE_WAIT: "Проверка стабильности основной сети",
+            Phase.RETURN_SELECT_GRID: "Отключение генераторной шины",
+            Phase.RETURN_CONNECT_GRID: "Возврат на основную сеть",
+            Phase.COOLDOWN: f"Охлаждение: {name}",
+            Phase.STOPPING: f"Остановка: {name}",
+            Phase.MANUAL_ISOLATE_GENERATOR: "Ручная остановка: отключение нагрузки",
+            Phase.MANUAL_CONNECT_NORMAL: "Ручная остановка: переход на Grid / МАП",
+            Phase.MANUAL_COOLDOWN: f"Ручная остановка: охлаждение {name}",
+            Phase.MANUAL_STOPPING: f"Ручная остановка: останавливается {name}",
+            Phase.TERMINAL: "Авария ATS — требуется сброс",
+        }
+        return statuses[phase]
 
     async def _execute_action(self, action: Action) -> None:
         """Единственная точка, где решение core превращается в реальный HA service call."""

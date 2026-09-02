@@ -27,7 +27,10 @@
 - `input_boolean.generator_reserve_session_active`
 - `input_select.generator_reserve_session_mode`
 - `input_button.generator_reserve_start`
-- `input_button.generator_return_to_grid`
+- `input_button.generator_return_to_grid` — остановить управляемый генератор;
+  при наличии Grid вернуть дом на сеть, без Grid оставить UPS-линию на МАП
+- `input_button.generator_ats_reset` — безопасный выход из TERMINAL
+- `input_text.generator_ats_status` — optional человекочитаемая фаза для UI
 
 ## Notifications
 

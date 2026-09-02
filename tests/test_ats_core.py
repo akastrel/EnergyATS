@@ -281,6 +281,28 @@ def test_manual_start_is_blocked_by_emergency_stop():
     assert not any(a.kind == "switch_on" and a.target == "switch.generator_a_remote_start" for a in actions)
 
 
+def test_repeated_manual_start_during_starting_is_ignored_without_duplicate_remote():
+    c = ATSController(Config())
+    c.bootstrapped = True
+    c.phase = Phase.STARTING
+    c.active_generator = "A"
+    c.session_mode = "manual"
+    c.deadline = 90
+    s = snap(
+        grid_ready=False,
+        house_grid=False,
+        generator_a_running=False,
+        remote_a=True,
+        session_active=True,
+        session_mode="manual",
+    )
+    c.request_manual_start()
+    actions = c.step(1, s)
+    assert c.phase == Phase.STARTING
+    assert any(a.kind == "log" and "starting" in (a.message or "") for a in actions)
+    assert not any(a.target == "switch.generator_a_remote_start" for a in actions)
+
+
 def test_grid_fails_again_during_cooldown_reuses_running_hot_generator():
     c = ATSController(Config(grid_failure_delay=5, generator_stop_delay=300))
     c.bootstrapped = True
@@ -430,8 +452,8 @@ def test_manual_session_does_not_auto_return_when_grid_is_present():
     assert not any(a.target == "switch.use_generator_as_power_source" for a in actions)
 
 
-def test_manual_return_uses_same_60_second_grid_stability_wait():
-    c = ATSController(Config(grid_restore_stable_time=60))
+def test_manual_stop_isolates_generator_before_remote_off_and_returns_to_grid():
+    c = ATSController(Config(generator_stop_delay=5, transfer_confirmation_timeout=60))
     c.bootstrapped = True
     c.phase = Phase.ON_GENERATOR
     c.active_generator = "A"
@@ -441,13 +463,153 @@ def test_manual_return_uses_same_60_second_grid_stability_wait():
              source_generator=True, ats_enabled=False, session_active=True,
              session_mode="manual")
     c.request_manual_return()
-    c.step(1, s)
-    assert c.phase == Phase.GRID_RESTORE_WAIT
-    c.step(60, s)
-    assert c.phase == Phase.GRID_RESTORE_WAIT
-    actions = c.step(61, s)
-    assert c.phase == Phase.RETURN_SELECT_GRID
+    actions = c.step(1, s)
+    assert c.phase == Phase.MANUAL_ISOLATE_GENERATOR
     assert ("switch_off", "switch.use_generator_as_power_source", None) in kinds(actions)
+    assert not any(a.target == "switch.generator_a_remote_start" for a in actions)
+
+    # Сначала подтверждаем, что дом действительно снят с генераторной шины.
+    s = replace(s, source_generator=False, house_generator=False)
+    actions = c.step(2, s)
+    assert c.phase == Phase.MANUAL_CONNECT_NORMAL
+    assert ("switch_on", "switch.grid_power", None) in kinds(actions)
+    assert not any(a.target == "switch.generator_a_remote_start" for a in actions)
+
+    # Только после появления Grid начинаем no-load cooldown.
+    s = replace(s, grid_disconnected=False, house_grid=True)
+    c.step(3, s)
+    assert c.phase == Phase.MANUAL_COOLDOWN
+    assert c.deadline == 8
+
+    actions = c.step(8, s)
+    assert c.phase == Phase.MANUAL_STOPPING
+    assert ("switch_off", "switch.generator_a_remote_start", None) in kinds(actions)
+
+    s = replace(s, generator_a_running=False, remote_a=False)
+    actions = c.step(9, s)
+    assert c.phase == Phase.GRID
+    assert ("set_session", None, "off") in kinds(actions)
+
+
+def test_manual_stop_without_grid_returns_to_map_battery_without_notification():
+    c = ATSController(Config(generator_stop_delay=5, transfer_confirmation_timeout=60))
+    c.bootstrapped = True
+    c.phase = Phase.ON_GENERATOR
+    c.active_generator = "A"
+    c.session_mode = "manual"
+    s = snap(
+        grid_ready=False,
+        house_grid=False,
+        house_generator=True,
+        generator_a_running=True,
+        remote_a=True,
+        grid_disconnected=True,
+        source_generator=True,
+        ats_enabled=True,
+        session_active=True,
+        session_mode="manual",
+    )
+
+    c.request_manual_return()
+    all_actions = c.step(1, s)
+    assert c.phase == Phase.MANUAL_ISOLATE_GENERATOR
+    assert c.manual_stop_destination == "battery"
+    assert not any(a.kind.startswith("notify_") for a in all_actions)
+    assert not any(a.target == "switch.generator_a_remote_start" for a in all_actions)
+
+    s = replace(s, source_generator=False, house_generator=False)
+    actions = c.step(2, s)
+    all_actions += actions
+    assert c.phase == Phase.MANUAL_CONNECT_NORMAL
+    assert ("switch_on", "switch.grid_power", None) in kinds(actions)
+
+    # Grid по-прежнему отсутствует. Подтверждения grid_power=ON достаточно:
+    # UPS-линия МАП уже работает от аккумуляторов.
+    s = replace(s, grid_disconnected=False)
+    actions = c.step(3, s)
+    all_actions += actions
+    assert c.phase == Phase.MANUAL_COOLDOWN
+
+    actions = c.step(8, s)
+    all_actions += actions
+    assert c.phase == Phase.MANUAL_STOPPING
+    assert ("switch_off", "switch.generator_a_remote_start", None) in kinds(actions)
+
+    s = replace(s, generator_a_running=False, remote_a=False)
+    all_actions += c.step(9, s)
+    assert c.phase == Phase.GRID
+    assert not any(a.kind.startswith("notify_") for a in all_actions)
+
+    # Даже при включённом automatic transfer явная ручная остановка не должна
+    # тут же перезапустить генератор. Новая ручная команда START снимает latch.
+    assert c.manual_stop_latched_until_grid is True
+    assert c.step(10, s) == []
+    assert c.phase == Phase.GRID
+    c.request_manual_start()
+    actions = c.step(11, s)
+    assert c.phase == Phase.STARTING
+    assert ("switch_on", "switch.generator_a_remote_start", None) in kinds(actions)
+
+
+def test_manual_stop_timeout_is_terminal():
+    c = ATSController(Config(generator_stop_timeout=10))
+    c.bootstrapped = True
+    c.phase = Phase.MANUAL_STOPPING
+    c.active_generator = "A"
+    c.session_mode = "manual"
+    c.deadline = 10
+    s = snap(
+        grid_ready=False,
+        house_grid=False,
+        house_generator=False,
+        generator_a_running=True,
+        remote_a=False,
+        grid_disconnected=False,
+        source_generator=False,
+        session_active=True,
+        session_mode="manual",
+    )
+    actions = c.step(10, s)
+    assert c.phase == Phase.TERMINAL
+    assert ("switch_on", "switch.generators_emergency_stop", None) in kinds(actions)
+
+
+def test_terminal_reset_requires_safe_hardware_then_recovers_without_restart():
+    c = ATSController()
+    c.bootstrapped = True
+    c.phase = Phase.TERMINAL
+
+    c.request_terminal_reset()
+    actions = c.step(1, snap(emergency_stop=True))
+    assert c.phase == Phase.TERMINAL
+    assert any(a.kind == "notify_warning" for a in actions)
+
+    c.request_terminal_reset()
+    actions = c.step(2, snap(emergency_stop=False))
+    assert c.phase == Phase.GRID
+    assert c.bootstrapped is True
+    assert ("set_session", None, "off") in kinds(actions)
+
+
+def test_terminal_reset_rejects_connected_or_running_generator():
+    c = ATSController()
+    c.bootstrapped = True
+    c.phase = Phase.TERMINAL
+    c.request_terminal_reset()
+    actions = c.step(
+        1,
+        snap(
+            emergency_stop=False,
+            house_grid=False,
+            house_generator=True,
+            generator_a_running=True,
+            remote_a=True,
+            grid_disconnected=True,
+            source_generator=True,
+        ),
+    )
+    assert c.phase == Phase.TERMINAL
+    assert any(a.kind == "notify_warning" for a in actions)
 
 
 def test_restart_on_grid_with_running_owned_generator_restarts_full_cooldown():
