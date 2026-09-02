@@ -1,55 +1,48 @@
 name: "Energy ATS"
-version: "0.2.3"
+version: "0.2.4"
 slug: "energy_ats"
 description: >-
   Автоматический ввод генераторного резерва с физической обратной связью,
-  fallback Generator A -> B, безопасным возвратом Grid и terminal fail-safe.
+  настраиваемым primary/backup, операторским abort-to-grid и terminal fail-safe.
 url: "https://github.com/akastrel/EnergyATS"
 arch:
   - amd64
   - aarch64
 
-# ATS зависит от уже запущенного Home Assistant и его entity/state machine.
 startup: application
 boot: auto
 init: false
 stage: experimental
-
-# Единственное специальное разрешение App: доступ к Home Assistant Core API.
-# Supervisor передаст SUPERVISOR_TOKEN внутрь контейнера, вручную токен создавать не нужно.
 homeassistant_api: true
 
 options:
-  # ========================================================================
-  # ПЕРВЫЙ ЗАПУСК: ОБЯЗАТЕЛЬНО FALSE
-  # ========================================================================
   armed: false
   startup_delay: 30
   tick_seconds: 1.0
   log_level: "info"
 
-  # Пропадание / возврат основной сети.
   grid_failure_delay: 5
   grid_restore_stable_time: 60
 
-  # Генераторы.
   generator_start_timeout: 90
   generator_stop_timeout: 90
   generator_stop_delay: 300
-
-  # Силовая коммутация.
   transfer_confirmation_timeout: 60
 
-  # Заслонка.
-  # Текущая фактическая картина:
-  #   A / Elemax — всегда стартует с физически закрытой заслонкой;
-  #   B / Вепрь  — заслонка закрывается только ниже choke_temperature.
+  # Пользовательская политика генераторов.
+  primary_generator: "A"
+  generator_a_name: "Elemax"
+  generator_b_name: "Вепрь"
+  generator_a_enabled: true
+  generator_b_enabled: true
+
+  # Заслонка. Это ручная настройка в UI Configuration самого App.
+  # На текущем этапе оба генератора запускаем с физически закрытой заслонкой.
   generator_a_choke_mode: "always"
-  generator_b_choke_mode: "temperature"
+  generator_b_choke_mode: "always"
   choke_temperature: 10
   choke_hold_time: 10
 
-  # Прогрев перед нагрузкой.
   preheat_warm_temperature: 10
   preheat_cool_temperature: -5
   preheat_cold_temperature: -10
@@ -70,6 +63,12 @@ schema:
   generator_stop_timeout: "float(1,300)"
   generator_stop_delay: "float(0,1800)"
   transfer_confirmation_timeout: "float(1,300)"
+
+  primary_generator: "list(A|B)"
+  generator_a_name: str
+  generator_b_name: str
+  generator_a_enabled: bool
+  generator_b_enabled: bool
 
   generator_a_choke_mode: "list(always|temperature|never)"
   generator_b_choke_mode: "list(always|temperature|never)"
