@@ -3,7 +3,8 @@ configuration:
     name: "Разрешить управление оборудованием"
     description: >-
       Главный deployment-предохранитель. При выключенном параметре приложение
-      только наблюдает за состояниями и не выполняет никаких управляющих service calls.
+      только наблюдает за состояниями и не выполняет аппаратных service calls.
+      Обновление диагностического UI-статуса остаётся разрешено.
       Для первого запуска обязательно оставить выключенным.
   startup_delay:
     name: "Задержка после запуска App, с"
@@ -22,50 +23,18 @@ configuration:
     name: "Стабилизация вернувшейся Grid, с"
     description: "Сколько Grid Input Ready должен непрерывно быть ON перед возвратом дома на сеть."
 
-  generator_start_timeout:
-    name: "Timeout запуска генератора, с"
-    description: "Максимальное ожидание физического generator_*_is_running после REMOTE START."
-  generator_stop_timeout:
-    name: "Timeout остановки генератора, с"
-    description: "Максимальное ожидание исчезновения generator_*_is_running после снятия REMOTE START."
-  generator_stop_delay:
-    name: "Работа без нагрузки перед остановкой, с"
-    description: "Cooldown после возврата дома на Grid."
+  manual_idle_warning_seconds:
+    name: "Предупреждение о холостом ходе, с"
+    description: "Когда напомнить, что вручную запущенный генератор продолжает работать после возврата дома на Grid. Автоматической остановки нет."
   transfer_confirmation_timeout:
     name: "Timeout подтверждения силового переключения, с"
     description: "Ожидание физических house_powered_by_* после каждого шага силовой коммутации."
-
-  generator_a_choke_mode:
-    name: "Режим заслонки Generator A / Elemax"
-    description: "always — всегда закрывать; temperature — по температуре гаража; never — всегда оставлять открытой."
-  generator_b_choke_mode:
-    name: "Режим заслонки Generator B / Вепрь"
-    description: "always — всегда закрывать; temperature — по температуре гаража; never — всегда оставлять открытой."
-  choke_temperature:
-    name: "Температура применения заслонки, °C"
-    description: "Порог используется только для генератора с choke_mode=temperature; неизвестная температура означает cold start."
-  choke_hold_time:
-    name: "Удержание заслонки после RUNNING, с"
-    description: "После запуска двигатель ещё это время работает с закрытой заслонкой, затем она открывается."
-
-  preheat_warm_temperature:
-    name: "Граница тёплого прогрева, °C"
-    description: "T >= этого значения использует минимальное время прогрева."
-  preheat_cool_temperature:
-    name: "Граница прохладного прогрева, °C"
-    description: "Нижняя граница диапазона среднего прогрева."
-  preheat_cold_temperature:
-    name: "Граница холодного прогрева, °C"
-    description: "Ниже этой температуры используется максимальный прогрев."
-  preheat_warm_seconds:
-    name: "Прогрев при тёплой температуре, с"
-    description: "Время прогрева при T >= warm temperature."
-  preheat_cool_seconds:
-    name: "Прогрев при прохладной температуре, с"
-    description: "Время прогрева в диапазоне cool..warm."
-  preheat_cold_seconds:
-    name: "Прогрев при холодной температуре, с"
-    description: "Время прогрева в диапазоне cold..cool."
-  preheat_very_cold_seconds:
-    name: "Максимальный прогрев, с"
-    description: "Используется при очень низкой или неизвестной температуре гаража."
+  primary_generator:
+    name: "Основной генератор"
+    description: "Первый кандидат для новой управляемой сессии. Автоматического fallback после его отказа в 0.3.0 нет."
+  generator_a_enabled:
+    name: "Разрешить Generator A"
+    description: "Разрешить Supervisor выбирать Elemax для новой сессии."
+  generator_b_enabled:
+    name: "Разрешить Generator B"
+    description: "Разрешить Supervisor выбирать Вепрь для новой сессии."

@@ -1,76 +1,59 @@
 # Energy ATS
 
-**Energy ATS** — Home Assistant App для автоматического ввода генераторного резерва (АВР) с физической обратной связью.
+Home Assistant App для управления источниками энергии дома с подтверждаемой
+силовой коммутацией и отдельными автоматами Elemax и Вепря.
 
-Проект предназначен для конкретной инженерной системы дома и пока находится в экспериментальной стадии. Управление построено как детерминированный конечный автомат на Python, а Home Assistant используется как источник физических состояний, UI и транспорт для service calls.
-
-## Основные принципы
-
-- физическая обратная связь — источник истины;
-- primary generator выбирается в настройках App, второй разрешённый агрегат используется как backup;
-- запуск генератора учитывает необходимость воздушной заслонки;
-- время прогрева зависит от температуры;
-- возврат Grid выполняется только после выдержки стабильности;
-- после возврата генератор работает без нагрузки перед штатной остановкой;
-- terminal failure переводит силовую часть в положение Grid и активирует общий `Generators Emergency Stop`;
-- после ручной проверки terminal можно сбросить отдельной кнопкой без restart App;
-- ручная остановка генератора работает и без внешней сети: UPS-линия остаётся на аккумуляторах МАП;
-- текущая фаза (`Запускается`, `Прогрев`, `Питание от генератора` и т. п.) публикуется в UI;
-- сложная логика ATS вынесена из Home Assistant YAML в отдельный Python state machine;
-- первый запуск выполняется только в режиме `armed: false`.
-
-## Архитектура
+Версия **0.3.0** — первая версия новой внутренней архитектуры Energy
+Supervisor. Приложение остаётся одним процессом:
 
 ```text
-Home Assistant package energy
-        │
-        │ states / UI helpers
-        ▼
-Home Assistant WebSocket API
-        │
-        ▼
-Energy ATS App
-├── main.py        # lifecycle, armed, recovery, логирование
-├── ha_client.py   # Home Assistant WebSocket API
-└── ats_core.py    # чистый конечный автомат АВР
-        │
-        ▼
-ESPHome / Bolid / реальные реле и датчики
+energy_supervisor.py      энергетическая политика и сессии
+power_transfer.py        безопасный break-before-make
+generator_controller.py  запуск, заслонка, прогрев и cooldown
+ha_adapter.py             Home Assistant entities и service calls
+main.py                   lifecycle и журнал транзакций
 ```
 
-## Установка как Home Assistant Apps repository
+## Основные свойства
 
-Добавьте этот GitHub repository в Home Assistant Apps store:
+- физическая обратная связь является источником истины;
+- Generator Controller не знает о Grid, МАП и контакторах дома;
+- Power Transfer не знает, зачем выбран источник, и не запускает двигатели;
+- внешний/локальный запуск только распознаётся — App его не захватывает;
+- ручная остановка при отсутствующей Grid штатно возвращает дом на аккумуляторы
+  МАП;
+- после такой ручной остановки АВР подавлен до возврата Grid или новой
+  ручной команды запуска;
+- при возврате Grid после ручного outage-запуска дом возвращается на сеть, но
+  двигатель без отдельной команды не останавливается;
+- автоматический fallback на второй генератор в 0.3.0 отключён;
+- перед аппаратными действиями записывается persistent transaction journal;
+- потеря HA во время транзакции требует ручного recovery, устойчивое состояние
+  не меняется;
+- `armed: false` полностью запрещает аппаратные команды.
+
+## Установка
+
+Добавьте repository в Home Assistant Apps store:
 
 ```text
 https://github.com/akastrel/EnergyATS
 ```
 
-После обновления списка приложений появится **Energy ATS**.
+Для 0.3.0 сначала требуется прошить Generator Controller 0.3.0 с новыми
+однозначными кнопками `choke_to_cold/choke_to_run`. Обновляться следует при
+работающей Grid, остановленных генераторах и `armed: false`.
 
-> **Важно:** после установки оставить `armed: false`. В этом режиме App только наблюдает за реальными сущностями и не выполняет управляющих service calls.
-
-Подробная инструкция: [`docs/INSTALL_RU.md`](docs/INSTALL_RU.md).
+Подробности: [установка и миграция](docs/INSTALL_RU.md).
 
 ## Документация
 
-- [`docs/ARCHITECTURE_RU.md`](docs/ARCHITECTURE_RU.md) — алгоритм и safety policy;
-- [`docs/ENTITIES_RU.md`](docs/ENTITIES_RU.md) — используемые Home Assistant entities;
-- [`docs/INSTALL_RU.md`](docs/INSTALL_RU.md) — первый безопасный запуск;
-- [`docs/TEST_RESULTS.md`](docs/TEST_RESULTS.md) — результаты тестов;
-- [`energy_ats/DOCS.md`](energy_ats/DOCS.md) — документация самого Home Assistant App.
+- [архитектура и поведение](docs/ARCHITECTURE_RU.md)
+- [Home Assistant entities](docs/ENTITIES_RU.md)
+- [установка и первый запуск](docs/INSTALL_RU.md)
+- [проверки релиза](docs/TEST_RESULTS.md)
 
-## Home Assistant package `energy`
-
-App ожидает несколько helper-ов Home Assistant для разрешения АВР, ручного ввода резерва и восстановления ownership после restart. Пример актуального package находится в:
-
-```text
-examples/homeassistant/packages/energy/
-```
-
-Это **пример для текущего дома**, а не универсальная часть устанавливаемого App.
-
-## Разработка и тесты
+## Разработка
 
 ```bash
 python -m venv .venv
@@ -79,12 +62,7 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-Тесты проверяют state machine отдельно от Home Assistant и транспортный адаптер WebSocket.
+Чистые автоматы не импортируют Home Assistant и тестируются обычными
+детерминированными снимками состояния.
 
-## Текущий статус
-
-Версия App: **0.2.5**
-
-ATS core: **v1.3**
-
-Stage: **experimental**
+Текущий статус: **0.3.0**, experimental.

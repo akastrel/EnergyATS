@@ -1,9 +1,9 @@
 name: "Energy ATS"
-version: "0.2.5"
+version: "0.3.0"
 slug: "energy_ats"
 description: >-
-  Автоматический ввод генераторного резерва с физической обратной связью,
-  настраиваемым primary/backup, безопасной ручной остановкой и terminal recovery.
+  Energy Supervisor: политика источников, безопасная силовая коммутация и
+  отдельные автоматы жизненного цикла генераторов.
 url: "https://github.com/akastrel/EnergyATS"
 arch:
   - amd64
@@ -23,33 +23,14 @@ options:
 
   grid_failure_delay: 5
   grid_restore_stable_time: 60
-
-  generator_start_timeout: 90
-  generator_stop_timeout: 90
-  generator_stop_delay: 300
+  manual_idle_warning_seconds: 600
   transfer_confirmation_timeout: 60
 
-  # Пользовательская политика генераторов.
+  # Политика выбора. Названия, модели, заслонка, прогрев и cooldown находятся
+  # в GeneratorProfile внутри generator_controller.py.
   primary_generator: "A"
-  generator_a_name: "Elemax"
-  generator_b_name: "Вепрь"
   generator_a_enabled: true
   generator_b_enabled: true
-
-  # Заслонка. Это ручная настройка в UI Configuration самого App.
-  # На текущем этапе оба генератора запускаем с физически закрытой заслонкой.
-  generator_a_choke_mode: "always"
-  generator_b_choke_mode: "always"
-  choke_temperature: 10
-  choke_hold_time: 10
-
-  preheat_warm_temperature: 10
-  preheat_cool_temperature: -5
-  preheat_cold_temperature: -10
-  preheat_warm_seconds: 30
-  preheat_cool_seconds: 60
-  preheat_cold_seconds: 180
-  preheat_very_cold_seconds: 300
 
 schema:
   armed: bool
@@ -59,26 +40,9 @@ schema:
 
   grid_failure_delay: "float(0,300)"
   grid_restore_stable_time: "float(0,900)"
-  generator_start_timeout: "float(1,300)"
-  generator_stop_timeout: "float(1,300)"
-  generator_stop_delay: "float(0,1800)"
+  manual_idle_warning_seconds: "float(0,86400)"
   transfer_confirmation_timeout: "float(1,300)"
 
   primary_generator: "list(A|B)"
-  generator_a_name: str
-  generator_b_name: str
   generator_a_enabled: bool
   generator_b_enabled: bool
-
-  generator_a_choke_mode: "list(always|temperature|never)"
-  generator_b_choke_mode: "list(always|temperature|never)"
-  choke_temperature: "float(-30,40)"
-  choke_hold_time: "float(0,60)"
-
-  preheat_warm_temperature: "float(-30,40)"
-  preheat_cool_temperature: "float(-30,40)"
-  preheat_cold_temperature: "float(-30,40)"
-  preheat_warm_seconds: "float(0,600)"
-  preheat_cool_seconds: "float(0,600)"
-  preheat_cold_seconds: "float(0,900)"
-  preheat_very_cold_seconds: "float(0,1800)"

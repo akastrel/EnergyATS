@@ -1,134 +1,164 @@
-# Установка Energy ATS App — первый безопасный запуск
+# Обновление до Energy ATS 0.3.0
 
-## 0. Что устанавливаем
+0.3.0 меняет внутреннюю архитектуру и контракт команд заслонки. Обновление
+лучше выполнять при доступной основной сети, остановленных генераторах и
+`armed: false`.
 
-Комплект состоит из двух частей:
+## 1. Исходное безопасное состояние
 
-1. Home Assistant package `energy` — UI helper-ы, текущие энергетические template/automation.
-2. Local Home Assistant App `Energy ATS` — Python state machine АВР.
-
-App использует штатный Home Assistant Core WebSocket proxy Supervisor. В `config.yaml` стоит
-`homeassistant_api: true`, поэтому Supervisor передаёт `SUPERVISOR_TOKEN` автоматически —
-long-lived token вручную создавать не нужно.
-
-## 1. Обновить package energy
-
-Скопировать:
+Перед обновлением проверить:
 
 ```text
-homeassistant/packages/energy/energy.yaml
-homeassistant/packages/energy/automations.yaml
+Grid Input Ready                 ON
+House Powered by Grid           ON
+House Powered by Generator      OFF
+Generator A/B is running        OFF
+Generator A/B Remote Start      OFF
+Use Generator as Power Source   OFF
+Grid Power                      ON
+Generators Emergency Stop       OFF
 ```
 
-в существующий `/config/packages/energy/`.
+Не обновлять приложение посередине запуска, переключения или cooldown.
 
-В `energy.yaml` используются семь ATS helper-ов:
+## 2. Сначала прошивка Generator Controller 0.3.0
+
+Обновлённый `generator-controller.yaml` сохраняет всю прежнюю телеметрию и
+старые кнопки, но добавляет однозначный контракт:
 
 ```text
-input_boolean.automatic_generator_transfer
-input_boolean.generator_reserve_session_active
-input_select.generator_reserve_session_mode
-input_button.generator_reserve_start
-input_button.generator_return_to_grid
-input_button.generator_ats_reset
-input_text.generator_ats_status
+button.generator_a_choke_to_cold
+button.generator_a_choke_to_run
+button.generator_b_choke_to_cold
+button.generator_b_choke_to_run
 ```
 
-Последние два helper-а появились в 0.2.5. Они optional для запуска App ради
-обратной совместимости, но без них в dashboard не будет текущего статуса и
-кнопки выхода из TERMINAL.
+Версия прошивки объявлена как `esphome.project.version: 0.3.0` и видна в
+информации об ESPHome-устройстве.
 
-После проверки конфигурации перезапустить Home Assistant.
+После прошивки вручную проверить в Home Assistant, что новые четыре кнопки
+существуют. На этом шаге не требуется запускать двигатель: достаточно
+проверить наличие entities. Физическую проверку направлений привода выполнять
+только в подготовленном безопасном сценарии.
 
-## 2. Установить Local App
+## 3. Обновить Home Assistant App
 
-Папку:
+Репозиторий:
 
 ```text
-energy_ats/
+https://github.com/akastrel/EnergyATS
 ```
 
-целиком скопировать в:
+После обновления списка Apps установить версию 0.3.0.
+
+Из Configuration удалены параметры, которые теперь принадлежат профилям
+двигателей:
 
 ```text
-/addons/energy_ats/
+generator_a_name
+generator_b_name
+generator_start_timeout
+generator_stop_timeout
+generator_stop_delay
+generator_a_choke_mode
+generator_b_choke_mode
+choke_temperature
+choke_hold_time
+preheat_*
 ```
 
-На HA OS это можно сделать через Samba или SSH App.
+Если Home Assistant сохранил их от 0.2.5, открыть Configuration, сохранить
+предложенную конфигурацию 0.3.0 и убедиться, что старых полей больше нет.
 
-Далее в UI:
+Новая компактная конфигурация:
 
-```text
-Settings -> Apps -> App store -> ... -> Check for updates
+```yaml
+armed: false
+startup_delay: 30
+tick_seconds: 1.0
+log_level: info
+grid_failure_delay: 5
+grid_restore_stable_time: 60
+manual_idle_warning_seconds: 600
+transfer_confirmation_timeout: 60
+primary_generator: A
+generator_a_enabled: true
+generator_b_enabled: true
 ```
 
-Должен появиться раздел `Local apps` и приложение `Energy ATS`.
+## 4. Первый запуск только DISARMED
 
-Установить приложение.
-
-## 3. ПЕРВЫЙ ЗАПУСК — НЕ ВКЛЮЧАТЬ ARMED
-
-В Configuration оставить:
+Оставить:
 
 ```yaml
 armed: false
 ```
 
-Запустить App и открыть его Logs.
-
-Ожидаем увидеть:
-
-- успешное соединение с Home Assistant;
-- отсутствие списка missing entity;
-- исходную физическую картину;
-- `DISARMED — только наблюдение`;
-- изменения физических состояний при ручной проверке датчиков/реле.
-
-В этом режиме App **не вызывает switch/button/script/logbook services**.
-
-## 4. Что проверить глазами до armed=true
-
-В обычном режиме Grid:
+Запустить App. Ожидаемый UI-статус:
 
 ```text
-GridReady=True
-HouseGrid=True
-HouseGen=False
-A=False
-B=False
-RemoteA=False
-RemoteB=False
-GridDisconnected=False
-SourceGenerator=False
-EStop=False
+DISARMED — только наблюдение
 ```
 
-Допускаются отличия только если физическое состояние дома реально другое.
+В этом режиме автоматическое и ручное управление железом запрещено. App может
+читать состояния и обновлять диагностический UI-статус.
 
-Особенно проверить семантику:
+В логах проверить:
+
+- версии и профили Elemax/Вепря;
+- `supervisor=normal`;
+- `transfer=stable_grid/grid`;
+- `A=idle`, `B=idle`;
+- отсутствие missing required entities.
+
+## 5. Журнал транзакций
+
+0.3.0 создаёт внутренний файл:
 
 ```text
-switch.grid_power = ON -> Grid подключён
-switch.use_generator_as_power_source = OFF -> selector Grid
+/data/energy-supervisor-state.json
 ```
 
-и заслонку:
+Это persistent storage самого App. Копировать его в Home Assistant package не
+нужно. При первом обновлении с 0.2.5 файла ещё нет — штатная ситуация.
+
+Если 0.3.0 впервые запущен при уже работающем генераторе без своего журнала,
+запуск будет классифицирован как внешний. App только сообщит о нём и не станет
+переключать или останавливать оборудование.
+
+## 6. Переход в ARMED
+
+`armed: true` включать только после проверки новых entity и логов DISARMED.
+Первый реальный тест выполнять поэтапно с человеком у генераторов и силового
+щита.
+
+Минимальная последовательность проверки:
+
+1. Grid доступна, оба генератора остановлены.
+2. Нажать `Включить резервное питание`.
+3. Проверить заслонку, REMOTE, RUNNING и статус прогрева.
+4. Убедиться, что Grid отключается до выбора генераторной шины.
+5. Нажать `Остановить генератор`.
+6. Убедиться, что дом снят с генератора до начала cooldown и снятия REMOTE.
+
+Автоматический АВР пока оставить выключенным:
 
 ```text
-button.generator_*_choke_open  -> физически ЗАКРЫТЬ choke
-button.generator_*_choke_close -> физически ОТКРЫТЬ choke
+input_boolean.automatic_generator_transfer = OFF
 ```
 
-Текущая политика App:
+Ручные кнопки при этом работают.
 
-```text
-generator_a_choke_mode = always       # Elemax
-generator_b_choke_mode = temperature  # Вепрь
-choke_temperature = 10 °C             # экспериментальный порог
-```
+## 7. Recovery Required
 
-## 5. Пока НЕ делать
+Если связь потеряна посередине физической транзакции, App не продолжает её
+автоматически. После восстановления связи:
 
-Не менять `armed` на `true` до отдельного согласованного сценария первого физического теста.
-Первый реальный тест лучше проводить не с полным отключением Grid, а поэтапно с человеком
-у генераторов/щита и с возможностью немедленного ручного вмешательства.
+1. осмотреть фактическое состояние;
+2. вручную остановить оба генератора;
+3. снять оба REMOTE;
+4. вернуть selector в normal и `Grid Power` в ON;
+5. снять Emergency Stop, если он был включён;
+6. нажать `Сбросить ошибку ATS`.
+
+Сброс принимается только при однозначно подтверждённом безопасном состоянии.
