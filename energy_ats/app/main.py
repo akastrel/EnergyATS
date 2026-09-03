@@ -1,3 +1,10 @@
+"""Композиция Energy Supervisor и его связь с Home Assistant.
+
+Здесь нет решений вида «когда запускать двигатель» или «в каком порядке
+переключать контакторы». ``main.py`` только собирает независимые контроллеры,
+передаёт им снимок физических состояний и исполняет уже сформированные команды.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -5,717 +12,570 @@ import json
 import logging
 import os
 import signal
-from dataclasses import asdict
+import time
 from pathlib import Path
 from typing import Any
 
-from ats_core import ATSController, Action, Config, Phase, Snapshot
+from domain import GeneratorSlot, SessionReason
+from energy_supervisor import (
+    EnergySupervisor,
+    SupervisorConfig,
+    SupervisorObservation,
+    SupervisorPhase,
+)
+from generator_controller import (
+    GeneratorAction,
+    GeneratorController,
+    GeneratorPhase,
+    default_generator_profiles,
+)
+from ha_adapter import ENTITIES, HardwareSnapshot, HomeAssistantAdapter
 from ha_client import HomeAssistantClient, HomeAssistantConnectionError
+from power_transfer import PowerTransferController, TransferAction
+from state_store import StateStore
 
 
-# ============================================================================
-# ЕДИНАЯ КАРТА HOME ASSISTANT СУЩНОСТЕЙ
-# ============================================================================
-#
-# Вся привязка Python-кода к конкретному дому находится здесь.
-# Чистый ATSController entity_id не знает вообще.
-#
-# Если в HA когда-нибудь переименуется физическая сущность, меняется одна строка
-# в этой таблице, а алгоритм state machine и его unit-тесты остаются прежними.
-# ============================================================================
-ENTITIES = {
-    "grid_ready": "binary_sensor.grid_input_ready",
-    "house_grid": "binary_sensor.house_powered_by_grid",
-    "house_generator": "binary_sensor.house_powered_by_generator",
-    "generator_a_running": "binary_sensor.generator_a_is_running",
-    "generator_b_running": "binary_sensor.generator_b_is_running",
-    "emergency_stop": "switch.generators_emergency_stop",
-    "garage_temperature": "sensor.garage_temperature",
-    "remote_a": "switch.generator_a_remote_start",
-    "remote_b": "switch.generator_b_remote_start",
-    # Логический switch назван положительно:
-    #   ON  = Grid подключён;
-    #   OFF = Grid отключён.
-    # В Snapshot ниже он инвертируется в удобный для core признак
-    # grid_disconnected.
-    "grid_power": "switch.grid_power",
-    "source_generator": "switch.use_generator_as_power_source",
-    "ats_enabled": "input_boolean.automatic_generator_transfer",
-    "session_active": "input_boolean.generator_reserve_session_active",
-    "session_mode": "input_select.generator_reserve_session_mode",
-    "manual_start": "input_button.generator_reserve_start",
-    "manual_return": "input_button.generator_return_to_grid",
-    "terminal_reset": "input_button.generator_ats_reset",
-    "status": "input_text.generator_ats_status",
-}
+APP_VERSION = "0.3.0"
 
 
 DEFAULT_OPTIONS: dict[str, Any] = {
-    # ------------------------------------------------------------------------
-    # Deployment-предохранитель.
-    # false = приложение только наблюдает; НИКАКИХ HA service calls к железу.
-    # ------------------------------------------------------------------------
+    # Главный deployment-предохранитель. При false аппаратные service calls
+    # запрещены, но физические состояния и UI-статус продолжают читаться.
     "armed": False,
     "startup_delay": 30,
     "tick_seconds": 1.0,
     "log_level": "info",
 
-    # Человекочитаемые имена используются в UI-статусе и сообщениях runtime.
-    "generator_a_name": "Elemax",
-    "generator_b_name": "Вепрь",
-
-    # Основные параметры алгоритма АВР.
+    # Энергетическая политика.
     "grid_failure_delay": 5,
     "grid_restore_stable_time": 60,
-    "generator_start_timeout": 90,
-    "generator_stop_timeout": 90,
+    "manual_idle_warning_seconds": 600,
+    "primary_generator": "A",
+    "generator_a_enabled": True,
+    "generator_b_enabled": True,
+
+    # Безопасная силовая коммутация.
     "transfer_confirmation_timeout": 60,
-    "generator_stop_delay": 300,
 
-    # Заслонка.
-    "generator_a_choke_mode": "always",
-    "generator_b_choke_mode": "temperature",
-    "choke_temperature": 10,
-    "choke_hold_time": 10,
-
-    # Прогрев.
-    "preheat_warm_temperature": 10,
-    "preheat_cool_temperature": -5,
-    "preheat_cold_temperature": -10,
-    "preheat_warm_seconds": 30,
-    "preheat_cool_seconds": 60,
-    "preheat_cold_seconds": 180,
-    "preheat_very_cold_seconds": 300,
+    # Внутренний файл App. Путь вынесен в options только ради тестов.
+    "state_file": "/data/energy-supervisor-state.json",
 }
 
 
-class EnergyATSApp:
-    """
-    Standalone Home Assistant App для управления автоматическим вводом резерва.
-
-    Архитектура intentionally простая и жёстко разделённая:
-
-        Home Assistant
-              │
-              │ WebSocket: states/events/services
-              ▼
-        HomeAssistantClient
-              │
-              │ Snapshot
-              ▼
-         ATSController      <- чистый Python, без HA
-              │
-              │ Action[]
-              ▼
-        EnergyATSApp._execute_action()
-              │
-              ▼
-        Home Assistant services -> ESPHome/Bolid/Template entities
-
-    В main.py нет бизнес-логики АВР. Если здесь появляется решение вида
-    «если сеть пропала, запусти A» — это архитектурная ошибка: такое решение
-    должно находиться в ats_core.py и покрываться unit-тестом.
-
-    --------------------------------------------------------------------------
-    ARMED И ATS ENABLED — РАЗНЫЕ УРОВНИ ЗАЩИТЫ
-    --------------------------------------------------------------------------
-
-    `armed` — deployment-предохранитель самого приложения.
-      false: приложение подключается к HA, проверяет физические состояния,
-             показывает подробный диагностический лог, но не вызывает НИ ОДНОГО
-             service, способного изменить силовую систему;
-      true:  разрешено исполнять Action, сформированные ATSController.
-
-    `input_boolean.automatic_generator_transfer` — штатный пользовательский
-    разрешатель АВР в UI.
-      OFF: автоматический запуск по пропаданию Grid запрещён;
-           ручные кнопки резерва/возврата продолжают работать.
-      ON:  автоматический АВР разрешён.
-
-    На первом физическом запуске `armed` ОБЯЗАТЕЛЬНО остаётся false.
-    """
+class EnergySupervisorApp:
+    """Один процесс, четыре явно разделённых слоя управления."""
 
     def __init__(self, options: dict[str, Any], token: str) -> None:
         self.options = {**DEFAULT_OPTIONS, **options}
-        self.armed = bool(self.options["armed"])
+        self.armed = _boolean_option(self.options, "armed")
         self.startup_delay = float(self.options["startup_delay"])
         self.tick_seconds = max(0.2, float(self.options["tick_seconds"]))
 
-        self.log = logging.getLogger("energy_ats")
+        self.log = logging.getLogger("energy_supervisor")
         self.client = HomeAssistantClient(token, logger=self.log)
-        self.controller = ATSController(self._config_from_options())
-        self.stop_event = asyncio.Event()
+        self.adapter = HomeAssistantAdapter(
+            self.client,
+            armed=self.armed,
+            logger=self.log,
+        )
 
-        self._last_phase: Phase | None = None
-        self._last_snapshot_signature: tuple[Any, ...] | None = None
-        self._last_observer_log_at = 0.0
-        self._last_published_status: str | None = None
+        self.profiles = default_generator_profiles()
+        self.generator_controllers = {
+            slot: GeneratorController(profile)
+            for slot, profile in self.profiles.items()
+        }
+        self.power_transfer = PowerTransferController(
+            confirmation_timeout=float(
+                self.options["transfer_confirmation_timeout"]
+            )
+        )
+
+        self.state_store = StateStore(str(self.options["state_file"]))
+        self.supervisor = self._restore_supervisor()
+        self._saved_state_signature: str | None = None
+        self._pending_action_records: list[dict[str, str]] = []
+
+        self.stop_event = asyncio.Event()
+        self._last_runtime_signature: tuple[Any, ...] | None = None
 
         self.client.add_state_listener(
             ENTITIES["manual_start"], self._manual_start_pressed
         )
         self.client.add_state_listener(
-            ENTITIES["manual_return"], self._manual_return_pressed
+            ENTITIES["manual_stop"], self._manual_stop_pressed
         )
         self.client.add_state_listener(
-            ENTITIES["terminal_reset"], self._terminal_reset_pressed
+            ENTITIES["recovery_reset"], self._recovery_reset_pressed
         )
 
     def request_stop(self) -> None:
         self.stop_event.set()
 
     async def run(self) -> None:
-        """
-        Главный lifecycle процесса.
-
-        При потере WebSocket приложение НЕ продолжает работать «по памяти».
-        Оно прекращает tick, переподключается, заново получает все состояния и
-        создаёт новый ATSController. Новый core делает recovery только по реальной
-        физической обратной связи + persistent session helper-ам в HA.
-
-        Это важное safety-свойство: после сетевого сбоя старая фаза автомата не
-        считается достоверной.
-        """
-        self.log.info("Energy ATS App запущен. Версия алгоритма: ATS v1.3.")
+        self.log.info("Energy ATS %s запущен.", APP_VERSION)
         self.log.info(
             "Режим: %s.",
             "ARMED — реальные команды разрешены"
             if self.armed
-            else "DISARMED — только наблюдение, управление железом запрещено",
+            else "DISARMED — только наблюдение",
         )
-        self.log.info("Параметры ATS: %s", asdict(self._config_from_options()))
+        for profile in self.profiles.values():
+            self.log.info(
+                "Generator %s: %s; модель: %s; choke: %s.",
+                profile.slot.value,
+                profile.display_name,
+                profile.model,
+                profile.choke_strategy.value,
+            )
 
         if self.startup_delay > 0:
             self.log.info(
-                "Стартовая выдержка %.0f с: ждём восстановления HA/ESPHome/Bolid.",
+                "Стартовая выдержка %.0f с для восстановления HA и ESPHome.",
                 self.startup_delay,
             )
-            try:
-                await asyncio.wait_for(self.stop_event.wait(), timeout=self.startup_delay)
+            if await self._stop_requested_within(self.startup_delay):
                 return
-            except asyncio.TimeoutError:
-                pass
 
         reconnect_delay = 5.0
         while not self.stop_event.is_set():
             try:
                 await self.client.connect()
                 await self._wait_until_required_entities_ready()
-
-                # Каждое новое WebSocket-соединение начинает новую recovery-сессию
-                # чистого core. Фазу из памяти процесса намеренно не переносим.
-                self.controller = ATSController(self._config_from_options())
-                self._last_phase = None
-                self._last_snapshot_signature = None
-                self._last_published_status = None
-
-                if self.armed:
-                    await self._armed_loop()
-                else:
-                    await self._observer_loop()
-
+                await self._connected_loop()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                if self.stop_event.is_set():
-                    break
-                self.log.error(
-                    "Рабочий цикл ATS прерван: %s. Переподключение через %.0f с.",
-                    exc,
-                    reconnect_delay,
-                )
+                if not self.stop_event.is_set():
+                    await self._record_interrupted_connection(exc)
+                    self.log.error(
+                        "Рабочий цикл прерван: %s. Переподключение через %.0f с.",
+                        exc,
+                        reconnect_delay,
+                    )
             finally:
                 await self.client.close()
 
-            try:
-                await asyncio.wait_for(self.stop_event.wait(), timeout=reconnect_delay)
-            except asyncio.TimeoutError:
-                pass
+            await self._stop_requested_within(reconnect_delay)
 
-        self.log.info("Energy ATS App остановлен.")
+        self.log.info("Energy ATS остановлен.")
 
-    async def _armed_loop(self) -> None:
-        """Рабочий цикл с реальным исполнением Action."""
-        self.log.warning(
-            "ATS ARMED: с этого момента Action state machine могут переключать реальное оборудование."
-        )
-
+    async def _connected_loop(self) -> None:
         while not self.stop_event.is_set():
             if not self.client.connected.is_set():
                 raise HomeAssistantConnectionError("WebSocket HA потерян")
 
-            snapshot = self._snapshot()
-            signature = self._snapshot_signature(snapshot)
-            if self._last_snapshot_signature is None:
-                # Исходная картина уже записана перед входом в ARMED loop.
-                self._last_snapshot_signature = signature
-            elif signature != self._last_snapshot_signature:
-                self._last_snapshot_signature = signature
-                self.log.info(
-                    "Физическое состояние изменилось: %s",
-                    self._snapshot_text(snapshot),
+            await self._tick(time.time())
+            await self._stop_requested_within(self.tick_seconds)
+
+    async def _tick(self, now: float) -> None:
+        hardware = self.adapter.snapshot()
+        self._refresh_component_views(now, hardware)
+
+        if self.supervisor.consume_recovery_reset_request():
+            self._attempt_recovery_reset(now, hardware)
+
+        observation = self._supervisor_observation(hardware)
+        decision = self.supervisor.step(now, observation)
+        actions_allowed = self.armed and decision.actions_allowed
+
+        generator_actions: list[GeneratorAction] = []
+        for slot, controller in self.generator_controllers.items():
+            generator_actions.extend(
+                controller.step(
+                    now,
+                    hardware.generators[slot],
+                    desired_running=decision.desired_generators[slot],
+                    actions_allowed=actions_allowed,
+                    stable_managed_session=(
+                        decision.stable_managed_generator == slot
+                    ),
                 )
+            )
 
-            now = asyncio.get_running_loop().time()
-            phase_before = self.controller.phase
-            actions = self.controller.step(now, snapshot)
-            phase_after = self.controller.phase
-
-            self._log_phase_transition(phase_before, phase_after, snapshot)
-
-            # Действия исполняются строго последовательно в том порядке, в котором
-            # их сформировал core. Для terminal-процедуры порядок особенно важен:
-            # REMOTE OFF -> source GRID -> grid connected -> Emergency Stop.
-            for action in actions:
-                await self._execute_action(action)
-
-            # Статус — UI-проекция фактической фазы контроллера, а не источник
-            # истины. Helper optional для обратной совместимости со старым
-            # package; после его добавления значение обновляется автоматически.
-            await self._publish_status()
-
-            await self._sleep_or_stop(self.tick_seconds)
-
-    async def _observer_loop(self) -> None:
-        """
-        Безопасный первый режим: только наблюдение.
-
-        Здесь мы специально НЕ прогоняем ATSController по таймерам. Если бы core
-        сформировал START_GENERATOR_A, а App подавил команду из-за armed=false,
-        state machine затем закономерно дождался бы timeout и объявил фиктивную
-        аварию. Такой dry-run был бы вводящим в заблуждение.
-
-        Поэтому DISARMED используется для проверки:
-          * доступности всех entity;
-          * реальной топологии Grid/Generator;
-          * состояний REMOTE/selector/E-STOP;
-          * работы WebSocket и ручных input_button событий.
-
-        Полноценное поведение автомата проверяется unit-тестами, а физическая
-        интеграция — только после сознательного armed=true.
-        """
-        self.log.warning(
-            "ATS DISARMED: state machine не выдаёт команды; выполняется только мониторинг реальных состояний."
+        generator_statuses = {
+            slot: controller.status(hardware.generators[slot])
+            for slot, controller in self.generator_controllers.items()
+        }
+        desired_generator = decision.desired_source.generator
+        desired_generator_ready = (
+            desired_generator is not None
+            and generator_statuses[desired_generator].ready_for_load
+        )
+        transfer_actions = self.power_transfer.step(
+            now,
+            hardware.power_transfer,
+            decision.desired_source,
+            desired_generator_ready=desired_generator_ready,
+            actions_allowed=actions_allowed,
         )
 
-        while not self.stop_event.is_set():
-            if not self.client.connected.is_set():
-                raise HomeAssistantConnectionError("WebSocket HA потерян")
+        # Журнал с точным списком pending-команд записывается ДО первого
+        # service call. После успешного исполнения список очищается отдельной
+        # атомарной записью.
+        self._pending_action_records = self._describe_actions(
+            transfer_actions,
+            generator_actions,
+        )
+        self._save_state(force=bool(self._pending_action_records))
 
-            snapshot = self._snapshot()
-            signature = self._snapshot_signature(snapshot)
-            if signature != self._last_snapshot_signature:
-                self._last_snapshot_signature = signature
-                self.log.info("Физическое состояние изменилось: %s", self._snapshot_text(snapshot))
+        if self._pending_action_records:
+            await self.adapter.execute_actions(transfer_actions, generator_actions)
+            self._pending_action_records = []
+            self._save_state(force=True)
 
-            await self._sleep_or_stop(max(1.0, self.tick_seconds))
+        updated_observation = self._supervisor_observation(hardware)
+        await self.adapter.publish_events(decision.events)
+        await self._publish_ui(updated_observation)
+        self._log_runtime_if_changed(updated_observation)
+
+    def _refresh_component_views(
+        self, now: float, hardware: HardwareSnapshot
+    ) -> None:
+        """До решения Supervisor обновить автоматы только наблюдениями.
+
+        Первый вызов восстанавливает физическую картину. Последующие нужны,
+        чтобы после разрыва HA или внешнего ручного действия Supervisor увидел
+        новое положение до формирования цели и не применил старую цель снова.
+        ``actions_allowed=False`` гарантирует отсутствие service calls.
+        """
+        for slot, controller in self.generator_controllers.items():
+            controller.step(
+                now,
+                hardware.generators[slot],
+                desired_running=self.supervisor.desired_generators[slot],
+                actions_allowed=False,
+                stable_managed_session=self.supervisor.manages_stable_generator(slot),
+            )
+
+        desired_generator = self.supervisor.desired_source.generator
+        ready = (
+            desired_generator is not None
+            and self.generator_controllers[desired_generator]
+            .status(hardware.generators[desired_generator])
+            .ready_for_load
+        )
+        self.power_transfer.step(
+            now,
+            hardware.power_transfer,
+            self.supervisor.desired_source,
+            desired_generator_ready=ready,
+            actions_allowed=False,
+        )
+
+    def _supervisor_observation(
+        self, hardware: HardwareSnapshot
+    ) -> SupervisorObservation:
+        return SupervisorObservation(
+            grid_ready=hardware.grid_ready,
+            automatic_transfer_enabled=(
+                hardware.automatic_transfer_enabled and self.armed
+            ),
+            emergency_stop=hardware.emergency_stop,
+            power=self.power_transfer.status(),
+            generators={
+                slot: controller.status(hardware.generators[slot])
+                for slot, controller in self.generator_controllers.items()
+            },
+            power_inputs_known=hardware.power_transfer.required_states_known,
+        )
+
+    def _attempt_recovery_reset(
+        self, now: float, hardware: HardwareSnapshot
+    ) -> None:
+        needs_reset = (
+            self.supervisor.phase == SupervisorPhase.RECOVERY_REQUIRED
+            or self.power_transfer.status().recovery_required
+            or any(
+                controller.phase
+                in {GeneratorPhase.FAULT, GeneratorPhase.RECOVERY_REQUIRED}
+                for controller in self.generator_controllers.values()
+            )
+        )
+        if not needs_reset:
+            self.supervisor.recovery_reset_result(
+                False,
+                "Сброс не требуется: контроллеры не находятся в аварийном состоянии.",
+            )
+            return
+
+        generators_safe = all(
+            item.running is False
+            and item.remote_on is False
+            and item.load_connected is not True
+            for item in hardware.generators.values()
+        )
+        if hardware.emergency_stop is not False or not generators_safe:
+            self.supervisor.recovery_reset_result(
+                False,
+                "Сброс отклонён: сначала снимите Emergency Stop, остановите оба "
+                "генератора и отключите генераторную шину.",
+            )
+            return
+
+        if not self.power_transfer.request_recovery_reset(hardware.power_transfer):
+            self.supervisor.recovery_reset_result(
+                False,
+                "Сброс отклонён: силовая топология не подтверждена как Grid/МАП.",
+            )
+            return
+
+        for slot, controller in self.generator_controllers.items():
+            controller.request_fault_reset()
+            controller.step(
+                now,
+                hardware.generators[slot],
+                desired_running=False,
+                actions_allowed=False,
+            )
+
+        reset_succeeded = all(
+            controller.phase == GeneratorPhase.IDLE
+            for controller in self.generator_controllers.values()
+        )
+        self.supervisor.recovery_reset_result(
+            reset_succeeded,
+            "Аварийная транзакция сброшена; управление снова разрешено."
+            if reset_succeeded
+            else "Сброс отклонён одним из контроллеров генераторов.",
+        )
 
     async def _wait_until_required_entities_ready(self) -> None:
-        """
-        Не начинаем ATS, пока невозможно достоверно восстановить топологию.
-
-        Температура гаража НЕ критична: при unavailable core сознательно выбирает
-        cold start и максимальный прогрев.
-
-        input_button может иметь `unknown` до первого нажатия — это нормально;
-        для него проверяем только факт существования сущности.
-        """
+        last_log_at = 0.0
         while not self.stop_event.is_set():
-            missing = self._missing_required_entities()
+            missing = self.adapter.missing_required_entities(
+                include_control_entities=self.armed
+            )
             if not missing:
-                snapshot = self._snapshot()
-                self.log.info("Все обязательные сущности доступны.")
-                self.log.info("Исходная физическая картина: %s", self._snapshot_text(snapshot))
                 return
 
-            self.log.error(
-                "ATS пока не может стартовать. Недоступны обязательные сущности: %s",
-                ", ".join(missing),
+            now = time.monotonic()
+            if now - last_log_at >= 30.0:
+                self.log.warning(
+                    "Ожидаем обязательные сущности Home Assistant: %s",
+                    ", ".join(missing),
+                )
+                last_log_at = now
+            if await self._stop_requested_within(1.0):
+                return
+            if not self.client.connected.is_set():
+                raise HomeAssistantConnectionError("WebSocket HA потерян")
+
+    async def _publish_ui(self, observation: SupervisorObservation) -> None:
+        try:
+            status = (
+                self.supervisor.status_text(observation)
+                if self.armed
+                else "DISARMED — только наблюдение"
             )
-            await self._sleep_or_stop(15.0)
+            await self.adapter.publish_status(status)
 
-    def _missing_required_entities(self) -> list[str]:
-        critical_known = [
-            ENTITIES["grid_ready"],
-            ENTITIES["house_grid"],
-            ENTITIES["house_generator"],
-            ENTITIES["generator_a_running"],
-            ENTITIES["generator_b_running"],
-            ENTITIES["emergency_stop"],
-            ENTITIES["remote_a"],
-            ENTITIES["remote_b"],
-            ENTITIES["grid_power"],
-            ENTITIES["source_generator"],
-            ENTITIES["ats_enabled"],
-            ENTITIES["session_active"],
-            ENTITIES["session_mode"],
-        ]
-        existence_only = [
-            ENTITIES["manual_start"],
-            ENTITIES["manual_return"],
-        ]
+            # Эти helper-ы — только UI-проекция, а не аппаратные команды.
+            # Обновляем их и в DISARMED, чтобы после перехода с 0.2.5 не
+            # оставались ложные признаки старой сессии.
+            active = self.supervisor.session is not None
+            await self.adapter.publish_session(active, self._session_mode())
+        except Exception as exc:
+            # UI helper-ы не являются частью силовой транзакции.
+            self.log.warning("Не удалось обновить UI helper-ы: %s", exc)
 
-        missing: list[str] = []
-        for entity_id in critical_known:
-            state = self.client.get_state(entity_id)
-            if state is None or state in ("unknown", "unavailable"):
-                missing.append(entity_id)
+    def _session_mode(self) -> str:
+        if self.supervisor.session is None:
+            return "none"
+        if self.supervisor.session.reason == SessionReason.MANUAL_BACKUP:
+            return "manual"
+        return "automatic"
 
-        for entity_id in existence_only:
-            if not self.client.has_entity(entity_id):
-                missing.append(entity_id)
+    async def _record_interrupted_connection(self, exc: Exception) -> None:
+        now = time.time()
+        self.supervisor.mark_connection_lost(now)
+        if self.supervisor.phase == SupervisorPhase.RECOVERY_REQUIRED:
+            self.power_transfer.mark_interrupted(
+                now,
+                "Потеряна связь с Home Assistant.",
+            )
+        try:
+            self._save_state(force=True)
+        except Exception as save_exc:
+            self.log.critical(
+                "Не удалось сохранить отметку о прерванной транзакции: %s",
+                save_exc,
+            )
+        if self.supervisor.phase == SupervisorPhase.RECOVERY_REQUIRED:
+            self.log.critical(
+                "Связь потеряна во время физической транзакции; "
+                "автоматическое продолжение заблокировано: %s",
+                exc,
+            )
 
-        return missing
+    def _restore_supervisor(self) -> EnergySupervisor:
+        config = self._supervisor_config()
+        try:
+            saved = self.state_store.load()
+            if saved is None:
+                return EnergySupervisor(config)
 
-    def _snapshot(self) -> Snapshot:
-        return Snapshot(
-            grid_ready=self._bool_state(ENTITIES["grid_ready"]),
-            house_grid=self._bool_state(ENTITIES["house_grid"]),
-            house_generator=self._bool_state(ENTITIES["house_generator"]),
-            generator_a_running=self._bool_state(ENTITIES["generator_a_running"]),
-            generator_b_running=self._bool_state(ENTITIES["generator_b_running"]),
-            emergency_stop=self._bool_state(ENTITIES["emergency_stop"]),
-            garage_temperature=self._float_state(ENTITIES["garage_temperature"]),
-            remote_a=self._bool_state(ENTITIES["remote_a"]),
-            remote_b=self._bool_state(ENTITIES["remote_b"]),
-            # В HA switch.grid_power использует положительную семантику
-            # (ON = Grid подключён), тогда как чистый core ожидает признак
-            # grid_disconnected. Инверсию выполняем только на границе адаптера.
-            grid_disconnected=self._inverted_bool_state(ENTITIES["grid_power"]),
-            source_generator=self._bool_state(ENTITIES["source_generator"]),
-            ats_enabled=self._bool_state(ENTITIES["ats_enabled"]) is True,
-            session_active=self._bool_state(ENTITIES["session_active"]) is True,
-            session_mode=self.client.get_state(ENTITIES["session_mode"]) or "none",
+            if "supervisor" in saved:
+                journal_version = saved.get("journal_schema_version")
+                if not isinstance(journal_version, int) or isinstance(
+                    journal_version,
+                    bool,
+                ):
+                    raise ValueError("Некорректная версия общего журнала")
+                if journal_version != 1:
+                    raise ValueError(
+                        "Неподдерживаемая версия общего журнала "
+                        f"{journal_version}"
+                    )
+            payload = saved.get("supervisor", saved)
+            if not isinstance(payload, dict):
+                raise ValueError("В журнале отсутствует объект supervisor")
+            supervisor = EnergySupervisor.from_dict(payload, config)
+
+            pending = saved.get("pending_actions", [])
+            if pending:
+                supervisor.require_recovery(
+                    "После restart обнаружены команды без подтверждения исполнения."
+                )
+            return supervisor
+        except Exception as exc:
+            supervisor = EnergySupervisor(config)
+            supervisor.require_recovery(
+                f"Не удалось прочитать сохранённый журнал: {exc}"
+            )
+            return supervisor
+
+    def _supervisor_config(self) -> SupervisorConfig:
+        return SupervisorConfig(
+            grid_failure_delay=float(self.options["grid_failure_delay"]),
+            grid_restore_stable_time=float(
+                self.options["grid_restore_stable_time"]
+            ),
+            manual_idle_warning_seconds=float(
+                self.options["manual_idle_warning_seconds"]
+            ),
+            primary_generator=GeneratorSlot(str(self.options["primary_generator"])),
+            generator_a_enabled=_boolean_option(
+                self.options,
+                "generator_a_enabled",
+            ),
+            generator_b_enabled=_boolean_option(
+                self.options,
+                "generator_b_enabled",
+            ),
         )
 
-    def _bool_state(self, entity_id: str) -> bool | None:
-        state = self.client.get_state(entity_id)
-        if state == "on":
-            return True
-        if state == "off":
-            return False
-        return None
+    def _save_state(self, *, force: bool = False) -> None:
+        payload = {
+            "journal_schema_version": 1,
+            "app_version": APP_VERSION,
+            "supervisor": self.supervisor.to_dict(),
+            "pending_actions": list(self._pending_action_records),
+            "runtime_snapshot": {
+                "generator_a_phase": self.generator_controllers[
+                    GeneratorSlot.A
+                ].phase.value,
+                "generator_b_phase": self.generator_controllers[
+                    GeneratorSlot.B
+                ].phase.value,
+                "power_transfer_phase": self.power_transfer.phase.value,
+            },
+        }
+        signature = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        if not force and signature == self._saved_state_signature:
+            return
+        self.state_store.save(payload)
+        self._saved_state_signature = signature
 
-    def _inverted_bool_state(self, entity_id: str) -> bool | None:
-        """Прочитать логический switch, сохранив unknown как None, и инвертировать."""
-        value = self._bool_state(entity_id)
-        return None if value is None else not value
+    @staticmethod
+    def _describe_actions(
+        transfer_actions: list[TransferAction],
+        generator_actions: list[GeneratorAction],
+    ) -> list[dict[str, str]]:
+        described = [
+            {"controller": "power_transfer", "action": action.kind.value}
+            for action in transfer_actions
+        ]
+        described.extend(
+            {
+                "controller": "generator_controller",
+                "generator": action.slot.value,
+                "action": action.kind.value,
+            }
+            for action in generator_actions
+        )
+        return described
 
-    def _float_state(self, entity_id: str) -> float | None:
-        state = self.client.get_state(entity_id)
-        try:
-            return float(state) if state is not None else None
-        except (TypeError, ValueError):
-            return None
+    def _log_runtime_if_changed(self, observation: SupervisorObservation) -> None:
+        signature = (
+            self.supervisor.phase,
+            observation.power.phase,
+            observation.power.actual_source,
+            observation.generators[GeneratorSlot.A].phase,
+            observation.generators[GeneratorSlot.B].phase,
+        )
+        if signature == self._last_runtime_signature:
+            return
+        self._last_runtime_signature = signature
+        self.log.info(
+            "Состояние: supervisor=%s; transfer=%s/%s; A=%s; B=%s.",
+            self.supervisor.phase.value,
+            observation.power.phase.value,
+            observation.power.actual_source.value,
+            observation.generators[GeneratorSlot.A].phase.value,
+            observation.generators[GeneratorSlot.B].phase.value,
+        )
 
     async def _manual_start_pressed(
-        self, entity_id: str, old: str | None, new: str | None
+        self, entity_id: str, old_state: str | None, new_state: str | None
     ) -> None:
-        if old == new:
-            return
         if not self.armed:
-            self.log.warning(
-                "Нажата '%s', но App DISARMED — команда сознательно проигнорирована.",
-                entity_id,
-            )
+            self.log.info("DISARMED: ручная команда ввода резерва проигнорирована.")
             return
-        self.log.info("Получена ручная команда: включить резервное питание.")
-        self.controller.request_manual_start()
+        self.supervisor.request_manual_start()
 
-    async def _manual_return_pressed(
-        self, entity_id: str, old: str | None, new: str | None
+    async def _manual_stop_pressed(
+        self, entity_id: str, old_state: str | None, new_state: str | None
     ) -> None:
-        if old == new:
-            return
         if not self.armed:
-            self.log.warning(
-                "Нажата '%s', но App DISARMED — команда сознательно проигнорирована.",
-                entity_id,
-            )
+            self.log.info("DISARMED: ручная команда остановки проигнорирована.")
             return
-        self.log.info("Получена ручная команда: остановить генератор.")
-        self.controller.request_manual_return()
+        self.supervisor.request_manual_stop()
 
-    async def _terminal_reset_pressed(
-        self, entity_id: str, old: str | None, new: str | None
+    async def _recovery_reset_pressed(
+        self, entity_id: str, old_state: str | None, new_state: str | None
     ) -> None:
-        if old == new:
-            return
         if not self.armed:
-            self.log.warning(
-                "Нажата '%s', но App DISARMED — команда сознательно проигнорирована.",
-                entity_id,
-            )
+            self.log.info("DISARMED: команда recovery reset проигнорирована.")
             return
-        self.log.info("Получена ручная команда: сбросить состояние TERMINAL.")
-        self.controller.request_terminal_reset()
+        self.supervisor.request_recovery_reset()
 
-    async def _publish_status(self) -> None:
-        """Опубликовать человекочитаемую фазу в optional input_text helper."""
-        if not self.client.has_entity(ENTITIES["status"]):
-            return
-
-        status = self._status_text()
-        if status == self._last_published_status:
-            return
-
-        try:
-            await self.client.call_service(
-                "input_text",
-                "set_value",
-                service_data={"entity_id": ENTITIES["status"], "value": status},
-            )
-        except Exception as exc:
-            # UI helper не относится к силовому контуру и не должен прерывать
-            # state machine. При реальной потере WebSocket основной loop всё
-            # равно обнаружит connected=False на следующем цикле.
-            self.log.warning("Не удалось обновить UI-статус ATS: %s", exc)
-            return
-        self._last_published_status = status
-
-    def _status_text(self) -> str:
-        """Преобразовать внутреннюю Phase в короткий статус для dashboard."""
-        generator = self.controller.active_generator
-        if generator == "A":
-            name = str(self.options.get("generator_a_name", "Elemax"))
-        elif generator == "B":
-            name = str(self.options.get("generator_b_name", "Вепрь"))
-        else:
-            name = "генератор"
-
-        phase = self.controller.phase
-        if phase == Phase.GRID:
-            grid_ready = self._bool_state(ENTITIES["grid_ready"])
-            if grid_ready is True:
-                return "Питание от основной сети"
-            if grid_ready is False:
-                return "Основная сеть OFF — UPS от МАП"
-            return "Нормальное положение Grid / МАП"
-
-        statuses = {
-            Phase.WAITING: "Ожидание данных",
-            Phase.EXTERNAL: "Внешнее управление генератором",
-            Phase.GRID_FAILURE_DELAY: "Ожидание перед запуском",
-            Phase.STARTING: f"Запускается: {name}",
-            Phase.CHOKE_HOLD: f"Запущен, заслонка закрыта: {name}",
-            Phase.PREHEATING: f"Прогрев: {name}",
-            Phase.WAIT_GRID_DECISION: "Ожидание решения по основной сети",
-            Phase.TRANSFER_DISCONNECT_GRID: f"Отключение основной сети: {name}",
-            Phase.TRANSFER_SELECT_GENERATOR: f"Переключение на генератор: {name}",
-            Phase.ON_GENERATOR: f"Питание от генератора: {name}",
-            Phase.FAILOVER_ISOLATE: "Изоляция отказавшего генератора",
-            Phase.GRID_RESTORE_WAIT: "Проверка стабильности основной сети",
-            Phase.RETURN_SELECT_GRID: "Отключение генераторной шины",
-            Phase.RETURN_CONNECT_GRID: "Возврат на основную сеть",
-            Phase.COOLDOWN: f"Охлаждение: {name}",
-            Phase.STOPPING: f"Остановка: {name}",
-            Phase.MANUAL_ISOLATE_GENERATOR: "Ручная остановка: отключение нагрузки",
-            Phase.MANUAL_CONNECT_NORMAL: "Ручная остановка: переход на Grid / МАП",
-            Phase.MANUAL_COOLDOWN: f"Ручная остановка: охлаждение {name}",
-            Phase.MANUAL_STOPPING: f"Ручная остановка: останавливается {name}",
-            Phase.TERMINAL: "Авария ATS — требуется сброс",
-        }
-        return statuses[phase]
-
-    async def _execute_action(self, action: Action) -> None:
-        """Единственная точка, где решение core превращается в реальный HA service call."""
-        if not self.armed:
-            # Дополнительная защита на самом нижнем программном уровне.
-            self.log.error("Попытка выполнить Action при DISARMED подавлена: %r", action)
-            return
-
-        self.log.info(
-            "ATS действие: kind=%s target=%s value=%s message=%s",
-            action.kind,
-            action.target,
-            action.value,
-            action.message,
-        )
-
-        if action.kind == "switch_on":
-            await self.client.call_service(
-                "switch", "turn_on", service_data={"entity_id": action.target}
-            )
-        elif action.kind == "switch_off":
-            await self.client.call_service(
-                "switch", "turn_off", service_data={"entity_id": action.target}
-            )
-        elif action.kind == "button":
-            await self.client.call_service(
-                "button", "press", service_data={"entity_id": action.target}
-            )
-        elif action.kind == "set_session":
-            service = "turn_on" if action.value == "on" else "turn_off"
-            await self.client.call_service(
-                "input_boolean",
-                service,
-                service_data={"entity_id": ENTITIES["session_active"]},
-            )
-        elif action.kind == "set_session_mode":
-            await self.client.call_service(
-                "input_select",
-                "select_option",
-                service_data={
-                    "entity_id": ENTITIES["session_mode"],
-                    "option": action.value,
-                },
-            )
-        elif action.kind == "notify_critical":
-            await self.client.call_service(
-                "script", "notify_critical", service_data={"message": action.message}
-            )
-        elif action.kind == "notify_warning":
-            await self.client.call_service(
-                "script", "notify_warning", service_data={"message": action.message}
-            )
-        elif action.kind == "log":
-            await self.client.call_service(
-                "logbook",
-                "log",
-                service_data={
-                    "name": "АВР генераторов",
-                    "message": action.message or "",
-                    # По принятому правилу каждая запись привязана к entity_id.
-                    "entity_id": action.entity_id
-                    or ENTITIES["ats_enabled"],
-                },
-            )
-        else:
-            raise RuntimeError(f"Неизвестный Action.kind: {action.kind!r}")
-
-    def _config_from_options(self) -> Config:
-        o = self.options
-
-        def num(key: str, default: float) -> float:
-            try:
-                return float(o.get(key, default))
-            except (TypeError, ValueError):
-                return float(default)
-
-        def choke_mode(key: str, default: str) -> str:
-            value = str(o.get(key, default)).lower()
-            return value if value in {"always", "temperature", "never"} else default
-
-        defaults = Config()
-        return Config(
-            grid_failure_delay=num("grid_failure_delay", defaults.grid_failure_delay),
-            grid_restore_stable_time=num(
-                "grid_restore_stable_time", defaults.grid_restore_stable_time
-            ),
-            generator_start_timeout=num(
-                "generator_start_timeout", defaults.generator_start_timeout
-            ),
-            generator_stop_timeout=num(
-                "generator_stop_timeout", defaults.generator_stop_timeout
-            ),
-            transfer_confirmation_timeout=num(
-                "transfer_confirmation_timeout",
-                defaults.transfer_confirmation_timeout,
-            ),
-            generator_stop_delay=num(
-                "generator_stop_delay", defaults.generator_stop_delay
-            ),
-            choke_temperature=num("choke_temperature", defaults.choke_temperature),
-            generator_a_choke_mode=choke_mode(
-                "generator_a_choke_mode", defaults.generator_a_choke_mode
-            ),
-            generator_b_choke_mode=choke_mode(
-                "generator_b_choke_mode", defaults.generator_b_choke_mode
-            ),
-            choke_hold_time=num("choke_hold_time", defaults.choke_hold_time),
-            preheat_warm_temp=num(
-                "preheat_warm_temperature", defaults.preheat_warm_temp
-            ),
-            preheat_cool_temp=num(
-                "preheat_cool_temperature", defaults.preheat_cool_temp
-            ),
-            preheat_cold_temp=num(
-                "preheat_cold_temperature", defaults.preheat_cold_temp
-            ),
-            preheat_warm_seconds=num(
-                "preheat_warm_seconds", defaults.preheat_warm_seconds
-            ),
-            preheat_cool_seconds=num(
-                "preheat_cool_seconds", defaults.preheat_cool_seconds
-            ),
-            preheat_cold_seconds=num(
-                "preheat_cold_seconds", defaults.preheat_cold_seconds
-            ),
-            preheat_very_cold_seconds=num(
-                "preheat_very_cold_seconds", defaults.preheat_very_cold_seconds
-            ),
-        )
-
-    def _log_phase_transition(
-        self, before: Phase, after: Phase, snapshot: Snapshot
-    ) -> None:
-        if after == before and after == self._last_phase:
-            return
-
-        if after != before:
-            self.log.info(
-                "ATS phase: %s -> %s | active_generator=%s | %s",
-                before.value,
-                after.value,
-                self.controller.active_generator or "-",
-                self._snapshot_text(snapshot),
-            )
-        elif self._last_phase is None:
-            self.log.info(
-                "ATS phase: %s | %s", after.value, self._snapshot_text(snapshot)
-            )
-        self._last_phase = after
-
-    @staticmethod
-    def _snapshot_signature(s: Snapshot) -> tuple[Any, ...]:
-        return (
-            s.grid_ready,
-            s.house_grid,
-            s.house_generator,
-            s.generator_a_running,
-            s.generator_b_running,
-            s.emergency_stop,
-            s.remote_a,
-            s.remote_b,
-            s.grid_disconnected,
-            s.source_generator,
-            s.ats_enabled,
-            s.session_active,
-            s.session_mode,
-            s.garage_temperature,
-        )
-
-    @staticmethod
-    def _snapshot_text(s: Snapshot) -> str:
-        temp = "?" if s.garage_temperature is None else f"{s.garage_temperature:.1f}°C"
-        return (
-            f"GridReady={s.grid_ready}, HouseGrid={s.house_grid}, "
-            f"HouseGen={s.house_generator}, A={s.generator_a_running}, "
-            f"B={s.generator_b_running}, RemoteA={s.remote_a}, "
-            f"RemoteB={s.remote_b}, GridDisconnected={s.grid_disconnected}, "
-            f"SourceGenerator={s.source_generator}, EStop={s.emergency_stop}, "
-            f"ATS={s.ats_enabled}, Session={s.session_active}/{s.session_mode}, "
-            f"Garage={temp}"
-        )
-
-    async def _sleep_or_stop(self, seconds: float) -> None:
+    async def _stop_requested_within(self, seconds: float) -> bool:
         try:
             await asyncio.wait_for(self.stop_event.wait(), timeout=seconds)
+            return True
         except asyncio.TimeoutError:
-            pass
+            return False
 
 
-# ============================================================================
-# ЗАГРУЗКА /data/options.json
-# ============================================================================
+# Имя оставлено как совместимый alias для внешних тестов/импортов 0.2.x.
+EnergyATSApp = EnergySupervisorApp
+
+
+def _boolean_option(options: dict[str, Any], name: str) -> bool:
+    value = options[name]
+    if not isinstance(value, bool):
+        raise ValueError(f"Параметр {name} должен быть JSON boolean")
+    return value
+
+
 def load_options(path: str | Path = "/data/options.json") -> dict[str, Any]:
-    p = Path(path)
-    if not p.exists():
+    options_path = Path(path)
+    if not options_path.exists():
         return dict(DEFAULT_OPTIONS)
-    with p.open("r", encoding="utf-8") as file:
-        loaded = json.load(file)
+    with options_path.open("r", encoding="utf-8") as stream:
+        loaded = json.load(stream)
     if not isinstance(loaded, dict):
-        raise ValueError("/data/options.json должен содержать JSON object")
+        raise ValueError("options.json должен содержать JSON object")
     return {**DEFAULT_OPTIONS, **loaded}
 
 
@@ -731,12 +591,12 @@ async def async_main() -> None:
     token = os.environ.get("SUPERVISOR_TOKEN")
     if not token:
         raise RuntimeError(
-            "SUPERVISOR_TOKEN не найден. Проверьте homeassistant_api: true в config.yaml App."
+            "SUPERVISOR_TOKEN не найден. Проверьте homeassistant_api: true в config.yaml."
         )
 
     options = load_options()
     configure_logging(str(options.get("log_level", "info")))
-    app = EnergyATSApp(options, token)
+    app = EnergySupervisorApp(options, token)
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):

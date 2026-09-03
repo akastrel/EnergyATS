@@ -17,48 +17,18 @@ configuration:
   grid_restore_stable_time:
     name: "Grid restore stability time, s"
     description: "How long Grid Input Ready must stay ON before returning the house to Grid."
-  generator_start_timeout:
-    name: "Generator start timeout, s"
-    description: "Maximum wait for generator_*_is_running after REMOTE START."
-  generator_stop_timeout:
-    name: "Generator stop timeout, s"
-    description: "Maximum wait for generator_*_is_running to become OFF after REMOTE START is removed."
-  generator_stop_delay:
-    name: "No-load cooldown before stop, s"
-    description: "Generator cooldown after the house has returned to Grid."
+  manual_idle_warning_seconds:
+    name: "Manual idle warning, s"
+    description: "When to remind the operator that a manually started generator is still idling after the house returned to Grid. It is not stopped automatically."
   transfer_confirmation_timeout:
     name: "Transfer confirmation timeout, s"
     description: "Maximum wait for physical house_powered_by_* feedback after a power transfer step."
-  generator_a_choke_mode:
-    name: "Generator A / Elemax choke mode"
-    description: "always closes the choke; temperature uses garage temperature; never keeps it open."
-  generator_b_choke_mode:
-    name: "Generator B / Vepr choke mode"
-    description: "always closes the choke; temperature uses garage temperature; never keeps it open."
-  choke_temperature:
-    name: "Choke threshold temperature, °C"
-    description: "Used only with choke_mode=temperature; an unknown temperature selects cold start."
-  choke_hold_time:
-    name: "Choke hold after RUNNING, s"
-    description: "How long to keep the choke closed after the engine RUNNING signal appears."
-  preheat_warm_temperature:
-    name: "Warm preheat threshold, °C"
-    description: "T >= this value uses the shortest preheat time."
-  preheat_cool_temperature:
-    name: "Cool preheat threshold, °C"
-    description: "Lower boundary of the medium preheat range."
-  preheat_cold_temperature:
-    name: "Cold preheat threshold, °C"
-    description: "At or below this value the longest preheat time is used."
-  preheat_warm_seconds:
-    name: "Warm preheat, s"
-    description: "Preheat duration at warm temperature."
-  preheat_cool_seconds:
-    name: "Cool preheat, s"
-    description: "Preheat duration in the cool temperature range."
-  preheat_cold_seconds:
-    name: "Cold preheat, s"
-    description: "Preheat duration in the cold temperature range."
-  preheat_very_cold_seconds:
-    name: "Maximum preheat, s"
-    description: "Used at very low or unknown garage temperature."
+  primary_generator:
+    name: "Primary generator"
+    description: "First candidate for a new managed session. Version 0.3.0 does not automatically fail over after a generator fault."
+  generator_a_enabled:
+    name: "Enable Generator A"
+    description: "Allow the Supervisor to select Elemax for a new session."
+  generator_b_enabled:
+    name: "Enable Generator B"
+    description: "Allow the Supervisor to select Vepr for a new session."

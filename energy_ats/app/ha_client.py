@@ -58,6 +58,8 @@ class HomeAssistantClient:
         self._next_id = 1
         self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
         self._listeners: dict[str, list[StateListener]] = defaultdict(list)
+        self._buffer_state_events = False
+        self._buffered_state_events: list[dict[str, Any]] = []
 
         # Сохраняем весь объект state из HA, а не только строку `state`.
         # Сейчас ATS использует в основном строковые состояния, но attributes
@@ -91,11 +93,16 @@ class HomeAssistantClient:
                     f"Авторизация Home Assistant не удалась: {auth!r}"
                 )
 
-            # После авторизации запускается единственный постоянный reader.
+            # Сначала включаем подписку, затем берём snapshot. События между
+            # этими шагами временно буферизуются и накладываются поверх
+            # snapshot, поэтому короткого окна с потерянным фронтом нет.
+            self._buffer_state_events = True
+            self._buffered_state_events = []
             self._reader_task = asyncio.create_task(
                 self._reader_loop(), name="ha-websocket-reader"
             )
 
+            await self.request("subscribe_events", event_type="state_changed")
             states = await self.request("get_states")
             result = states.get("result")
             if not isinstance(result, list):
@@ -108,11 +115,16 @@ class HomeAssistantClient:
                 if isinstance(item, dict) and "entity_id" in item
             }
 
-            # Подписываемся после initial snapshot. Возможна очень короткая гонка
-            # между get_states и subscribe_events, но следующий физический фронт
-            # всё равно придёт. Для ATS это приемлемо; после reconnect core также
-            # полностью реконструирует состояние из физической картины.
-            await self.request("subscribe_events", event_type="state_changed")
+            # Пока проигрываются накопленные события, reader продолжает
+            # добавлять новые в следующий batch. Между проверкой пустого списка
+            # и снятием флага нет await, поэтому порядок не теряется.
+            while self._buffered_state_events:
+                buffered = self._buffered_state_events
+                self._buffered_state_events = []
+                for event in buffered:
+                    await self._handle_event(event)
+            self._buffer_state_events = False
+
             self.connected.set()
             self.log.info(
                 "Соединение с Home Assistant установлено; получено %d состояний.",
@@ -125,6 +137,8 @@ class HomeAssistantClient:
     async def close(self) -> None:
         """Корректно закрыть соединение и разбудить ожидающие request с ошибкой."""
         self.connected.clear()
+        self._buffer_state_events = False
+        self._buffered_state_events = []
 
         if self._reader_task is not None:
             task = self._reader_task
@@ -235,7 +249,10 @@ class HomeAssistantClient:
                         continue
 
                     if msg_type == "event":
-                        await self._handle_event(data)
+                        if self._buffer_state_events:
+                            self._buffered_state_events.append(data)
+                        else:
+                            await self._handle_event(data)
                         continue
 
                     # auth_* здесь уже не ожидаются; прочие системные сообщения

@@ -1,5 +1,8 @@
-# Energy ATS Home Assistant App
+# Energy ATS 0.3.0
 
-Standalone Python finite-state machine для автоматического ввода генераторного резерва.
+Home Assistant App с внутренней архитектурой Energy Supervisor. Полное
+описание, миграция и требования к Generator Controller находятся в корневой
+документации repository.
 
-Для первого запуска обязательно использовать `armed: false`.
+Для первого запуска и после обновления обязательно использовать
+`armed: false`.
