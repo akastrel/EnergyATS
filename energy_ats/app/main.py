@@ -36,7 +36,7 @@ from power_transfer import PowerTransferController, TransferAction
 from state_store import StateStore
 
 
-APP_VERSION = "0.3.3"
+APP_VERSION = "0.3.4"
 
 
 DEFAULT_OPTIONS: dict[str, Any] = {
@@ -527,6 +527,10 @@ class EnergySupervisorApp:
 
     def _configured_primary_generator(self) -> GeneratorSlot:
         configured_name = str(self.options["primary_generator"])
+        # Совместимость для обновления с версий, где в options сохранено A/B.
+        # После обновления пользователь может выбрать отображаемое имя.
+        if configured_name in {slot.value for slot in GeneratorSlot}:
+            return GeneratorSlot(configured_name)
         for slot, profile in self.profiles.items():
             if profile.display_name == configured_name:
                 return slot

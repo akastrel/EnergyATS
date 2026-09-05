@@ -254,6 +254,19 @@ def test_generator_names_are_mapped_to_internal_slots(tmp_path):
     assert app.supervisor.config.primary_generator == GeneratorSlot.B
 
 
+def test_legacy_generator_slot_allows_in_place_update(tmp_path):
+    app = EnergySupervisorApp(
+        {
+            **DEFAULT_OPTIONS,
+            "primary_generator": "A",
+            "state_file": str(tmp_path / "state.json"),
+        },
+        token="test",
+    )
+
+    assert app.supervisor.config.primary_generator == GeneratorSlot.A
+
+
 def test_adapter_reads_positive_grid_switch_and_external_temperature():
     fake = FakeClient()
     fake.states = populated_states()

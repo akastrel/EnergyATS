@@ -1,4 +1,4 @@
-# Проверки Energy ATS 0.3.3
+# Проверки Energy ATS 0.3.4
 
 Команда:
 
@@ -6,7 +6,7 @@
 pytest -q
 ```
 
-Текущий результат: **85 passed**.
+Текущий результат: **86 passed**.
 
 ## Generator Controller
 
