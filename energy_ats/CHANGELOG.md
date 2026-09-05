@@ -24,9 +24,6 @@
   `choke_to_cold_start`; `choke_to_run` означает рабочее положение двигателя.
 - Recovery reset разрешён только после ручного возврата силовой схемы в
   подтверждённый Grid path и остановки обоих генераторов.
-- В репозиторий добавлен версионированный пример прошивки
-  `examples/esphome/generator-controller.yaml` 0.3.1.
-
 ## 0.3.0
 
 - Монолитный ATS разделён на `EnergySupervisor`, `PowerTransferController`,

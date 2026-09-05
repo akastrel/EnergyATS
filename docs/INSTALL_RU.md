@@ -24,9 +24,8 @@ Generators Emergency Stop       OFF
 
 ## 2. Сначала прошивка Generator Controller 0.3.1
 
-Обновлённый [`generator-controller.yaml`](../examples/esphome/generator-controller.yaml)
-сохраняет всю прежнюю телеметрию и старые кнопки, но использует однозначный
-контракт:
+Обновлённый `generator-controller.yaml` сохраняет всю прежнюю телеметрию и
+старые кнопки, но использует однозначный контракт:
 
 ```text
 button.generator_a_choke_to_cold_start
