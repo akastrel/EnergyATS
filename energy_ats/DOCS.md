@@ -1,4 +1,4 @@
-# Energy ATS 0.3.0
+# Energy ATS 0.3.1
 
 Energy ATS теперь содержит Energy Supervisor, безопасный Power Transfer и два
 независимых Generator Controller в одном Python-процессе.
@@ -8,8 +8,8 @@ Energy ATS теперь содержит Energy Supervisor, безопасный
 1. Обеспечьте питание от Grid.
 2. Остановите оба генератора и снимите оба REMOTE.
 3. Установите `armed: false`.
-4. Прошейте `generator-controller.yaml` 0.3.0: App ожидает новые entities
-   `button.generator_*_choke_to_cold` и `choke_to_run`.
+4. Прошейте `generator-controller.yaml` 0.3.1: App ожидает новые entities
+   `button.generator_*_choke_to_cold_start` и `choke_to_run`.
 5. Затем обновите и запустите этот App.
 
 ## ARMED и автоматический АВР
@@ -22,7 +22,7 @@ Energy ATS теперь содержит Energy Supervisor, безопасный
 `input_boolean.automatic_generator_transfer` управляет только запуском по
 пропаданию Grid. При его состоянии OFF ручные кнопки продолжают работать.
 
-Автоматический fallback с A на B в версии 0.3.0 отключён.
+Автоматический fallback с A на B в версии 0.3.1 отключён.
 
 ## Ручные кнопки
 
@@ -32,7 +32,7 @@ Energy ATS теперь содержит Energy Supervisor, безопасный
   затем выполнить cooldown и снять REMOTE.
 - `Сбросить ошибку ATS` — после ручного осмотра выйти из
   `RECOVERY_REQUIRED`, только если оба двигателя и REMOTE выключены, а силовая
-  схема подтверждена в normal path.
+  схема подтверждена в Grid path.
 
 Внешне/локально запущенный двигатель App только отображает и не останавливает.
 

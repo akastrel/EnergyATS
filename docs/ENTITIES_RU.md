@@ -1,4 +1,4 @@
-# Home Assistant entities — Energy ATS 0.3.0
+# Home Assistant entities — Energy ATS 0.3.1
 
 Вся привязка к конкретным `entity_id` находится в `ha_adapter.py`. Остальные
 Python-контроллеры этих имён не знают.
@@ -12,15 +12,15 @@ Python-контроллеры этих имён не знают.
 - `binary_sensor.generator_b_is_running`
 - `switch.generator_a_remote_start`
 - `switch.generator_b_remote_start`
-- `switch.grid_power` — ON означает подключённый normal/Grid path
+- `switch.grid_power` — ON означает подключённый Grid path
 - `switch.use_generator_as_power_source` — ON означает генераторную шину
 - `switch.generators_emergency_stop`
 
-## Команды Generator Controller firmware 0.3.0
+## Команды Generator Controller firmware 0.3.1
 
-- `button.generator_a_choke_to_cold`
+- `button.generator_a_choke_to_cold_start`
 - `button.generator_a_choke_to_run`
-- `button.generator_b_choke_to_cold`
+- `button.generator_b_choke_to_cold_start`
 - `button.generator_b_choke_to_run`
 
 Названия описывают физический результат. В отличие от старых
@@ -63,7 +63,7 @@ Helper-ы являются интерфейсом и отображением. �
 
 ## Устаревший интерфейс заслонки
 
-Прошивка 0.3.0 временно оставляет старые кнопки, чтобы обновление с Energy ATS
+Прошивка 0.3.1 временно оставляет старые кнопки, чтобы обновление с Energy ATS
 0.2.5 можно было выполнить безопасно:
 
 - `button.generator_a_choke_open`
@@ -71,5 +71,5 @@ Helper-ы являются интерфейсом и отображением. �
 - `button.generator_b_choke_open`
 - `button.generator_b_choke_close`
 
-Energy ATS 0.3.0 их не вызывает. Удалить их можно в следующем согласованном
+Energy ATS 0.3.1 их не вызывает. Удалить их можно в следующем согласованном
 релизе после обновления работающей установки.

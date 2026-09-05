@@ -4,7 +4,13 @@ from dataclasses import replace
 
 import pytest
 
-from domain import GeneratorSlot, PowerSource, Transaction, TransactionStatus
+from domain import (
+    GeneratorSlot,
+    PowerPath,
+    PowerSource,
+    Transaction,
+    TransactionStatus,
+)
 from energy_supervisor import (
     EnergySupervisor,
     SupervisorConfig,
@@ -39,16 +45,21 @@ def generator_status(
     )
 
 
-def power_status(source: PowerSource) -> PowerTransferStatus:
-    if source == PowerSource.GRID:
-        phase = TransferPhase.STABLE_GRID
-    elif source == PowerSource.BATTERY:
-        phase = TransferPhase.STABLE_BATTERY
+def power_status(
+    source: PowerSource,
+    path: PowerPath | None = None,
+) -> PowerTransferStatus:
+    actual_path = path or PowerPath.for_source(source)
+    if actual_path == PowerPath.GRID:
+        phase = TransferPhase.STABLE_GRID_PATH
+    elif actual_path == PowerPath.BATTERY:
+        phase = TransferPhase.STABLE_BATTERY_PATH
     else:
         phase = TransferPhase.STABLE_GENERATOR
     return PowerTransferStatus(
         phase=phase,
         actual_source=source,
+        actual_path=actual_path,
         target_source=source,
         transition_in_progress=False,
         recovery_required=False,
@@ -60,6 +71,8 @@ def observation(
     *,
     grid_ready: bool = True,
     source: PowerSource = PowerSource.GRID,
+    path: PowerPath | None = None,
+    transfer_status: PowerTransferStatus | None = None,
     automatic: bool = False,
     a: GeneratorStatus | None = None,
     b: GeneratorStatus | None = None,
@@ -69,7 +82,7 @@ def observation(
         grid_ready=grid_ready,
         automatic_transfer_enabled=automatic,
         emergency_stop=False,
-        power=power_status(source),
+        power=transfer_status or power_status(source, path),
         generators={
             GeneratorSlot.A: a or generator_status(GeneratorSlot.A),
             GeneratorSlot.B: b or generator_status(GeneratorSlot.B),
@@ -214,7 +227,7 @@ def test_manual_outage_session_returns_house_to_grid_but_leaves_engine_running()
             a=ready_a(),
         ),
     )
-    assert supervisor.phase == SupervisorPhase.RETURNING_TO_NORMAL
+    assert supervisor.phase == SupervisorPhase.RETURNING_TO_GRID_OR_BATTERY
     assert decision.desired_source == PowerSource.GRID
 
     decision = supervisor.step(
@@ -243,7 +256,7 @@ def test_manual_stop_without_grid_targets_battery_without_warning():
             a=ready_a(),
         ),
     )
-    assert supervisor.phase == SupervisorPhase.RETURNING_TO_NORMAL
+    assert supervisor.phase == SupervisorPhase.RETURNING_TO_GRID_OR_BATTERY
     assert decision.desired_source == PowerSource.BATTERY
     assert not any("невозмож" in event.message.lower() for event in decision.events)
 
@@ -682,24 +695,31 @@ def test_stable_grid_return_during_start_avoids_unnecessary_transfer():
         remote_on=True,
         ready=False,
     )
-    supervisor.step(
+    decision = supervisor.step(
         1.0,
         observation(
             grid_ready=True,
-            source=PowerSource.GRID,
+            source=PowerSource.BATTERY,
+            path=PowerPath.BATTERY,
             automatic=True,
             a=warming,
         ),
     )
-    supervisor.step(
+    assert supervisor.phase == SupervisorPhase.STARTING_GENERATOR
+    assert decision.desired_source == PowerSource.BATTERY
+
+    decision = supervisor.step(
         3.0,
         observation(
             grid_ready=True,
-            source=PowerSource.GRID,
+            source=PowerSource.BATTERY,
+            path=PowerPath.BATTERY,
             automatic=True,
             a=warming,
         ),
     )
+    assert supervisor.phase == SupervisorPhase.RETURNING_TO_GRID_OR_BATTERY
+    assert decision.desired_source == PowerSource.GRID
 
     decision = supervisor.step(
         4.0,
@@ -711,8 +731,9 @@ def test_stable_grid_return_during_start_avoids_unnecessary_transfer():
         ),
     )
 
-    assert supervisor.phase == SupervisorPhase.RETURNING_TO_NORMAL
+    assert supervisor.phase == SupervisorPhase.STOPPING_GENERATOR
     assert decision.desired_source == PowerSource.GRID
+    assert decision.desired_generators[GeneratorSlot.A] is False
 
 
 def test_external_session_never_moves_power_path_after_engine_stops():
@@ -853,3 +874,149 @@ def test_restart_never_reasserts_saved_source_over_changed_hardware():
     assert restored.phase == SupervisorPhase.RECOVERY_REQUIRED
     assert decision.actions_allowed is False
     assert decision.desired_source == PowerSource.GENERATOR_A
+
+
+def test_external_stop_without_grid_suppresses_automatic_restart_persistently():
+    supervisor = EnergySupervisor(SupervisorConfig(grid_failure_delay=0.0))
+    external = generator_status(
+        GeneratorSlot.A,
+        phase=GeneratorPhase.EXTERNAL_RUNNING,
+        running=True,
+        remote_on=False,
+        external=True,
+    )
+    supervisor.step(
+        0.0,
+        observation(
+            grid_ready=False,
+            source=PowerSource.GENERATOR_A,
+            automatic=True,
+            a=external,
+        ),
+    )
+
+    supervisor.step(
+        1.0,
+        observation(
+            grid_ready=False,
+            source=PowerSource.BATTERY,
+            path=PowerPath.BATTERY,
+            automatic=True,
+        ),
+    )
+    assert supervisor.phase == SupervisorPhase.NORMAL
+    assert supervisor.session is None
+    assert supervisor.automatic_start_suppressed_until_grid is True
+
+    restored = EnergySupervisor.from_dict(
+        supervisor.to_dict(),
+        SupervisorConfig(grid_failure_delay=0.0),
+    )
+    restored.step(
+        100.0,
+        observation(
+            grid_ready=False,
+            source=PowerSource.BATTERY,
+            path=PowerPath.BATTERY,
+            automatic=True,
+        ),
+    )
+    assert restored.session is None
+    assert restored.automatic_start_suppressed_until_grid is True
+
+
+def test_fault_of_either_generator_blocks_new_manual_session():
+    supervisor = EnergySupervisor()
+    supervisor.step(0.0, observation())
+    failed_b = generator_status(
+        GeneratorSlot.B,
+        phase=GeneratorPhase.FAULT,
+        fault="требуется осмотр",
+    )
+
+    supervisor.request_manual_start()
+    decision = supervisor.step(1.0, observation(b=failed_b))
+
+    assert supervisor.session is None
+    assert supervisor.phase == SupervisorPhase.RECOVERY_REQUIRED
+    assert decision.actions_allowed is False
+
+
+def test_fault_of_unmanaged_generator_blocks_active_session():
+    supervisor = EnergySupervisor()
+    enter_manual_session(
+        supervisor,
+        grid_ready=True,
+        initial_source=PowerSource.GRID,
+    )
+    failed_b = generator_status(
+        GeneratorSlot.B,
+        phase=GeneratorPhase.FAULT,
+        fault="требуется осмотр",
+    )
+
+    decision = supervisor.step(
+        10.0,
+        observation(
+            source=PowerSource.GENERATOR_A,
+            a=ready_a(),
+            b=failed_b,
+        ),
+    )
+
+    assert supervisor.phase == SupervisorPhase.RECOVERY_REQUIRED
+    assert decision.actions_allowed is False
+
+
+def test_grid_return_during_transfer_cancels_generator_target_immediately():
+    supervisor = EnergySupervisor(
+        SupervisorConfig(
+            grid_failure_delay=0.0,
+            grid_restore_stable_time=60.0,
+        )
+    )
+    supervisor.step(
+        0.0,
+        observation(
+            grid_ready=False,
+            source=PowerSource.BATTERY,
+            automatic=True,
+        ),
+    )
+    supervisor.step(
+        0.1,
+        observation(
+            grid_ready=False,
+            source=PowerSource.BATTERY,
+            automatic=True,
+        ),
+    )
+    supervisor.step(
+        1.0,
+        observation(
+            grid_ready=False,
+            source=PowerSource.BATTERY,
+            automatic=True,
+            a=ready_a(),
+        ),
+    )
+    assert supervisor.phase == SupervisorPhase.TRANSFERRING_TO_GENERATOR
+
+    transfer = replace(
+        power_status(PowerSource.BATTERY),
+        target_source=PowerSource.GENERATOR_A,
+        transition_in_progress=True,
+    )
+    decision = supervisor.step(
+        2.0,
+        observation(
+            grid_ready=True,
+            source=PowerSource.BATTERY,
+            automatic=True,
+            a=ready_a(),
+            transfer_status=transfer,
+        ),
+    )
+
+    assert supervisor.phase == SupervisorPhase.TRANSFERRING_TO_GENERATOR
+    assert decision.desired_source == PowerSource.BATTERY

@@ -24,7 +24,7 @@ class GeneratorPhase(str, Enum):
     IDLE = "idle"
     PREPARING = "preparing"
     WAITING_FOR_RUNNING = "waiting_for_running"
-    CHOKE_HOLD = "choke_hold"
+    HOLDING_COLD_START_CHOKE = "holding_cold_start_choke"
     WARMING_UP = "warming_up"
     READY_FOR_LOAD = "ready_for_load"
     WAITING_FOR_LOAD_RELEASE = "waiting_for_load_release"
@@ -38,7 +38,7 @@ class GeneratorPhase(str, Enum):
 class GeneratorActionKind(str, Enum):
     REMOTE_ON = "remote_on"
     REMOTE_OFF = "remote_off"
-    CHOKE_TO_COLD = "choke_to_cold"
+    CHOKE_TO_COLD_START = "choke_to_cold_start"
     CHOKE_TO_RUN = "choke_to_run"
 
 
@@ -57,7 +57,7 @@ class GeneratorProfile:
     choke_strategy: ChokeStrategy
     choke_temperature: float = 10.0
     choke_move_seconds: float = 1.0
-    choke_hold_seconds: float = 10.0
+    cold_start_choke_hold_seconds: float = 10.0
     start_timeout_seconds: float = 90.0
     stop_timeout_seconds: float = 90.0
     cooldown_seconds: float = 300.0
@@ -108,7 +108,10 @@ def default_generator_profiles() -> dict[GeneratorSlot, GeneratorProfile]:
             slot=GeneratorSlot.B,
             display_name="Вепрь",
             model="Вепрь 6.5 kW (точная модель пока не указана)",
-            choke_strategy=ChokeStrategy.TEMPERATURE,
+            # Для обоих реальных двигателей положение холодного запуска
+            # используется всегда. Внешняя температура влияет только на
+            # длительность последующего прогрева.
+            choke_strategy=ChokeStrategy.ALWAYS,
         ),
     }
 
@@ -267,6 +270,11 @@ class GeneratorController:
         if self.phase == GeneratorPhase.PREPARING:
             if not desired_running:
                 return self._abort_start(now, observation)
+            if observation.running is True:
+                return self._set_fault(
+                    f"{self.profile.display_name}: RUNNING появился до "
+                    "управляемой команды REMOTE START."
+                )
             if self._deadline_reached(now):
                 self.phase = GeneratorPhase.WAITING_FOR_RUNNING
                 self.deadline = now + self.profile.start_timeout_seconds
@@ -293,7 +301,7 @@ class GeneratorController:
                 )
             return []
 
-        if self.phase == GeneratorPhase.CHOKE_HOLD:
+        if self.phase == GeneratorPhase.HOLDING_COLD_START_CHOKE:
             if not desired_running:
                 return self._abort_start(now, observation)
             if observation.remote_on is not True:
@@ -334,6 +342,7 @@ class GeneratorController:
                 not desired_running
                 and observation.running is False
                 and observation.remote_on is False
+                and observation.load_connected is False
             ):
                 # Дом уже снят с генератора, а человек успел остановить
                 # двигатель раньше программного cooldown. Команд не требуется.
@@ -343,14 +352,30 @@ class GeneratorController:
                 return self._set_fault(
                     f"{self.profile.display_name} потерял RUNNING в рабочем режиме."
                 )
+            if observation.remote_on is not True:
+                return self._set_fault(
+                    f"{self.profile.display_name} потерял REMOTE в рабочем режиме."
+                )
             if not desired_running:
                 return self._begin_stop(now, observation)
             return []
 
         if self.phase == GeneratorPhase.WAITING_FOR_LOAD_RELEASE:
-            if observation.running is not True:
+            if (
+                observation.running is False
+                and observation.remote_on is False
+                and observation.load_connected is False
+            ):
                 self._return_to_idle()
                 return []
+            if observation.running is not True:
+                return self._set_fault(
+                    f"{self.profile.display_name} потерял RUNNING до снятия нагрузки."
+                )
+            if observation.remote_on is not True:
+                return self._set_fault(
+                    f"{self.profile.display_name} потерял REMOTE до снятия нагрузки."
+                )
             if desired_running:
                 self.phase = GeneratorPhase.READY_FOR_LOAD
                 return []
@@ -359,9 +384,21 @@ class GeneratorController:
             return []
 
         if self.phase == GeneratorPhase.COOLING_DOWN:
-            if observation.running is not True:
+            if (
+                observation.running is False
+                and observation.remote_on is False
+                and observation.load_connected is not True
+            ):
                 self._return_to_idle()
                 return []
+            if observation.running is not True:
+                return self._set_fault(
+                    f"{self.profile.display_name} потерял RUNNING во время cooldown."
+                )
+            if observation.remote_on is not True:
+                return self._set_fault(
+                    f"{self.profile.display_name} потерял REMOTE во время cooldown."
+                )
             if desired_running or observation.load_connected is True:
                 self.phase = GeneratorPhase.READY_FOR_LOAD
                 self.deadline = None
@@ -442,7 +479,7 @@ class GeneratorController:
 
         position = "закрыта" if self.choke_used else "открыта"
         action = (
-            GeneratorActionKind.CHOKE_TO_COLD
+            GeneratorActionKind.CHOKE_TO_COLD_START
             if self.choke_used
             else GeneratorActionKind.CHOKE_TO_RUN
         )
@@ -454,8 +491,8 @@ class GeneratorController:
 
     def _running_confirmed(self, now: float) -> list[GeneratorAction]:
         if self.choke_used:
-            self.phase = GeneratorPhase.CHOKE_HOLD
-            self.deadline = now + self.profile.choke_hold_seconds
+            self.phase = GeneratorPhase.HOLDING_COLD_START_CHOKE
+            self.deadline = now + self.profile.cold_start_choke_hold_seconds
         else:
             self.phase = GeneratorPhase.WARMING_UP
             self.deadline = now + self.profile.warmup_seconds(self.start_temperature)

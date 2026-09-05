@@ -31,9 +31,9 @@ ENTITIES = {
     "generator_b_running": "binary_sensor.generator_b_is_running",
     "generator_a_remote": "switch.generator_a_remote_start",
     "generator_b_remote": "switch.generator_b_remote_start",
-    "generator_a_choke_cold": "button.generator_a_choke_to_cold",
+    "generator_a_choke_cold_start": "button.generator_a_choke_to_cold_start",
     "generator_a_choke_run": "button.generator_a_choke_to_run",
-    "generator_b_choke_cold": "button.generator_b_choke_to_cold",
+    "generator_b_choke_cold_start": "button.generator_b_choke_to_cold_start",
     "generator_b_choke_run": "button.generator_b_choke_to_run",
     "emergency_stop": "switch.generators_emergency_stop",
     "ambient_temperature_external": "sensor.garage_temperature",
@@ -156,9 +156,9 @@ class HomeAssistantAdapter:
         existence_only = [ENTITIES["manual_start"], ENTITIES["manual_stop"]]
         if include_control_entities:
             existence_only.extend([
-                ENTITIES["generator_a_choke_cold"],
+                ENTITIES["generator_a_choke_cold_start"],
                 ENTITIES["generator_a_choke_run"],
-                ENTITIES["generator_b_choke_cold"],
+                ENTITIES["generator_b_choke_cold_start"],
                 ENTITIES["generator_b_choke_run"],
             ])
 
@@ -312,8 +312,8 @@ class HomeAssistantAdapter:
             return ENTITIES[f"{prefix}_remote"], "switch", "turn_on"
         if action.kind == GeneratorActionKind.REMOTE_OFF:
             return ENTITIES[f"{prefix}_remote"], "switch", "turn_off"
-        if action.kind == GeneratorActionKind.CHOKE_TO_COLD:
-            return ENTITIES[f"{prefix}_choke_cold"], "button", "press"
+        if action.kind == GeneratorActionKind.CHOKE_TO_COLD_START:
+            return ENTITIES[f"{prefix}_choke_cold_start"], "button", "press"
         return ENTITIES[f"{prefix}_choke_run"], "button", "press"
 
     def _assert_generator_action_safe(self, action: GeneratorAction) -> None:

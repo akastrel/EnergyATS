@@ -20,7 +20,7 @@ def profile(**changes) -> GeneratorProfile:
         model="Test Model",
         choke_strategy=ChokeStrategy.ALWAYS,
         choke_move_seconds=0.5,
-        choke_hold_seconds=1.0,
+        cold_start_choke_hold_seconds=1.0,
         start_timeout_seconds=4.0,
         stop_timeout_seconds=2.0,
         cooldown_seconds=3.0,
@@ -53,7 +53,7 @@ def test_complete_managed_start_warmup_cooldown_and_stop():
     assert controller.phase == GeneratorPhase.IDLE
 
     actions = controller.step(1.0, observed(), desired_running=True)
-    assert action_kinds(actions) == [GeneratorActionKind.CHOKE_TO_COLD]
+    assert action_kinds(actions) == [GeneratorActionKind.CHOKE_TO_COLD_START]
     assert controller.start_temperature_source == "ambient_temperature_external"
 
     actions = controller.step(1.5, observed(), desired_running=True)
@@ -62,7 +62,7 @@ def test_complete_managed_start_warmup_cooldown_and_stop():
 
     running = observed(running=True, remote_on=True)
     assert controller.step(2.0, running, desired_running=True) == []
-    assert controller.phase == GeneratorPhase.CHOKE_HOLD
+    assert controller.phase == GeneratorPhase.HOLDING_COLD_START_CHOKE
 
     actions = controller.step(3.0, running, desired_running=True)
     assert action_kinds(actions) == [GeneratorActionKind.CHOKE_TO_RUN]
@@ -110,7 +110,7 @@ def test_unknown_temperature_uses_conservative_cold_start():
         observed(ambient_temperature_external=None),
         True,
     )
-    assert action_kinds(actions) == [GeneratorActionKind.CHOKE_TO_COLD]
+    assert action_kinds(actions) == [GeneratorActionKind.CHOKE_TO_COLD_START]
     assert controller.start_temperature_source == "conservative_fallback"
 
 
@@ -316,3 +316,28 @@ def test_already_stopped_unloaded_generator_needs_no_stop_command():
 
     assert actions == []
     assert controller.phase == GeneratorPhase.IDLE
+
+
+def test_running_off_without_remote_off_is_not_accepted_as_local_stop():
+    controller = GeneratorController(profile())
+    running = observed(running=True, remote_on=True, load_connected=False)
+    controller.step(
+        0.0,
+        running,
+        desired_running=True,
+        stable_managed_session=True,
+    )
+    controller.step(1.0, running, desired_running=False)
+    assert controller.phase == GeneratorPhase.COOLING_DOWN
+
+    actions = controller.step(
+        2.0,
+        observed(running=False, remote_on=True, load_connected=False),
+        desired_running=False,
+    )
+
+    assert controller.phase == GeneratorPhase.FAULT
+    assert action_kinds(actions) == [
+        GeneratorActionKind.REMOTE_OFF,
+        GeneratorActionKind.CHOKE_TO_RUN,
+    ]

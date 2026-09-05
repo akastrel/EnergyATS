@@ -1,6 +1,7 @@
-# Обновление до Energy ATS 0.3.0
+# Обновление до Energy ATS 0.3.1
 
-0.3.0 меняет внутреннюю архитектуру и контракт команд заслонки. Обновление
+0.3.1 синхронизирует реализацию с `REQUIREMENTS_RU.md`, разделяет Grid path и
+Battery path и уточняет контракт команд заслонки. Обновление
 лучше выполнять при доступной основной сети, остановленных генераторах и
 `armed: false`.
 
@@ -21,19 +22,20 @@ Generators Emergency Stop       OFF
 
 Не обновлять приложение посередине запуска, переключения или cooldown.
 
-## 2. Сначала прошивка Generator Controller 0.3.0
+## 2. Сначала прошивка Generator Controller 0.3.1
 
-Обновлённый `generator-controller.yaml` сохраняет всю прежнюю телеметрию и
-старые кнопки, но добавляет однозначный контракт:
+Обновлённый [`generator-controller.yaml`](../examples/esphome/generator-controller.yaml)
+сохраняет всю прежнюю телеметрию и старые кнопки, но использует однозначный
+контракт:
 
 ```text
-button.generator_a_choke_to_cold
+button.generator_a_choke_to_cold_start
 button.generator_a_choke_to_run
-button.generator_b_choke_to_cold
+button.generator_b_choke_to_cold_start
 button.generator_b_choke_to_run
 ```
 
-Версия прошивки объявлена как `esphome.project.version: 0.3.0` и видна в
+Версия прошивки объявлена как `esphome.project.version: 0.3.1` и видна в
 информации об ESPHome-устройстве.
 
 После прошивки вручную проверить в Home Assistant, что новые четыре кнопки
@@ -49,7 +51,7 @@ button.generator_b_choke_to_run
 https://github.com/akastrel/EnergyATS
 ```
 
-После обновления списка Apps установить версию 0.3.0.
+После обновления списка Apps установить версию 0.3.1.
 
 Из Configuration удалены параметры, которые теперь принадлежат профилям
 двигателей:
@@ -68,7 +70,7 @@ preheat_*
 ```
 
 Если Home Assistant сохранил их от 0.2.5, открыть Configuration, сохранить
-предложенную конфигурацию 0.3.0 и убедиться, что старых полей больше нет.
+предложенную конфигурацию 0.3.1 и убедиться, что старых полей больше нет.
 
 Новая компактная конфигурация:
 
@@ -107,13 +109,13 @@ DISARMED — только наблюдение
 
 - версии и профили Elemax/Вепря;
 - `supervisor=normal`;
-- `transfer=stable_grid/grid`;
+- `transfer=stable_grid_path/grid/grid_path`;
 - `A=idle`, `B=idle`;
 - отсутствие missing required entities.
 
 ## 5. Журнал транзакций
 
-0.3.0 создаёт внутренний файл:
+0.3.1 использует внутренний файл:
 
 ```text
 /data/energy-supervisor-state.json
@@ -122,7 +124,7 @@ DISARMED — только наблюдение
 Это persistent storage самого App. Копировать его в Home Assistant package не
 нужно. При первом обновлении с 0.2.5 файла ещё нет — штатная ситуация.
 
-Если 0.3.0 впервые запущен при уже работающем генераторе без своего журнала,
+Если 0.3.1 впервые запущен при уже работающем генераторе без своего журнала,
 запуск будет классифицирован как внешний. App только сообщит о нём и не станет
 переключать или останавливать оборудование.
 
@@ -157,7 +159,7 @@ input_boolean.automatic_generator_transfer = OFF
 1. осмотреть фактическое состояние;
 2. вручную остановить оба генератора;
 3. снять оба REMOTE;
-4. вернуть selector в normal и `Grid Power` в ON;
+4. снять generator selector и включить `Grid Power`, то есть вернуть Grid path;
 5. снять Emergency Stop, если он был включён;
 6. нажать `Сбросить ошибку ATS`.
 

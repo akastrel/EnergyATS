@@ -16,6 +16,7 @@ from uuid import uuid4
 
 from domain import (
     GeneratorSlot,
+    PowerPath,
     PowerSource,
     SessionReason,
     SupervisorEvent,
@@ -33,7 +34,7 @@ class SupervisorPhase(str, Enum):
     STARTING_GENERATOR = "starting_generator"
     TRANSFERRING_TO_GENERATOR = "transferring_to_generator"
     ON_GENERATOR = "on_generator"
-    RETURNING_TO_NORMAL = "returning_to_normal"
+    RETURNING_TO_GRID_OR_BATTERY = "returning_to_grid_or_battery"
     MANUAL_GENERATOR_IDLE = "manual_generator_idle"
     STOPPING_GENERATOR = "stopping_generator"
     ISOLATING_FAILED_SOURCE = "isolating_failed_source"
@@ -268,6 +269,29 @@ class EnergySupervisor:
             )
             return self._decision(observation)
 
+        # Fault GC, которым не владеет текущая сессия, является аварией
+        # нижнего контроллера по ES-16. Без сессии это относится к обоим GC;
+        # во время сессии — к невыбранному агрегату. Неисправность выбранного
+        # генератора ниже обрабатывается отдельно по ES-15 с изоляцией шины.
+        managed_slot = self.session.generator if self.session is not None else None
+        unsafe_generators = [
+            status
+            for slot, status in observation.generators.items()
+            if slot != managed_slot
+            and status.phase
+            in {GeneratorPhase.FAULT, GeneratorPhase.RECOVERY_REQUIRED}
+        ]
+        if unsafe_generators:
+            self._manual_start_requested = False
+            self._manual_stop_requested = False
+            names = ", ".join(
+                status.display_name for status in unsafe_generators
+            )
+            self._require_recovery(
+                f"Контроллер генератора требует проверки: {names}."
+            )
+            return self._decision(observation)
+
         if self._manual_start_requested:
             self._manual_start_requested = False
             self._handle_manual_start(now, observation)
@@ -337,33 +361,24 @@ class EnergySupervisor:
             # Внешний запуск только наблюдаем; силовую цель не меняем.
             return
 
-        unsafe = [
-            status
-            for status in observation.generators.values()
-            if status.phase
-            in {GeneratorPhase.FAULT, GeneratorPhase.RECOVERY_REQUIRED}
-        ]
-        if unsafe:
-            names = ", ".join(status.display_name for status in unsafe)
-            self._require_recovery(
-                f"Контроллер генератора требует проверки: {names}."
-            )
-            return
-
         if self.phase == SupervisorPhase.EXTERNAL_RUNNING:
             if (
-                observation.power.actual_source
-                not in {PowerSource.GRID, PowerSource.BATTERY}
+                observation.power.actual_path
+                not in {PowerPath.GRID, PowerPath.BATTERY}
                 or observation.power.transition_in_progress
             ):
                 # Внешний сеанс остаётся внешним и после остановки двигателя,
-                # пока человек сам не вернёт силовую схему в normal path.
+                # пока человек сам не вернёт силовую схему в Grid path или
+                # Battery path.
                 # Никаких команд контакторам здесь не формируем.
                 self.desired_generators = {
                     GeneratorSlot.A: False,
                     GeneratorSlot.B: False,
                 }
                 return
+            if observation.grid_ready is False:
+                self.automatic_start_suppressed_until_grid = True
+                self.grid_failed_since = None
             self._event("info", "Внешне запущенный генератор остановлен.")
 
         self.phase = (
@@ -371,7 +386,9 @@ class EnergySupervisor:
             if self.phase == SupervisorPhase.GRID_FAILURE_DELAY
             else SupervisorPhase.NORMAL
         )
-        self.desired_source = self._normal_source(observation.grid_ready)
+        self.desired_source = self._safe_source_for_grid_state(
+            observation.grid_ready
+        )
 
         if observation.grid_ready is True:
             self.automatic_start_suppressed_until_grid = False
@@ -412,7 +429,12 @@ class EnergySupervisor:
         other_generator = observation.generators[other_slot]
 
         if self.phase == SupervisorPhase.ISOLATING_FAILED_SOURCE:
-            if self._normal_power_confirmed(observation):
+            # Безопасная цель следует за доступностью Grid даже если сеть
+            # изменилась уже после обнаружения отказа.
+            self.desired_source = self._safe_source_for_grid_state(
+                observation.grid_ready
+            )
+            if self._safe_power_path_confirmed(observation):
                 if self.transaction is not None:
                     self.transaction.advance(
                         "recovery_required",
@@ -460,9 +482,23 @@ class EnergySupervisor:
             return
 
         if self.phase == SupervisorPhase.STARTING_GENERATOR:
-            # Пока генератор ещё не готов, дом остаётся на текущем normal path:
-            # Grid при наличии сети либо МАП от аккумуляторов при её отсутствии.
-            self.desired_source = self._normal_source(observation.grid_ready)
+            # Автоматический запуск больше не ведёт к генератору, как только
+            # Grid снова появилась. До 60-секундного подтверждения удерживаем
+            # Battery path, после чего возвращаем дом на Grid path.
+            if (
+                self.session.reason == SessionReason.GRID_OUTAGE
+                and observation.grid_ready is True
+            ):
+                self.desired_source = PowerSource.BATTERY
+                if self._should_return_after_grid_restore(now, observation):
+                    self._begin_return_to_safe_source(now, observation)
+                return
+
+            # Пока генератор не готов, при доступной Grid дом остаётся на Grid
+            # path, а при её отсутствии — на Battery path.
+            self.desired_source = self._safe_source_for_grid_state(
+                observation.grid_ready
+            )
             if generator.externally_started:
                 self._require_recovery(
                     f"{generator.display_name} запущен внешне во время управляемой сессии."
@@ -470,7 +506,7 @@ class EnergySupervisor:
                 return
             if generator.ready_for_load:
                 if self._should_return_after_grid_restore(now, observation):
-                    self._begin_return_to_normal(now, observation)
+                    self._begin_return_to_safe_source(now, observation)
                 else:
                     self.desired_source = PowerSource.for_generator(slot)
                     self.phase = SupervisorPhase.TRANSFERRING_TO_GENERATOR
@@ -478,8 +514,18 @@ class EnergySupervisor:
             return
 
         if self.phase == SupervisorPhase.TRANSFERRING_TO_GENERATOR:
+            if (
+                self.session.reason == SessionReason.GRID_OUTAGE
+                and observation.grid_ready is True
+            ):
+                # Если TPC уже начал движение, цель BATTERY безопасно отменит
+                # ввод генератора и доведёт текущий шаг до конца.
+                self.desired_source = PowerSource.BATTERY
+                if self._should_return_after_grid_restore(now, observation):
+                    self._begin_return_to_safe_source(now, observation)
+                return
             if self._should_return_after_grid_restore(now, observation):
-                self._begin_return_to_normal(now, observation)
+                self._begin_return_to_safe_source(now, observation)
                 return
             if not generator.ready_for_load:
                 self._handle_generator_fault(
@@ -521,10 +567,10 @@ class EnergySupervisor:
                 )
                 return
             if self._should_return_after_grid_restore(now, observation):
-                self._begin_return_to_normal(now, observation)
+                self._begin_return_to_safe_source(now, observation)
             return
 
-        if self.phase == SupervisorPhase.RETURNING_TO_NORMAL:
+        if self.phase == SupervisorPhase.RETURNING_TO_GRID_OR_BATTERY:
             if (
                 observation.grid_ready is False
                 and not self.session.stop_requested
@@ -532,9 +578,12 @@ class EnergySupervisor:
             ):
                 self._cancel_automatic_return(now, observation, generator)
                 return
-            if not self._normal_power_confirmed(observation):
+            if not self._safe_power_path_confirmed(observation):
                 return
-            self._complete_transaction(now, "Normal path Grid/МАП подтверждён.")
+            self._complete_transaction(
+                now,
+                "Целевой Grid path или Battery path подтверждён.",
+            )
             if self.session.stop_requested or self.session.reason != SessionReason.MANUAL_BACKUP:
                 self.desired_generators[slot] = False
                 self.phase = SupervisorPhase.STOPPING_GENERATOR
@@ -564,7 +613,9 @@ class EnergySupervisor:
                     "ручной сессии."
                 )
                 return
-            self.desired_source = self._normal_source(observation.grid_ready)
+            self.desired_source = self._safe_source_for_grid_state(
+                observation.grid_ready
+            )
             if observation.grid_ready is False and generator.ready_for_load:
                 self.desired_source = PowerSource.for_generator(slot)
                 self.phase = SupervisorPhase.TRANSFERRING_TO_GENERATOR
@@ -581,7 +632,9 @@ class EnergySupervisor:
             return
 
         if self.phase == SupervisorPhase.STOPPING_GENERATOR:
-            self.desired_source = self._normal_source(observation.grid_ready)
+            self.desired_source = self._safe_source_for_grid_state(
+                observation.grid_ready
+            )
             if (
                 observation.grid_ready is False
                 and not self.session.stop_requested
@@ -656,7 +709,7 @@ class EnergySupervisor:
         self.session.stop_requested = True
         if observation.grid_ready is False:
             self.automatic_start_suppressed_until_grid = True
-        self._begin_return_to_normal(now, observation)
+        self._begin_return_to_safe_source(now, observation)
 
     def _begin_session(
         self,
@@ -677,7 +730,9 @@ class EnergySupervisor:
         self.desired_generators[slot] = True
         other = GeneratorSlot.B if slot == GeneratorSlot.A else GeneratorSlot.A
         self.desired_generators[other] = False
-        self.desired_source = self._normal_source(observation.grid_ready)
+        self.desired_source = self._safe_source_for_grid_state(
+            observation.grid_ready
+        )
         self.phase = SupervisorPhase.STARTING_GENERATOR
         self.transaction = Transaction.begin(
             "enter_generator", slot.value, now, "start_generator"
@@ -688,13 +743,18 @@ class EnergySupervisor:
             f"{observation.generators[slot].display_name}.",
         )
 
-    def _begin_return_to_normal(
+    def _begin_return_to_safe_source(
         self, now: float, observation: SupervisorObservation
     ) -> None:
-        self.desired_source = self._normal_source(observation.grid_ready)
-        self.phase = SupervisorPhase.RETURNING_TO_NORMAL
+        self.desired_source = self._safe_source_for_grid_state(
+            observation.grid_ready
+        )
+        self.phase = SupervisorPhase.RETURNING_TO_GRID_OR_BATTERY
         self.transaction = Transaction.begin(
-            "return_to_normal", self.desired_source.value, now, "isolate_generator"
+            "return_to_grid_or_battery",
+            self.desired_source.value,
+            now,
+            "isolate_generator",
         )
 
     def _handle_generator_fault(
@@ -707,7 +767,9 @@ class EnergySupervisor:
     ) -> None:
         assert self.session is not None
         slot = self.session.generator
-        self.desired_source = self._normal_source(observation.grid_ready)
+        self.desired_source = self._safe_source_for_grid_state(
+            observation.grid_ready
+        )
         self.desired_generators[slot] = False
         self.phase = SupervisorPhase.ISOLATING_FAILED_SOURCE
         # Это новая физическая транзакция, а не просто финальный статус
@@ -748,8 +810,8 @@ class EnergySupervisor:
         """Корректно пережить повторный провал Grid во время возврата.
 
         Начатую силовую операцию не разворачиваем посередине. Если контакторы
-        уже движутся к normal path, сначала подтверждаем безопасное положение
-        BATTERY, а на следующем шаге снова вводим готовый генератор.
+        уже снимают генераторную шину, сначала подтверждаем Battery path, а на
+        следующем шаге снова вводим готовый генератор.
         """
         slot = self.session.generator
         generator_source = PowerSource.for_generator(slot)
@@ -763,7 +825,7 @@ class EnergySupervisor:
             return
 
         self.desired_source = PowerSource.BATTERY
-        if not self._normal_power_confirmed(observation):
+        if not self._safe_power_path_confirmed(observation):
             return
 
         if not generator.ready_for_load:
@@ -793,7 +855,9 @@ class EnergySupervisor:
             GeneratorSlot.A: False,
             GeneratorSlot.B: False,
         }
-        self.desired_source = self._normal_source(observation.grid_ready)
+        self.desired_source = self._safe_source_for_grid_state(
+            observation.grid_ready
+        )
         self.phase = SupervisorPhase.NORMAL
         self.generator_idle_since = None
         self.idle_warning_sent = False
@@ -810,10 +874,14 @@ class EnergySupervisor:
             and now - self.grid_ready_since >= self.config.grid_restore_stable_time
         )
 
-    def _normal_power_confirmed(self, observation: SupervisorObservation) -> bool:
-        expected = self._normal_source(observation.grid_ready)
+    def _safe_power_path_confirmed(
+        self, observation: SupervisorObservation
+    ) -> bool:
+        expected = self._safe_source_for_grid_state(observation.grid_ready)
+        expected_path = PowerPath.for_source(expected)
         return (
             observation.power.actual_source == expected
+            and observation.power.actual_path == expected_path
             and not observation.power.transition_in_progress
         )
 
@@ -826,12 +894,17 @@ class EnergySupervisor:
             return False
         if self.phase == SupervisorPhase.ON_GENERATOR:
             expected = PowerSource.for_generator(self.session.generator)
-            return observation.power.actual_source == expected
+            return (
+                observation.power.actual_source == expected
+                and observation.power.actual_path == PowerPath.GENERATOR
+            )
         if self.phase == SupervisorPhase.MANUAL_GENERATOR_IDLE:
-            return observation.power.actual_source in {
-                PowerSource.GRID,
-                PowerSource.BATTERY,
-            }
+            expected_path = PowerPath.for_source(observation.power.actual_source)
+            return (
+                observation.power.actual_source
+                in {PowerSource.GRID, PowerSource.BATTERY}
+                and observation.power.actual_path == expected_path
+            )
         return False
 
     def _choose_generator(
@@ -876,7 +949,7 @@ class EnergySupervisor:
             self.grid_failed_since = None
 
     @staticmethod
-    def _normal_source(grid_ready: bool | None) -> PowerSource:
+    def _safe_source_for_grid_state(grid_ready: bool | None) -> PowerSource:
         if grid_ready is True:
             return PowerSource.GRID
         if grid_ready is False:
@@ -963,7 +1036,9 @@ class EnergySupervisor:
             SupervisorPhase.STARTING_GENERATOR: f"Запускается: {generator}",
             SupervisorPhase.TRANSFERRING_TO_GENERATOR: f"Переключение на {generator}",
             SupervisorPhase.ON_GENERATOR: f"Питание от генератора: {generator}",
-            SupervisorPhase.RETURNING_TO_NORMAL: "Возврат на Grid / МАП",
+            SupervisorPhase.RETURNING_TO_GRID_OR_BATTERY: (
+                "Возврат на Grid path / Battery path"
+            ),
             SupervisorPhase.MANUAL_GENERATOR_IDLE: f"{generator} работает без нагрузки",
             SupervisorPhase.STOPPING_GENERATOR: f"Охлаждение / остановка: {generator}",
             SupervisorPhase.ISOLATING_FAILED_SOURCE: "Изоляция отказавшего генератора",
@@ -1003,7 +1078,14 @@ class EnergySupervisor:
         if schema_version != 1:
             raise ValueError("Неподдерживаемая версия журнала Energy Supervisor")
         supervisor = cls(config)
-        supervisor.phase = SupervisorPhase(str(data["phase"]))
+        saved_phase = str(data["phase"])
+        # 0.3.0 называла этот же переход "returning_to_normal". Это известное
+        # старое имя, поэтому журнал можно безопасно прочитать без угадывания
+        # физического состояния; окончательная проверка всё равно выполняется
+        # по обратным связям после запуска.
+        if saved_phase == "returning_to_normal":
+            saved_phase = SupervisorPhase.RETURNING_TO_GRID_OR_BATTERY.value
+        supervisor.phase = SupervisorPhase(saved_phase)
         session = data.get("session")
         supervisor.session = (
             GeneratorSession.from_dict(session) if isinstance(session, Mapping) else None

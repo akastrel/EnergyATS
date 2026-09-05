@@ -39,6 +39,31 @@ class PowerSource(str, Enum):
         return None
 
 
+class PowerPath(str, Enum):
+    """Подтверждённое физическое положение силового переключателя.
+
+    Источник и путь намеренно разделены. При пропавшей Grid дом питается от
+    аккумуляторов МАП, хотя ввод Grid может оставаться подключённым. И наоборот,
+    Battery path означает намеренно отключённый ввод Grid независимо от того,
+    присутствует ли напряжение перед контактором.
+    """
+
+    GRID = "grid_path"
+    BATTERY = "battery_path"
+    GENERATOR = "generator_path"
+    UNKNOWN = "unknown"
+
+    @classmethod
+    def for_source(cls, source: PowerSource) -> "PowerPath":
+        if source == PowerSource.GRID:
+            return cls.GRID
+        if source == PowerSource.BATTERY:
+            return cls.BATTERY
+        if source.generator is not None:
+            return cls.GENERATOR
+        return cls.UNKNOWN
+
+
 class SessionReason(str, Enum):
     NONE = "none"
     MANUAL_BACKUP = "manual_backup"

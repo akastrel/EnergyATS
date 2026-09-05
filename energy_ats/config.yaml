@@ -1,5 +1,5 @@
 name: "Energy ATS"
-version: "0.3.0"
+version: "0.3.1"
 slug: "energy_ats"
 description: >-
   Energy Supervisor: политика источников, безопасная силовая коммутация и

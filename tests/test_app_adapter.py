@@ -105,9 +105,9 @@ def populated_states() -> dict[str, str]:
         ENTITIES["automatic_transfer"]: "off",
         ENTITIES["manual_start"]: "unknown",
         ENTITIES["manual_stop"]: "unknown",
-        ENTITIES["generator_a_choke_cold"]: "unknown",
+        ENTITIES["generator_a_choke_cold_start"]: "unknown",
         ENTITIES["generator_a_choke_run"]: "unknown",
-        ENTITIES["generator_b_choke_cold"]: "unknown",
+        ENTITIES["generator_b_choke_cold_start"]: "unknown",
         ENTITIES["generator_b_choke_run"]: "unknown",
     }
 
@@ -146,7 +146,7 @@ def test_generator_specific_settings_live_in_generator_controller(tmp_path):
     assert app.profiles[GeneratorSlot.A].display_name == "Elemax"
     assert app.profiles[GeneratorSlot.A].choke_strategy == ChokeStrategy.ALWAYS
     assert app.profiles[GeneratorSlot.B].display_name == "Вепрь"
-    assert app.profiles[GeneratorSlot.B].choke_strategy == ChokeStrategy.TEMPERATURE
+    assert app.profiles[GeneratorSlot.B].choke_strategy == ChokeStrategy.ALWAYS
     assert app.profiles[GeneratorSlot.B].choke_temperature == 10.0
     assert app.profiles[GeneratorSlot.A].start_timeout_seconds == 90.0
     assert app.profiles[GeneratorSlot.A].stop_timeout_seconds == 90.0
@@ -169,11 +169,11 @@ def test_adapter_reads_positive_grid_switch_and_external_temperature():
 def test_control_entities_are_required_only_in_armed_mode():
     fake = FakeClient()
     fake.states = populated_states()
-    del fake.states[ENTITIES["generator_a_choke_cold"]]
+    del fake.states[ENTITIES["generator_a_choke_cold_start"]]
     adapter = HomeAssistantAdapter(fake, armed=True)
 
-    assert ENTITIES["generator_a_choke_cold"] in adapter.missing_required_entities()
-    assert ENTITIES["generator_a_choke_cold"] not in adapter.missing_required_entities(
+    assert ENTITIES["generator_a_choke_cold_start"] in adapter.missing_required_entities()
+    assert ENTITIES["generator_a_choke_cold_start"] not in adapter.missing_required_entities(
         include_control_entities=False
     )
 
@@ -524,7 +524,7 @@ async def test_app_journals_pending_command_before_hardware_call(tmp_path):
         {
             "controller": "generator_controller",
             "generator": "A",
-            "action": "choke_to_cold",
+            "action": "choke_to_cold_start",
         }
     ]
     saved_after_call = json.loads(journal.read_text(encoding="utf-8"))
@@ -561,7 +561,7 @@ async def test_manual_stop_during_start_aborts_without_touching_power_selector(
         if domain in {"switch", "button"} and "entity_id" in data
     ]
     assert hardware_calls == [
-        ("button", "press", ENTITIES["generator_a_choke_cold"]),
+        ("button", "press", ENTITIES["generator_a_choke_cold_start"]),
         ("switch", "turn_on", ENTITIES["generator_a_remote"]),
         ("switch", "turn_off", ENTITIES["generator_a_remote"]),
         ("button", "press", ENTITIES["generator_a_choke_run"]),
@@ -597,6 +597,36 @@ async def test_recovery_reset_succeeds_only_from_safe_normal_topology(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_recovery_reset_is_rejected_from_battery_path(tmp_path):
+    journal = tmp_path / "state.json"
+    app = EnergySupervisorApp(
+        {
+            **DEFAULT_OPTIONS,
+            "armed": True,
+            "state_file": str(journal),
+        },
+        token="test",
+    )
+    fake = PhysicalFakeClient(journal)
+    fake.states = populated_states()
+    fake.states.update(
+        {
+            ENTITIES["grid_ready"]: "off",
+            ENTITIES["grid_power"]: "off",
+            ENTITIES["house_grid"]: "off",
+        }
+    )
+    attach_fake_client(app, fake)
+    await app._tick(0.0)
+
+    app.supervisor.require_recovery("test")
+    app.supervisor.request_recovery_reset()
+    await app._tick(1.0)
+
+    assert app.supervisor.phase == SupervisorPhase.RECOVERY_REQUIRED
+
+
+@pytest.mark.asyncio
 async def test_complete_manual_session_obeys_controller_boundaries(tmp_path):
     journal = tmp_path / "state.json"
     app = EnergySupervisorApp(
@@ -629,7 +659,7 @@ async def test_complete_manual_session_obeys_controller_boundaries(tmp_path):
     app.supervisor.request_manual_stop()
     await app._tick(48.0)  # selector -> normal
     await app._tick(49.0)  # Grid power -> ON
-    await app._tick(50.0)  # подтверждение normal path
+    await app._tick(50.0)  # подтверждение Grid path
     await app._tick(51.0)  # начинается cooldown
     await app._tick(350.0)
     assert fake.states[ENTITIES["generator_a_remote"]] == "on"
@@ -646,7 +676,7 @@ async def test_complete_manual_session_obeys_controller_boundaries(tmp_path):
         if domain in {"switch", "button"} and "entity_id" in data
     ]
     assert hardware_calls == [
-        ("button", "press", ENTITIES["generator_a_choke_cold"]),
+        ("button", "press", ENTITIES["generator_a_choke_cold_start"]),
         ("switch", "turn_on", ENTITIES["generator_a_remote"]),
         ("button", "press", ENTITIES["generator_a_choke_run"]),
         ("switch", "turn_off", ENTITIES["grid_power"]),

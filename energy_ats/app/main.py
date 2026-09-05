@@ -35,7 +35,7 @@ from power_transfer import PowerTransferController, TransferAction
 from state_store import StateStore
 
 
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.3.1"
 
 
 DEFAULT_OPTIONS: dict[str, Any] = {
@@ -312,6 +312,28 @@ class EnergySupervisorApp:
             )
             return
 
+        grid_path_confirmed = (
+            hardware.power_transfer.generator_selected is False
+            and hardware.power_transfer.house_on_generator is False
+            and hardware.power_transfer.grid_connected is True
+            and (
+                (
+                    hardware.power_transfer.grid_ready is True
+                    and hardware.power_transfer.house_on_grid is True
+                )
+                or (
+                    hardware.power_transfer.grid_ready is False
+                    and hardware.power_transfer.house_on_grid is False
+                )
+            )
+        )
+        if not grid_path_confirmed:
+            self.supervisor.recovery_reset_result(
+                False,
+                "Сброс отклонён: сначала вручную верните схему в Grid path.",
+            )
+            return
+
         if not self.power_transfer.request_recovery_reset(hardware.power_transfer):
             self.supervisor.recovery_reset_result(
                 False,
@@ -510,6 +532,7 @@ class EnergySupervisorApp:
             self.supervisor.phase,
             observation.power.phase,
             observation.power.actual_source,
+            observation.power.actual_path,
             observation.generators[GeneratorSlot.A].phase,
             observation.generators[GeneratorSlot.B].phase,
         )
@@ -517,10 +540,11 @@ class EnergySupervisorApp:
             return
         self._last_runtime_signature = signature
         self.log.info(
-            "Состояние: supervisor=%s; transfer=%s/%s; A=%s; B=%s.",
+            "Состояние: supervisor=%s; transfer=%s/%s/%s; A=%s; B=%s.",
             self.supervisor.phase.value,
             observation.power.phase.value,
             observation.power.actual_source.value,
+            observation.power.actual_path.value,
             observation.generators[GeneratorSlot.A].phase.value,
             observation.generators[GeneratorSlot.B].phase.value,
         )

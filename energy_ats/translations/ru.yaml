@@ -31,7 +31,7 @@ configuration:
     description: "Ожидание физических house_powered_by_* после каждого шага силовой коммутации."
   primary_generator:
     name: "Основной генератор"
-    description: "Первый кандидат для новой управляемой сессии. Автоматического fallback после его отказа в 0.3.0 нет."
+    description: "Первый кандидат для новой управляемой сессии. Автоматического fallback после его отказа в 0.3.1 нет."
   generator_a_enabled:
     name: "Разрешить Generator A"
     description: "Разрешить Supervisor выбирать Elemax для новой сессии."
