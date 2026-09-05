@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.2
+
+- Ручные команды `start_backup`, `stop_generator` и `reset_recovery` теперь
+  поступают непосредственно в App через `hassio.app_stdin`; HA `input_button`
+  больше не создаются и не требуются.
+- Разрешение автоматического ввода резерва перенесено из
+  `input_boolean.automatic_generator_transfer` во внутренний persistent-журнал
+  App. Новая установка начинается с АВР `OFF`.
+- Добавлены stdin-команды `automatic_transfer_on` и
+  `automatic_transfer_off`. Изменение сохраняется сразу и переживает restart.
+- Удалены необязательные HA-проекции статуса и сессии. Текущая фаза, источник,
+  состояния GC/TPC и положение АВР записываются в журнал App.
+- Energy ATS больше не зависит от пользовательских helper-ов в `energy.yaml`.
+
 ## 0.3.1
 
 - Реализация приведена в соответствие с прошедшим peer review документом

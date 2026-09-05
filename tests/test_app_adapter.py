@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -33,6 +34,7 @@ from ha_adapter import (  # noqa: E402
     UnsafeHardwareCommand,
 )
 from ha_client import HomeAssistantClient  # noqa: E402
+import main as app_main  # noqa: E402
 from main import DEFAULT_OPTIONS, EnergySupervisorApp, load_options  # noqa: E402
 from power_transfer import TransferAction, TransferActionKind  # noqa: E402
 from state_store import StateStore  # noqa: E402
@@ -102,9 +104,6 @@ def populated_states() -> dict[str, str]:
         ENTITIES["ambient_temperature_external"]: "7.5",
         ENTITIES["grid_power"]: "on",
         ENTITIES["source_generator"]: "off",
-        ENTITIES["automatic_transfer"]: "off",
-        ENTITIES["manual_start"]: "unknown",
-        ENTITIES["manual_stop"]: "unknown",
         ENTITIES["generator_a_choke_cold_start"]: "unknown",
         ENTITIES["generator_a_choke_run"]: "unknown",
         ENTITIES["generator_b_choke_cold_start"]: "unknown",
@@ -122,6 +121,125 @@ def test_load_options_merges_small_public_configuration(tmp_path):
     assert options["armed"] is True
     assert options["grid_failure_delay"] == 7
     assert options["transfer_confirmation_timeout"] == 60
+
+
+def test_automatic_transfer_is_off_by_default(tmp_path):
+    app = EnergySupervisorApp(
+        {
+            **DEFAULT_OPTIONS,
+            "state_file": str(tmp_path / "state.json"),
+        },
+        token="test",
+    )
+
+    assert app.automatic_transfer_enabled is False
+
+
+def test_stdin_commands_are_dispatched_without_ha_helpers(tmp_path, monkeypatch):
+    app = EnergySupervisorApp(
+        {
+            **DEFAULT_OPTIONS,
+            "armed": True,
+            "state_file": str(tmp_path / "state.json"),
+        },
+        token="test",
+    )
+    app.commands_ready = True
+    received: list[str] = []
+    monkeypatch.setattr(
+        app.supervisor,
+        "request_manual_start",
+        lambda: received.append("start_backup"),
+    )
+    monkeypatch.setattr(
+        app.supervisor,
+        "request_manual_stop",
+        lambda: received.append("stop_generator"),
+    )
+    monkeypatch.setattr(
+        app.supervisor,
+        "request_recovery_reset",
+        lambda: received.append("reset_recovery"),
+    )
+
+    app.handle_stdin_line('{"command":"start_backup"}')
+    app.handle_stdin_line('{"command":"stop_generator"}')
+    app.handle_stdin_line('{"command":"reset_recovery"}')
+
+    assert received == ["start_backup", "stop_generator", "reset_recovery"]
+
+
+def test_automatic_transfer_command_is_persistent(tmp_path):
+    journal = tmp_path / "state.json"
+    options = {
+        **DEFAULT_OPTIONS,
+        "state_file": str(journal),
+    }
+    app = EnergySupervisorApp(options, token="test")
+
+    app.handle_stdin_line('{"command":"automatic_transfer_on"}')
+    assert app.automatic_transfer_enabled is True
+    assert json.loads(journal.read_text(encoding="utf-8"))[
+        "automatic_transfer_enabled"
+    ] is True
+
+    restored = EnergySupervisorApp(options, token="test")
+    assert restored.automatic_transfer_enabled is True
+
+    restored.handle_stdin_line('{"command":"automatic_transfer_off"}')
+    assert restored.automatic_transfer_enabled is False
+
+
+def test_disarmed_app_ignores_manual_stdin_commands(tmp_path):
+    app = EnergySupervisorApp(
+        {
+            **DEFAULT_OPTIONS,
+            "armed": False,
+            "state_file": str(tmp_path / "state.json"),
+        },
+        token="test",
+    )
+
+    app.handle_stdin_line('{"command":"start_backup"}')
+
+    assert app.supervisor._manual_start_requested is False
+
+
+def test_manual_command_is_not_queued_before_app_is_ready(tmp_path):
+    app = EnergySupervisorApp(
+        {
+            **DEFAULT_OPTIONS,
+            "armed": True,
+            "state_file": str(tmp_path / "state.json"),
+        },
+        token="test",
+    )
+
+    app.handle_stdin_line('{"command":"start_backup"}')
+
+    assert app.supervisor._manual_start_requested is False
+
+
+@pytest.mark.asyncio
+async def test_stdin_reader_accepts_home_assistant_json(tmp_path, monkeypatch):
+    app = EnergySupervisorApp(
+        {
+            **DEFAULT_OPTIONS,
+            "state_file": str(tmp_path / "state.json"),
+        },
+        token="test",
+    )
+    read_fd, write_fd = os.pipe()
+    read_stream = os.fdopen(read_fd, "r", encoding="utf-8")
+    monkeypatch.setattr(app_main.sys, "stdin", read_stream)
+
+    task = asyncio.create_task(app.read_stdin_commands())
+    await asyncio.sleep(0)
+    os.write(write_fd, b'{"command":"automatic_transfer_on"}\n')
+    os.close(write_fd)
+    await asyncio.wait_for(task, timeout=1.0)
+
+    assert app.automatic_transfer_enabled is True
 
 
 def test_string_false_can_never_arm_hardware(tmp_path):
@@ -363,7 +481,7 @@ async def test_disarmed_adapter_never_calls_hardware():
 
 
 @pytest.mark.asyncio
-async def test_disarmed_app_updates_ui_projection_but_not_hardware(tmp_path):
+async def test_disarmed_app_does_not_issue_hardware_commands(tmp_path):
     app = EnergySupervisorApp(
         {
             **DEFAULT_OPTIONS,
@@ -374,13 +492,6 @@ async def test_disarmed_app_updates_ui_projection_but_not_hardware(tmp_path):
     )
     fake = PhysicalFakeClient(tmp_path / "state.json")
     fake.states = populated_states()
-    fake.states.update(
-        {
-            ENTITIES["status"]: "old",
-            ENTITIES["session_active"]: "on",
-            ENTITIES["session_mode"]: "manual",
-        }
-    )
     attach_fake_client(app, fake)
 
     await app._tick(0.0)
@@ -389,16 +500,6 @@ async def test_disarmed_app_updates_ui_projection_but_not_hardware(tmp_path):
         domain in {"switch", "button"}
         for domain, _service, _data in fake.calls
     )
-    assert (
-        "input_boolean",
-        "turn_off",
-        {"entity_id": ENTITIES["session_active"]},
-    ) in fake.calls
-    assert (
-        "input_select",
-        "select_option",
-        {"entity_id": ENTITIES["session_mode"], "option": "none"},
-    ) in fake.calls
 
 
 @pytest.mark.asyncio

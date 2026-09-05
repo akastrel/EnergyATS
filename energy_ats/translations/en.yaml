@@ -25,7 +25,7 @@ configuration:
     description: "Maximum wait for physical house_powered_by_* feedback after a power transfer step."
   primary_generator:
     name: "Primary generator"
-    description: "First candidate for a new managed session. Version 0.3.1 does not automatically fail over after a generator fault."
+    description: "First candidate for a new managed session. Version 0.3.2 does not automatically fail over after a generator fault."
   generator_a_enabled:
     name: "Enable Generator A"
     description: "Allow the Supervisor to select Elemax for a new session."

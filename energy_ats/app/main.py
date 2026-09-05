@@ -12,11 +12,12 @@ import json
 import logging
 import os
 import signal
+import sys
 import time
 from pathlib import Path
 from typing import Any
 
-from domain import GeneratorSlot, SessionReason
+from domain import GeneratorSlot
 from energy_supervisor import (
     EnergySupervisor,
     SupervisorConfig,
@@ -35,12 +36,12 @@ from power_transfer import PowerTransferController, TransferAction
 from state_store import StateStore
 
 
-APP_VERSION = "0.3.1"
+APP_VERSION = "0.3.2"
 
 
 DEFAULT_OPTIONS: dict[str, Any] = {
     # Главный deployment-предохранитель. При false аппаратные service calls
-    # запрещены, но физические состояния и UI-статус продолжают читаться.
+    # запрещены, но физические состояния продолжают читаться и логироваться.
     "armed": False,
     "startup_delay": 30,
     "tick_seconds": 1.0,
@@ -91,25 +92,108 @@ class EnergySupervisorApp:
         )
 
         self.state_store = StateStore(str(self.options["state_file"]))
+        # АВР является политикой самого App, а не состоянием HA-helper-а.
+        # Новая установка всегда начинается с OFF.
+        self.automatic_transfer_enabled = False
         self.supervisor = self._restore_supervisor()
         self._saved_state_signature: str | None = None
         self._pending_action_records: list[dict[str, str]] = []
 
         self.stop_event = asyncio.Event()
+        self.commands_ready = False
         self._last_runtime_signature: tuple[Any, ...] | None = None
-
-        self.client.add_state_listener(
-            ENTITIES["manual_start"], self._manual_start_pressed
-        )
-        self.client.add_state_listener(
-            ENTITIES["manual_stop"], self._manual_stop_pressed
-        )
-        self.client.add_state_listener(
-            ENTITIES["recovery_reset"], self._recovery_reset_pressed
-        )
 
     def request_stop(self) -> None:
         self.stop_event.set()
+
+    async def read_stdin_commands(self) -> None:
+        """Принимать однократные команды от ``hassio.app_stdin``.
+
+        Supervisor передаёт поле ``input`` как одну JSON-строку. Неизвестная
+        или повреждённая команда только записывается в журнал и не может
+        остановить основной цикл автоматики.
+        """
+        reader = asyncio.StreamReader()
+        protocol = asyncio.StreamReaderProtocol(reader)
+        transport = None
+        try:
+            loop = asyncio.get_running_loop()
+            transport, _ = await loop.connect_read_pipe(lambda: protocol, sys.stdin)
+            while not self.stop_event.is_set():
+                line = await reader.readline()
+                if not line:
+                    self.log.warning("STDIN закрыт; ручные команды HA недоступны.")
+                    return
+                self.handle_stdin_line(line.decode("utf-8"))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.log.error("Обработчик команд STDIN остановлен: %s", exc)
+        finally:
+            if transport is not None:
+                transport.close()
+
+    def handle_stdin_line(self, line: str) -> None:
+        """Проверить JSON из HA и передать известную команду Supervisor."""
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError as exc:
+            self.log.warning("Отклонена некорректная JSON-команда: %s", exc)
+            return
+
+        if not isinstance(message, dict) or not isinstance(
+            message.get("command"), str
+        ):
+            self.log.warning(
+                "Отклонена команда без строкового поля 'command': %r", message
+            )
+            return
+
+        command = message["command"]
+        if command == "automatic_transfer_on":
+            self._set_automatic_transfer(True)
+            return
+        if command == "automatic_transfer_off":
+            self._set_automatic_transfer(False)
+            return
+
+        manual_commands = {
+            "start_backup": self.supervisor.request_manual_start,
+            "stop_generator": self.supervisor.request_manual_stop,
+            "reset_recovery": self.supervisor.request_recovery_reset,
+        }
+        handler = manual_commands.get(command)
+        if handler is None:
+            self.log.warning("Неизвестная команда Energy ATS: %s", command)
+            return
+
+        if not self.armed:
+            self.log.info("DISARMED: команда %s проигнорирована.", command)
+            return
+
+        if not self.commands_ready:
+            self.log.warning(
+                "Команда %s отклонена: App ещё не получил обязательные "
+                "физические состояния от Home Assistant.",
+                command,
+            )
+            return
+
+        handler()
+        self.log.info("Принята команда Energy ATS: %s", command)
+
+    def _set_automatic_transfer(self, enabled: bool) -> None:
+        if self.automatic_transfer_enabled == enabled:
+            self.log.info(
+                "Автоматический ввод резерва уже %s.", "ON" if enabled else "OFF"
+            )
+            return
+        self.automatic_transfer_enabled = enabled
+        self._save_state(force=True)
+        self.log.warning(
+            "Автоматический ввод резерва переключён в %s.",
+            "ON" if enabled else "OFF",
+        )
 
     async def run(self) -> None:
         self.log.info("Energy ATS %s запущен.", APP_VERSION)
@@ -141,6 +225,9 @@ class EnergySupervisorApp:
             try:
                 await self.client.connect()
                 await self._wait_until_required_entities_ready()
+                if self.stop_event.is_set():
+                    break
+                self.commands_ready = True
                 await self._connected_loop()
             except asyncio.CancelledError:
                 raise
@@ -153,6 +240,7 @@ class EnergySupervisorApp:
                         reconnect_delay,
                     )
             finally:
+                self.commands_ready = False
                 await self.client.close()
 
             await self._stop_requested_within(reconnect_delay)
@@ -225,7 +313,6 @@ class EnergySupervisorApp:
 
         updated_observation = self._supervisor_observation(hardware)
         await self.adapter.publish_events(decision.events)
-        await self._publish_ui(updated_observation)
         self._log_runtime_if_changed(updated_observation)
 
     def _refresh_component_views(
@@ -268,7 +355,7 @@ class EnergySupervisorApp:
         return SupervisorObservation(
             grid_ready=hardware.grid_ready,
             automatic_transfer_enabled=(
-                hardware.automatic_transfer_enabled and self.armed
+                self.automatic_transfer_enabled and self.armed
             ),
             emergency_stop=hardware.emergency_stop,
             power=self.power_transfer.status(),
@@ -382,31 +469,6 @@ class EnergySupervisorApp:
             if not self.client.connected.is_set():
                 raise HomeAssistantConnectionError("WebSocket HA потерян")
 
-    async def _publish_ui(self, observation: SupervisorObservation) -> None:
-        try:
-            status = (
-                self.supervisor.status_text(observation)
-                if self.armed
-                else "DISARMED — только наблюдение"
-            )
-            await self.adapter.publish_status(status)
-
-            # Эти helper-ы — только UI-проекция, а не аппаратные команды.
-            # Обновляем их и в DISARMED, чтобы после перехода с 0.2.5 не
-            # оставались ложные признаки старой сессии.
-            active = self.supervisor.session is not None
-            await self.adapter.publish_session(active, self._session_mode())
-        except Exception as exc:
-            # UI helper-ы не являются частью силовой транзакции.
-            self.log.warning("Не удалось обновить UI helper-ы: %s", exc)
-
-    def _session_mode(self) -> str:
-        if self.supervisor.session is None:
-            return "none"
-        if self.supervisor.session.reason == SessionReason.MANUAL_BACKUP:
-            return "manual"
-        return "automatic"
-
     async def _record_interrupted_connection(self, exc: Exception) -> None:
         now = time.time()
         self.supervisor.mark_connection_lost(now)
@@ -448,6 +510,10 @@ class EnergySupervisorApp:
                         "Неподдерживаемая версия общего журнала "
                         f"{journal_version}"
                     )
+                self.automatic_transfer_enabled = _strict_saved_bool(
+                    saved.get("automatic_transfer_enabled", False),
+                    "automatic_transfer_enabled",
+                )
             payload = saved.get("supervisor", saved)
             if not isinstance(payload, dict):
                 raise ValueError("В журнале отсутствует объект supervisor")
@@ -490,6 +556,7 @@ class EnergySupervisorApp:
         payload = {
             "journal_schema_version": 1,
             "app_version": APP_VERSION,
+            "automatic_transfer_enabled": self.automatic_transfer_enabled,
             "supervisor": self.supervisor.to_dict(),
             "pending_actions": list(self._pending_action_records),
             "runtime_snapshot": {
@@ -530,6 +597,7 @@ class EnergySupervisorApp:
     def _log_runtime_if_changed(self, observation: SupervisorObservation) -> None:
         signature = (
             self.supervisor.phase,
+            self.automatic_transfer_enabled,
             observation.power.phase,
             observation.power.actual_source,
             observation.power.actual_path,
@@ -540,38 +608,19 @@ class EnergySupervisorApp:
             return
         self._last_runtime_signature = signature
         self.log.info(
-            "Состояние: supervisor=%s; transfer=%s/%s/%s; A=%s; B=%s.",
-            self.supervisor.phase.value,
+            "Состояние: %s; AVR=%s; transfer=%s/%s/%s; A=%s; B=%s.",
+            (
+                self.supervisor.status_text(observation)
+                if self.armed
+                else "DISARMED — только наблюдение"
+            ),
+            "ON" if self.automatic_transfer_enabled else "OFF",
             observation.power.phase.value,
             observation.power.actual_source.value,
             observation.power.actual_path.value,
             observation.generators[GeneratorSlot.A].phase.value,
             observation.generators[GeneratorSlot.B].phase.value,
         )
-
-    async def _manual_start_pressed(
-        self, entity_id: str, old_state: str | None, new_state: str | None
-    ) -> None:
-        if not self.armed:
-            self.log.info("DISARMED: ручная команда ввода резерва проигнорирована.")
-            return
-        self.supervisor.request_manual_start()
-
-    async def _manual_stop_pressed(
-        self, entity_id: str, old_state: str | None, new_state: str | None
-    ) -> None:
-        if not self.armed:
-            self.log.info("DISARMED: ручная команда остановки проигнорирована.")
-            return
-        self.supervisor.request_manual_stop()
-
-    async def _recovery_reset_pressed(
-        self, entity_id: str, old_state: str | None, new_state: str | None
-    ) -> None:
-        if not self.armed:
-            self.log.info("DISARMED: команда recovery reset проигнорирована.")
-            return
-        self.supervisor.request_recovery_reset()
 
     async def _stop_requested_within(self, seconds: float) -> bool:
         try:
@@ -589,6 +638,13 @@ def _boolean_option(options: dict[str, Any], name: str) -> bool:
     value = options[name]
     if not isinstance(value, bool):
         raise ValueError(f"Параметр {name} должен быть JSON boolean")
+    return value
+
+
+def _strict_saved_bool(value: Any, field: str) -> bool:
+    """Не принимать строковые ``on``/``off`` за надёжное состояние журнала."""
+    if not isinstance(value, bool):
+        raise ValueError(f"{field} в журнале должен быть JSON boolean")
     return value
 
 
@@ -629,7 +685,15 @@ async def async_main() -> None:
         except NotImplementedError:
             pass
 
-    await app.run()
+    command_task = asyncio.create_task(
+        app.read_stdin_commands(),
+        name="energy-ats-stdin",
+    )
+    try:
+        await app.run()
+    finally:
+        command_task.cancel()
+        await asyncio.gather(command_task, return_exceptions=True)
 
 
 def main() -> None:

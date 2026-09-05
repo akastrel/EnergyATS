@@ -798,7 +798,7 @@ class EnergySupervisor:
         self._event(
             "warning",
             f"{generator.display_name} продолжительное время работает без нагрузки. "
-            "Остановите генератор ручной кнопкой, если он больше не нужен.",
+            "Выполните stop_generator, если генератор больше не нужен.",
         )
 
     def _cancel_automatic_return(

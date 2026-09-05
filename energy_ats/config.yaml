@@ -1,5 +1,5 @@
 name: "Energy ATS"
-version: "0.3.1"
+version: "0.3.2"
 slug: "energy_ats"
 description: >-
   Energy Supervisor: политика источников, безопасная силовая коммутация и
@@ -14,6 +14,7 @@ boot: auto
 init: false
 stage: experimental
 homeassistant_api: true
+stdin: true
 
 options:
   armed: false

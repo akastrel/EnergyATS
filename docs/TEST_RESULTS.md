@@ -1,4 +1,4 @@
-# Проверки Energy ATS 0.3.1
+# Проверки Energy ATS 0.3.2
 
 Команда:
 
@@ -6,7 +6,7 @@
 pytest -q
 ```
 
-Текущий результат: **80 passed**.
+Текущий результат: **86 passed**.
 
 ## Generator Controller
 
@@ -96,6 +96,10 @@ pytest -q
 - pending-команда и неизвестная версия общего журнала восстанавливаются только
   в `RECOVERY_REQUIRED`;
 - recovery reset принимается только из Grid path и отклоняется из Battery path;
+- stdin-команды передаются непосредственно в App без HA-helper-ов;
+- АВР по умолчанию выключен, изменяется командами и переживает restart;
+- ручная команда не накапливается во время startup или потери данных;
+- реальный асинхронный stdin принимает JSON, отправляемый Home Assistant;
 - сквозной ручной сценарий:
   `choke → REMOTE → RUNNING → warmup → transfer → return → cooldown → stop`;
 - реальный WebSocket roundtrip тестового HA-сервера.
@@ -107,6 +111,5 @@ python -m compileall -q energy_ats/app
 git diff --check
 ```
 
-ESPHome YAML отдельно разбирается YAML-парсером. Полная компиляция прошивки
-требует локальную папку пользовательских `components`, которая не хранится в
-репозитории EnergyATS.
+App config, переводы и Home Assistant package отдельно разбираются
+YAML-парсером с поддержкой тега `!include`.

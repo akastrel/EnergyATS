@@ -3,7 +3,7 @@
 # Содержит:
 #   - вычисляемые состояния UPS и генераторных аккумуляторов;
 #   - признаки готовности внешней сети, UPS и генераторов;
-#   - логические UI-переключатели зарядки основной и запасной генераторных АКБ;
+#   - логические переключатели зарядки основной и запасной генераторных АКБ;
 #   - автоматизацию периодической подзарядки запасной генераторной АКБ
 #     из соседнего файла automations.yaml.
 #
@@ -17,84 +17,6 @@
 #   sensor.generator_aux_battery_voltage
 #
 # Ниже уже везде используется новое entity_id.
-
-# ============================================================================
-# ENERGY SUPERVISOR: UI, РАЗРЕШЕНИЕ И ПРОЕКЦИЯ СОСТОЯНИЯ
-# ============================================================================
-#
-# Сценарии находятся НЕ в YAML, а в Home Assistant App `Energy ATS`:
-# энергетическая политика, силовая коммутация и жизненный цикл генераторов.
-# Package хранит пользовательские команды и UI-проекцию состояния.
-#
-# ВАЖНОЕ РАЗДЕЛЕНИЕ:
-#
-#   input_boolean.automatic_generator_transfer
-#       Штатный разрешатель АВР в UI.
-#       OFF = автоматический запуск по пропаданию Grid запрещён.
-#       Ручные команды резерва/возврата продолжают работать.
-#
-#   input_boolean.generator_reserve_session_active
-#   input_select.generator_reserve_session_mode
-#       Только UI-проекция активной сессии и её типа automatic/manual.
-#       Persistent ownership хранится в transaction journal самого App.
-#
-#   input_text.generator_ats_status
-#       Текущая человекочитаемая фаза для dashboard: «Запускается», «Прогрев»,
-#       «Питание от генератора», «Ручная остановка», «Авария» и т. п.
-#
-# Эти helper-ы НЕ являются источником истины или recovery-журналом. После
-# restart App сверяет свой persistent journal с физическими датчиками:
-# Grid Ready, House Powered by Grid/Generator, Running A/B и реле.
-# ============================================================================
-
-input_boolean:
-  automatic_generator_transfer:
-    name: "Автоматический ввод резерва"
-    icon: mdi:transmission-tower-import
-
-  generator_reserve_session_active:
-    name: "Generator Reserve Session Active"
-    icon: mdi:state-machine
-
-input_select:
-  generator_reserve_session_mode:
-    name: "Generator Reserve Session Mode"
-    icon: mdi:source-branch
-    options:
-      - "none"
-      - "automatic"
-      - "manual"
-
-# Человекочитаемая проекция текущей Phase для dashboard. Значение обновляет
-# Energy ATS; физическим источником истины этот helper не является.
-input_text:
-  generator_ats_status:
-    name: "Состояние Energy ATS"
-    icon: mdi:state-machine
-    max: 100
-
-input_button:
-  # Ручной ввод генераторного резерва.
-  # Работает независимо от automatic_generator_transfer, но НЕ обходит
-  # switch.generators_emergency_stop и остальные safety-проверки ATS.
-  generator_reserve_start:
-    name: "Включить резервное питание"
-    icon: mdi:generator-portable
-
-  # Глобальная ручная остановка управляемой резервной сессии. Сначала ATS
-  # подтверждённо снимает дом с генераторной шины, затем возвращает selector
-  # в Grid и останавливает генератор после cooldown. Если внешней сети нет,
-  # UPS-нагрузки продолжают работать от аккумуляторов МАП.
-  generator_return_to_grid:
-    name: "Остановить генератор"
-    icon: mdi:stop-circle-outline
-
-  # Выход из RECOVERY_REQUIRED без restart App. Перед нажатием оператор обязан
-  # Emergency Stop, убедиться, что оба генератора и REMOTE выключены, а
-  # selector находится в Grid. ATS повторно проверит эти состояния сам.
-  generator_ats_reset:
-    name: "Сбросить ошибку ATS"
-    icon: mdi:restart-alert
 
 # ============================================================================
 # ВЫЧИСЛЯЕМЫЕ СЕНСОРЫ И ЛОГИЧЕСКИЕ UI-ПЕРЕКЛЮЧАТЕЛИ

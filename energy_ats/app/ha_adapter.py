@@ -39,20 +39,12 @@ ENTITIES = {
     "ambient_temperature_external": "sensor.garage_temperature",
     "grid_power": "switch.grid_power",
     "source_generator": "switch.use_generator_as_power_source",
-    "automatic_transfer": "input_boolean.automatic_generator_transfer",
-    "session_active": "input_boolean.generator_reserve_session_active",
-    "session_mode": "input_select.generator_reserve_session_mode",
-    "manual_start": "input_button.generator_reserve_start",
-    "manual_stop": "input_button.generator_return_to_grid",
-    "recovery_reset": "input_button.generator_ats_reset",
-    "status": "input_text.generator_ats_status",
 }
 
 
 @dataclass(frozen=True)
 class HardwareSnapshot:
     grid_ready: bool | None
-    automatic_transfer_enabled: bool
     emergency_stop: bool | None
     generators: dict[GeneratorSlot, GeneratorObservation]
     power_transfer: PowerTransferObservation
@@ -73,9 +65,6 @@ class HomeAssistantAdapter:
         self.client = client
         self.armed = armed
         self.log = logger or logging.getLogger(__name__)
-        self._last_status: str | None = None
-        self._last_session_active: bool | None = None
-        self._last_session_mode: str | None = None
 
     def snapshot(self) -> HardwareSnapshot:
         grid_ready = self.bool_state(ENTITIES["grid_ready"])
@@ -121,9 +110,6 @@ class HomeAssistantAdapter:
 
         return HardwareSnapshot(
             grid_ready=grid_ready,
-            automatic_transfer_enabled=(
-                self.bool_state(ENTITIES["automatic_transfer"]) is True
-            ),
             emergency_stop=emergency_stop,
             generators=generators,
             power_transfer=PowerTransferObservation(
@@ -151,9 +137,8 @@ class HomeAssistantAdapter:
             ENTITIES["emergency_stop"],
             ENTITIES["grid_power"],
             ENTITIES["source_generator"],
-            ENTITIES["automatic_transfer"],
         ]
-        existence_only = [ENTITIES["manual_start"], ENTITIES["manual_stop"]]
+        existence_only: list[str] = []
         if include_control_entities:
             existence_only.extend([
                 ENTITIES["generator_a_choke_cold_start"],
@@ -236,43 +221,10 @@ class HomeAssistantAdapter:
                     )
                 await self._logbook(
                     event.message,
-                    event.entity_id or ENTITIES["automatic_transfer"],
+                    event.entity_id,
                 )
             except Exception as exc:
                 self.log.warning("Не удалось опубликовать событие в HA: %s", exc)
-
-    async def publish_status(self, status: str) -> None:
-        if status == self._last_status or not self.client.has_entity(ENTITIES["status"]):
-            return
-        await self.client.call_service(
-            "input_text",
-            "set_value",
-            service_data={"entity_id": ENTITIES["status"], "value": status},
-        )
-        self._last_status = status
-
-    async def publish_session(self, active: bool, mode: str) -> None:
-        """Синхронизировать прежние HA helper-ы для dashboard и диагностики."""
-        if (
-            active != self._last_session_active
-            and self.client.has_entity(ENTITIES["session_active"])
-        ):
-            await self.client.call_service(
-                "input_boolean",
-                "turn_on" if active else "turn_off",
-                service_data={"entity_id": ENTITIES["session_active"]},
-            )
-            self._last_session_active = active
-        if (
-            mode != self._last_session_mode
-            and self.client.has_entity(ENTITIES["session_mode"])
-        ):
-            await self.client.call_service(
-                "input_select",
-                "select_option",
-                service_data={"entity_id": ENTITIES["session_mode"], "option": mode},
-            )
-            self._last_session_mode = mode
 
     def bool_state(self, entity_id: str) -> bool | None:
         state = self.client.get_state(entity_id)
@@ -378,15 +330,17 @@ class HomeAssistantAdapter:
             return ENTITIES["source_generator"], "turn_on"
         return ENTITIES["source_generator"], "turn_off"
 
-    async def _logbook(self, message: str, entity_id: str) -> None:
+    async def _logbook(self, message: str, entity_id: str | None) -> None:
+        service_data = {
+            "name": "Energy Supervisor",
+            "message": message,
+        }
+        if entity_id is not None:
+            service_data["entity_id"] = entity_id
         await self.client.call_service(
             "logbook",
             "log",
-            service_data={
-                "name": "Energy Supervisor",
-                "message": message,
-                "entity_id": entity_id,
-            },
+            service_data=service_data,
         )
 
     async def _publish_log_entries(
