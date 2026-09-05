@@ -36,7 +36,7 @@ from power_transfer import PowerTransferController, TransferAction
 from state_store import StateStore
 
 
-APP_VERSION = "0.3.2"
+APP_VERSION = "0.3.3"
 
 
 DEFAULT_OPTIONS: dict[str, Any] = {
@@ -51,7 +51,7 @@ DEFAULT_OPTIONS: dict[str, Any] = {
     "grid_failure_delay": 5,
     "grid_restore_stable_time": 60,
     "manual_idle_warning_seconds": 600,
-    "primary_generator": "A",
+    "primary_generator": "Elemax",
     "generator_a_enabled": True,
     "generator_b_enabled": True,
 
@@ -92,9 +92,6 @@ class EnergySupervisorApp:
         )
 
         self.state_store = StateStore(str(self.options["state_file"]))
-        # АВР является политикой самого App, а не состоянием HA-helper-а.
-        # Новая установка всегда начинается с OFF.
-        self.automatic_transfer_enabled = False
         self.supervisor = self._restore_supervisor()
         self._saved_state_signature: str | None = None
         self._pending_action_records: list[dict[str, str]] = []
@@ -150,17 +147,10 @@ class EnergySupervisorApp:
             return
 
         command = message["command"]
-        if command == "automatic_transfer_on":
-            self._set_automatic_transfer(True)
-            return
-        if command == "automatic_transfer_off":
-            self._set_automatic_transfer(False)
-            return
-
         manual_commands = {
-            "start_backup": self.supervisor.request_manual_start,
+            "start_generator": self.supervisor.request_manual_start,
             "stop_generator": self.supervisor.request_manual_stop,
-            "reset_recovery": self.supervisor.request_recovery_reset,
+            "reset": self.supervisor.request_recovery_reset,
         }
         handler = manual_commands.get(command)
         if handler is None:
@@ -181,19 +171,6 @@ class EnergySupervisorApp:
 
         handler()
         self.log.info("Принята команда Energy ATS: %s", command)
-
-    def _set_automatic_transfer(self, enabled: bool) -> None:
-        if self.automatic_transfer_enabled == enabled:
-            self.log.info(
-                "Автоматический ввод резерва уже %s.", "ON" if enabled else "OFF"
-            )
-            return
-        self.automatic_transfer_enabled = enabled
-        self._save_state(force=True)
-        self.log.warning(
-            "Автоматический ввод резерва переключён в %s.",
-            "ON" if enabled else "OFF",
-        )
 
     async def run(self) -> None:
         self.log.info("Energy ATS %s запущен.", APP_VERSION)
@@ -355,7 +332,7 @@ class EnergySupervisorApp:
         return SupervisorObservation(
             grid_ready=hardware.grid_ready,
             automatic_transfer_enabled=(
-                self.automatic_transfer_enabled and self.armed
+                hardware.automatic_transfer_enabled and self.armed
             ),
             emergency_stop=hardware.emergency_stop,
             power=self.power_transfer.status(),
@@ -510,10 +487,6 @@ class EnergySupervisorApp:
                         "Неподдерживаемая версия общего журнала "
                         f"{journal_version}"
                     )
-                self.automatic_transfer_enabled = _strict_saved_bool(
-                    saved.get("automatic_transfer_enabled", False),
-                    "automatic_transfer_enabled",
-                )
             payload = saved.get("supervisor", saved)
             if not isinstance(payload, dict):
                 raise ValueError("В журнале отсутствует объект supervisor")
@@ -541,7 +514,7 @@ class EnergySupervisorApp:
             manual_idle_warning_seconds=float(
                 self.options["manual_idle_warning_seconds"]
             ),
-            primary_generator=GeneratorSlot(str(self.options["primary_generator"])),
+            primary_generator=self._configured_primary_generator(),
             generator_a_enabled=_boolean_option(
                 self.options,
                 "generator_a_enabled",
@@ -552,11 +525,20 @@ class EnergySupervisorApp:
             ),
         )
 
+    def _configured_primary_generator(self) -> GeneratorSlot:
+        configured_name = str(self.options["primary_generator"])
+        for slot, profile in self.profiles.items():
+            if profile.display_name == configured_name:
+                return slot
+        raise ValueError(
+            "Параметр primary_generator должен содержать имя генератора: "
+            + ", ".join(profile.display_name for profile in self.profiles.values())
+        )
+
     def _save_state(self, *, force: bool = False) -> None:
         payload = {
             "journal_schema_version": 1,
             "app_version": APP_VERSION,
-            "automatic_transfer_enabled": self.automatic_transfer_enabled,
             "supervisor": self.supervisor.to_dict(),
             "pending_actions": list(self._pending_action_records),
             "runtime_snapshot": {
@@ -597,7 +579,7 @@ class EnergySupervisorApp:
     def _log_runtime_if_changed(self, observation: SupervisorObservation) -> None:
         signature = (
             self.supervisor.phase,
-            self.automatic_transfer_enabled,
+            observation.automatic_transfer_enabled,
             observation.power.phase,
             observation.power.actual_source,
             observation.power.actual_path,
@@ -614,7 +596,7 @@ class EnergySupervisorApp:
                 if self.armed
                 else "DISARMED — только наблюдение"
             ),
-            "ON" if self.automatic_transfer_enabled else "OFF",
+            "ON" if observation.automatic_transfer_enabled else "OFF",
             observation.power.phase.value,
             observation.power.actual_source.value,
             observation.power.actual_path.value,
@@ -638,13 +620,6 @@ def _boolean_option(options: dict[str, Any], name: str) -> bool:
     value = options[name]
     if not isinstance(value, bool):
         raise ValueError(f"Параметр {name} должен быть JSON boolean")
-    return value
-
-
-def _strict_saved_bool(value: Any, field: str) -> bool:
-    """Не принимать строковые ``on``/``off`` за надёжное состояние журнала."""
-    if not isinstance(value, bool):
-        raise ValueError(f"{field} в журнале должен быть JSON boolean")
     return value
 
 

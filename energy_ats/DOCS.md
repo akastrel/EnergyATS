@@ -1,4 +1,4 @@
-# Energy ATS 0.3.2
+# Energy ATS 0.3.3
 
 Energy ATS теперь содержит Energy Supervisor, безопасный Power Transfer и два
 независимых Generator Controller в одном Python-процессе.
@@ -19,19 +19,20 @@ Energy ATS теперь содержит Energy Supervisor, безопасный
 - `false`: аппаратные switch/button calls запрещены;
 - `true`: контроллерам разрешено исполнять подтверждаемые операции.
 
-Положение АВР хранится внутри App, переживает restart и по умолчанию равно
-`OFF`. Оно меняется командами `automatic_transfer_on` и
-`automatic_transfer_off` через `hassio.app_stdin`.
+Положение АВР задаёт `input_boolean.automatic_generator_transfer` из корневого
+`ats.yaml`. Это настоящее отображаемое состояние Home Assistant, а не кнопка
+для передачи команды. При первом создании оно равно `OFF`, затем HA
+восстанавливает последнее состояние.
 
-Автоматический fallback с A на B в версии 0.3.2 отключён.
+Автоматический fallback после фактического отказа генератора отключён.
 
 ## Ручные команды
 
-- `start_backup` — создать управляемую сессию, запустить
+- `start_generator` — создать управляемую сессию, запустить
   выбранный генератор, прогреть и безопасно ввести его.
 - `stop_generator` — сначала вернуть дом на Grid либо аккумуляторы МАП,
   затем выполнить cooldown и снять REMOTE.
-- `reset_recovery` — после ручного осмотра выйти из
+- `reset` — после ручного осмотра выйти из
   `RECOVERY_REQUIRED`, только если оба двигателя и REMOTE выключены, а силовая
   схема подтверждена в Grid path.
 
@@ -42,11 +43,11 @@ action: hassio.app_stdin
 data:
   app: YOUR_ENERGY_ATS_APP_ID
   input:
-    command: start_backup
+    command: start_generator
 ```
 
-Пользовательские HA-helper-ы для Energy ATS не требуются. Текущее состояние
-контроллеров и АВР записывается в журнал App.
+Кнопка dashboard может вызывать это действие напрямую и не требует entity.
+Текущее состояние контроллеров записывается в журнал App.
 
 Фактический `app` ID лучше выбрать в визуальном редакторе действия Home
 Assistant, выбрав **Energy ATS** из списка.

@@ -1,4 +1,4 @@
-# Проверки Energy ATS 0.3.2
+# Проверки Energy ATS 0.3.3
 
 Команда:
 
@@ -6,7 +6,7 @@
 pytest -q
 ```
 
-Текущий результат: **86 passed**.
+Текущий результат: **85 passed**.
 
 ## Generator Controller
 
@@ -96,20 +96,11 @@ pytest -q
 - pending-команда и неизвестная версия общего журнала восстанавливаются только
   в `RECOVERY_REQUIRED`;
 - recovery reset принимается только из Grid path и отклоняется из Battery path;
-- stdin-команды передаются непосредственно в App без HA-helper-ов;
-- АВР по умолчанию выключен, изменяется командами и переживает restart;
+- три stdin-команды передаются непосредственно в App без HA-кнопок;
+- разрешение АВР читается из `input_boolean.automatic_generator_transfer`;
+- АВР читается из единственного отображаемого HA-helper-а;
 - ручная команда не накапливается во время startup или потери данных;
 - реальный асинхронный stdin принимает JSON, отправляемый Home Assistant;
 - сквозной ручной сценарий:
   `choke → REMOTE → RUNNING → warmup → transfer → return → cooldown → stop`;
 - реальный WebSocket roundtrip тестового HA-сервера.
-
-Дополнительно выполняются:
-
-```bash
-python -m compileall -q energy_ats/app
-git diff --check
-```
-
-App config, переводы и Home Assistant package отдельно разбираются
-YAML-парсером с поддержкой тега `!include`.

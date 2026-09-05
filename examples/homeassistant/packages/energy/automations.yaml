@@ -191,7 +191,7 @@
 #   switch.backup_generator_battery_charging
 #
 # Физическая последовательность отключить -> переключить -> включить
-# находится в самих template switch в energy.yaml.
+# должна находиться в пользовательских template switch Home Assistant.
 # ============================================================================
 
 - id: generator_aux_battery_auto_charge

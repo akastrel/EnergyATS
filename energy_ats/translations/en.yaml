@@ -25,10 +25,10 @@ configuration:
     description: "Maximum wait for physical house_powered_by_* feedback after a power transfer step."
   primary_generator:
     name: "Primary generator"
-    description: "First candidate for a new managed session. Version 0.3.2 does not automatically fail over after a generator fault."
+    description: "First candidate for a new managed session. If both generators are enabled, the other one is the secondary candidate. Automatic failover after an actual generator fault is still disabled."
   generator_a_enabled:
-    name: "Enable Generator A"
+    name: "Enable Elemax"
     description: "Allow the Supervisor to select Elemax for a new session."
   generator_b_enabled:
-    name: "Enable Generator B"
+    name: "Enable Vepr"
     description: "Allow the Supervisor to select Vepr for a new session."

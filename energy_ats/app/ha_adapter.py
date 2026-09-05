@@ -24,6 +24,7 @@ from power_transfer import (
 
 
 ENTITIES = {
+    "automatic_transfer": "input_boolean.automatic_generator_transfer",
     "grid_ready": "binary_sensor.grid_input_ready",
     "house_grid": "binary_sensor.house_powered_by_grid",
     "house_generator": "binary_sensor.house_powered_by_generator",
@@ -45,6 +46,7 @@ ENTITIES = {
 @dataclass(frozen=True)
 class HardwareSnapshot:
     grid_ready: bool | None
+    automatic_transfer_enabled: bool
     emergency_stop: bool | None
     generators: dict[GeneratorSlot, GeneratorObservation]
     power_transfer: PowerTransferObservation
@@ -110,6 +112,9 @@ class HomeAssistantAdapter:
 
         return HardwareSnapshot(
             grid_ready=grid_ready,
+            automatic_transfer_enabled=(
+                self.bool_state(ENTITIES["automatic_transfer"]) is True
+            ),
             emergency_stop=emergency_stop,
             generators=generators,
             power_transfer=PowerTransferObservation(
@@ -127,6 +132,7 @@ class HomeAssistantAdapter:
         self, *, include_control_entities: bool = True
     ) -> list[str]:
         state_required = [
+            ENTITIES["automatic_transfer"],
             ENTITIES["grid_ready"],
             ENTITIES["house_grid"],
             ENTITIES["house_generator"],

@@ -1,4 +1,4 @@
-# Energy ATS 0.3.2
+# Energy ATS 0.3.3
 
 Home Assistant App с внутренней архитектурой Energy Supervisor. Полное
 описание, миграция и требования к Generator Controller находятся в корневой

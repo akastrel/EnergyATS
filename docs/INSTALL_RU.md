@@ -1,8 +1,8 @@
-# Обновление до Energy ATS 0.3.2
+# Обновление до Energy ATS 0.3.3
 
-0.3.2 сохраняет силовую логику 0.3.1, но удаляет зависимость от
-пользовательских HA-helper-ов. Команды передаются непосредственно в App через
-`hassio.app_stdin`, а АВР хранится во внутреннем журнале. Обновление лучше
+0.3.3 сохраняет силовую логику 0.3.1. Ручные команды передаются непосредственно
+в App через `hassio.app_stdin`, а разрешение АВР хранится и отображается через
+`input_boolean.automatic_generator_transfer`. Обновление лучше
 выполнять при доступной основной сети, остановленных генераторах и
 `armed: false`.
 
@@ -51,7 +51,12 @@ button.generator_b_choke_to_run
 https://github.com/akastrel/EnergyATS
 ```
 
-После обновления списка Apps установить версию 0.3.2.
+После обновления списка Apps установить версию 0.3.3.
+
+Перед запуском скопировать корневой `ats.yaml` в каталог packages Home
+Assistant и перечитать конфигурацию HA. Он создаёт только
+`input_boolean.automatic_generator_transfer`; все остальные необходимые
+entities перечислены там в комментариях и должны уже существовать.
 
 Из Configuration удалены параметры, которые теперь принадлежат профилям
 двигателей:
@@ -70,7 +75,7 @@ preheat_*
 ```
 
 Если Home Assistant сохранил их от 0.2.5, открыть Configuration, сохранить
-предложенную конфигурацию 0.3.2 и убедиться, что старых полей больше нет.
+предложенную конфигурацию 0.3.3 и убедиться, что старых полей больше нет.
 
 Новая компактная конфигурация:
 
@@ -83,7 +88,7 @@ grid_failure_delay: 5
 grid_restore_stable_time: 60
 manual_idle_warning_seconds: 600
 transfer_confirmation_timeout: 60
-primary_generator: A
+primary_generator: Elemax
 generator_a_enabled: true
 generator_b_enabled: true
 ```
@@ -115,17 +120,17 @@ DISARMED — только наблюдение
 
 ## 5. Журнал транзакций
 
-0.3.2 использует внутренний файл:
+0.3.3 использует внутренний файл:
 
 ```text
 /data/energy-supervisor-state.json
 ```
 
 Это persistent storage самого App. Копировать его в Home Assistant package не
-нужно. При первом запуске файла ещё нет — это штатная ситуация; АВР начинается
-с `automatic_transfer_enabled = OFF`.
+нужно. При первом запуске файла ещё нет — это штатная ситуация. Положение АВР
+берётся из `input_boolean.automatic_generator_transfer` в корневом `ats.yaml`.
 
-Если 0.3.2 впервые запущен при уже работающем генераторе без своего журнала,
+Если 0.3.3 впервые запущен при уже работающем генераторе без своего журнала,
 запуск будет классифицирован как внешний. App только сообщит о нём и не станет
 переключать или останавливать оборудование.
 
@@ -138,21 +143,20 @@ DISARMED — только наблюдение
 Минимальная последовательность проверки:
 
 1. Grid доступна, оба генератора остановлены.
-2. Выполнить команду `start_backup` через `hassio.app_stdin`.
+2. Выполнить команду `start_generator` через `hassio.app_stdin`.
 3. Проверить заслонку, REMOTE, RUNNING и статус прогрева.
 4. Убедиться, что Grid отключается до выбора генераторной шины.
 5. Выполнить команду `stop_generator`.
 6. Убедиться, что дом снят с генератора до начала cooldown и снятия REMOTE.
 
-Автоматический АВР пока оставить выключенным:
+Автоматический АВР пока оставить выключенным в Home Assistant:
 
 ```text
-automatic_transfer_enabled = OFF
+input_boolean.automatic_generator_transfer = OFF
 ```
 
-Это значение по умолчанию. Для последующего включения и выключения АВР
-используются команды `automatic_transfer_on` и `automatic_transfer_off`.
-Ручные команды от положения АВР не зависят.
+При первом создании helper выключен; затем Home Assistant восстанавливает его
+последнее состояние. Ручные команды от положения АВР не зависят.
 
 ## 7. Recovery Required
 
@@ -164,7 +168,7 @@ automatic_transfer_enabled = OFF
 3. снять оба REMOTE;
 4. снять generator selector и включить `Grid Power`, то есть вернуть Grid path;
 5. снять Emergency Stop, если он был включён;
-6. выполнить команду `reset_recovery`.
+6. выполнить команду `reset`.
 
 Сброс принимается только при однозначно подтверждённом безопасном состоянии.
 
@@ -177,14 +181,14 @@ action: hassio.app_stdin
 data:
   app: YOUR_ENERGY_ATS_APP_ID
   input:
-    command: start_backup
+    command: start_generator
 ```
 
-Значение `command` можно заменить на `stop_generator`, `reset_recovery`,
-`automatic_transfer_on` или `automatic_transfer_off`. Это действие можно
-вызывать из Developer Tools, script, automation либо обычной карточки-кнопки
-dashboard. Никаких `input_button`, `input_boolean`, `input_select` или
-`input_text` для Energy ATS создавать не требуется.
+Значение `command` можно заменить на `stop_generator` или `reset`. Это действие
+можно вызывать из Developer Tools, script, automation либо обычной
+карточки-кнопки dashboard. Для этих команд не нужны `input_button`.
+Единственный state-helper ATS — `input_boolean.automatic_generator_transfer`
+из корневого `ats.yaml`.
 
 Поле `app` проще не вводить вручную: в визуальном редакторе действия выбрать
 **Write data to app stdin**, затем выбрать **Energy ATS**. Home Assistant сам

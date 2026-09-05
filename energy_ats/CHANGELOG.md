@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.3
+
+- Команды упрощены до `start_generator`, `stop_generator` и `reset`.
+- Разрешение АВР снова является настоящим отображаемым состоянием Home
+  Assistant: `input_boolean.automatic_generator_transfer`. Внутреннего дубля
+  и stdin-команд включения/выключения АВР больше нет.
+- Добавлен корневой HA package `ats.yaml` с helper-ом АВР и описанием полного
+  контракта внешних entities; прежний `energy.yaml` удалён.
+- В Configuration вместо абстрактных A/B показываются Elemax и Вепрь. Оба
+  генератора можно независимо разрешить; при двух разрешённых выбранный
+  основной рассматривается первым.
+
 ## 0.3.2
 
 - Ручные команды `start_backup`, `stop_generator` и `reset_recovery` теперь

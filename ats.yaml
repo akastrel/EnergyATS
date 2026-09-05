@@ -1,0 +1,47 @@
+# Home Assistant package для Energy ATS 0.3.3.
+#
+# Подключите этот файл как package Home Assistant. Сам App не создаёт entities.
+# Единственное состояние UI, принадлежащее ATS, — разрешение АВР ниже. При
+# первом создании оно равно OFF; затем Home Assistant восстанавливает последнее
+# состояние.
+#
+# Обязательные внешние entities (их создают силовой шкаф, Generator Controller,
+# ESPHome либо другая существующая конфигурация HA):
+#
+# binary_sensor.grid_input_ready
+#   Grid пригодна для подключения дома.
+# binary_sensor.house_powered_by_grid
+#   Подтверждение питания дома от Grid.
+# binary_sensor.house_powered_by_generator
+#   Подтверждение питания дома от генераторной шины.
+# binary_sensor.generator_a_is_running
+# binary_sensor.generator_b_is_running
+#   Физическая обратная связь RUNNING от Elemax и Вепря.
+# switch.generator_a_remote_start
+# switch.generator_b_remote_start
+#   Команды REMOTE START для DKG116.
+# button.generator_a_choke_to_cold_start
+# button.generator_a_choke_to_run
+# button.generator_b_choke_to_cold_start
+# button.generator_b_choke_to_run
+#   Команды двух устойчивых положений заслонки.
+# switch.generators_emergency_stop
+#   Общий аварийный останов генераторов.
+# sensor.garage_temperature
+#   Внешняя температура; используется только для выбора времени прогрева.
+# switch.grid_power
+#   Подключение и отключение Grid path.
+# switch.use_generator_as_power_source
+#   Подключение и отключение генераторной шины.
+#
+# Необязательные службы уведомлений, используемые ATS при их наличии:
+# script.notify_warning
+# script.notify_critical
+#
+# Прямые команды через hassio.app_stdin:
+# start_generator, stop_generator, reset.
+
+input_boolean:
+  automatic_generator_transfer:
+    name: "Automatic Generator Transfer"
+    icon: mdi:transfer

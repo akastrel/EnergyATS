@@ -93,6 +93,7 @@ def attach_fake_client(app: EnergySupervisorApp, fake: FakeClient) -> None:
 
 def populated_states() -> dict[str, str]:
     return {
+        ENTITIES["automatic_transfer"]: "off",
         ENTITIES["grid_ready"]: "on",
         ENTITIES["house_grid"]: "on",
         ENTITIES["house_generator"]: "off",
@@ -123,18 +124,6 @@ def test_load_options_merges_small_public_configuration(tmp_path):
     assert options["transfer_confirmation_timeout"] == 60
 
 
-def test_automatic_transfer_is_off_by_default(tmp_path):
-    app = EnergySupervisorApp(
-        {
-            **DEFAULT_OPTIONS,
-            "state_file": str(tmp_path / "state.json"),
-        },
-        token="test",
-    )
-
-    assert app.automatic_transfer_enabled is False
-
-
 def test_stdin_commands_are_dispatched_without_ha_helpers(tmp_path, monkeypatch):
     app = EnergySupervisorApp(
         {
@@ -149,7 +138,7 @@ def test_stdin_commands_are_dispatched_without_ha_helpers(tmp_path, monkeypatch)
     monkeypatch.setattr(
         app.supervisor,
         "request_manual_start",
-        lambda: received.append("start_backup"),
+        lambda: received.append("start_generator"),
     )
     monkeypatch.setattr(
         app.supervisor,
@@ -159,35 +148,14 @@ def test_stdin_commands_are_dispatched_without_ha_helpers(tmp_path, monkeypatch)
     monkeypatch.setattr(
         app.supervisor,
         "request_recovery_reset",
-        lambda: received.append("reset_recovery"),
+        lambda: received.append("reset"),
     )
 
-    app.handle_stdin_line('{"command":"start_backup"}')
+    app.handle_stdin_line('{"command":"start_generator"}')
     app.handle_stdin_line('{"command":"stop_generator"}')
-    app.handle_stdin_line('{"command":"reset_recovery"}')
+    app.handle_stdin_line('{"command":"reset"}')
 
-    assert received == ["start_backup", "stop_generator", "reset_recovery"]
-
-
-def test_automatic_transfer_command_is_persistent(tmp_path):
-    journal = tmp_path / "state.json"
-    options = {
-        **DEFAULT_OPTIONS,
-        "state_file": str(journal),
-    }
-    app = EnergySupervisorApp(options, token="test")
-
-    app.handle_stdin_line('{"command":"automatic_transfer_on"}')
-    assert app.automatic_transfer_enabled is True
-    assert json.loads(journal.read_text(encoding="utf-8"))[
-        "automatic_transfer_enabled"
-    ] is True
-
-    restored = EnergySupervisorApp(options, token="test")
-    assert restored.automatic_transfer_enabled is True
-
-    restored.handle_stdin_line('{"command":"automatic_transfer_off"}')
-    assert restored.automatic_transfer_enabled is False
+    assert received == ["start_generator", "stop_generator", "reset"]
 
 
 def test_disarmed_app_ignores_manual_stdin_commands(tmp_path):
@@ -200,7 +168,7 @@ def test_disarmed_app_ignores_manual_stdin_commands(tmp_path):
         token="test",
     )
 
-    app.handle_stdin_line('{"command":"start_backup"}')
+    app.handle_stdin_line('{"command":"start_generator"}')
 
     assert app.supervisor._manual_start_requested is False
 
@@ -215,7 +183,7 @@ def test_manual_command_is_not_queued_before_app_is_ready(tmp_path):
         token="test",
     )
 
-    app.handle_stdin_line('{"command":"start_backup"}')
+    app.handle_stdin_line('{"command":"start_generator"}')
 
     assert app.supervisor._manual_start_requested is False
 
@@ -225,6 +193,7 @@ async def test_stdin_reader_accepts_home_assistant_json(tmp_path, monkeypatch):
     app = EnergySupervisorApp(
         {
             **DEFAULT_OPTIONS,
+            "armed": True,
             "state_file": str(tmp_path / "state.json"),
         },
         token="test",
@@ -232,14 +201,15 @@ async def test_stdin_reader_accepts_home_assistant_json(tmp_path, monkeypatch):
     read_fd, write_fd = os.pipe()
     read_stream = os.fdopen(read_fd, "r", encoding="utf-8")
     monkeypatch.setattr(app_main.sys, "stdin", read_stream)
+    app.commands_ready = True
 
     task = asyncio.create_task(app.read_stdin_commands())
     await asyncio.sleep(0)
-    os.write(write_fd, b'{"command":"automatic_transfer_on"}\n')
+    os.write(write_fd, b'{"command":"start_generator"}\n')
     os.close(write_fd)
     await asyncio.wait_for(task, timeout=1.0)
 
-    assert app.automatic_transfer_enabled is True
+    assert app.supervisor._manual_start_requested is True
 
 
 def test_string_false_can_never_arm_hardware(tmp_path):
@@ -271,17 +241,34 @@ def test_generator_specific_settings_live_in_generator_controller(tmp_path):
     assert app.profiles[GeneratorSlot.A].cooldown_seconds == 300.0
 
 
+def test_generator_names_are_mapped_to_internal_slots(tmp_path):
+    app = EnergySupervisorApp(
+        {
+            **DEFAULT_OPTIONS,
+            "primary_generator": "Вепрь",
+            "state_file": str(tmp_path / "state.json"),
+        },
+        token="test",
+    )
+
+    assert app.supervisor.config.primary_generator == GeneratorSlot.B
+
+
 def test_adapter_reads_positive_grid_switch_and_external_temperature():
     fake = FakeClient()
     fake.states = populated_states()
     adapter = HomeAssistantAdapter(fake, armed=True)
 
     snapshot = adapter.snapshot()
+    assert snapshot.automatic_transfer_enabled is False
     assert snapshot.power_transfer.grid_connected is True
     assert snapshot.power_transfer.generator_selected is False
     assert (
         snapshot.generators[GeneratorSlot.A].ambient_temperature_external == 7.5
     )
+
+    fake.states[ENTITIES["automatic_transfer"]] = "on"
+    assert adapter.snapshot().automatic_transfer_enabled is True
 
 
 def test_control_entities_are_required_only_in_armed_mode():
