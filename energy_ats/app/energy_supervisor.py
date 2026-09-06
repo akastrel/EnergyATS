@@ -24,7 +24,7 @@ from domain import (
     TransactionStatus,
 )
 from generator_controller import GeneratorPhase, GeneratorStatus
-from power_transfer import PowerTransferStatus
+from power_transfer import PowerTransferStatus, TransferPhase
 
 
 class SupervisorPhase(str, Enum):
@@ -180,6 +180,75 @@ class EnergySupervisor:
         self._recovery_reset_requested = False
         return requested
 
+    @property
+    def recovery_reset_in_progress(self) -> bool:
+        return (
+            self.phase == SupervisorPhase.RECOVERY_REQUIRED
+            and self.transaction is not None
+            and self.transaction.kind == "recovery_reset"
+            and self.transaction.status == TransactionStatus.IN_PROGRESS
+        )
+
+    def begin_recovery_reset(self, now: float) -> None:
+        """Начать сохраняемую процедуру ES-18, не снимая recovery заранее."""
+        if self.recovery_reset_in_progress:
+            self._event("info", "Восстановление уже выполняется.")
+            return
+        self.transaction = Transaction.begin(
+            "recovery_reset",
+            PowerPath.GRID.value,
+            now,
+            "restore_grid_path",
+        )
+        self.desired_generators = {
+            GeneratorSlot.A: False,
+            GeneratorSlot.B: False,
+        }
+        self._event("info", "Начато безопасное восстановление Energy ATS.")
+
+    def advance_recovery_reset(
+        self,
+        now: float,
+        step: str,
+        *,
+        confirmed: str,
+    ) -> None:
+        if self.recovery_reset_in_progress and self.transaction is not None:
+            self.transaction.advance(step, now, confirmed=confirmed)
+
+    def reject_recovery_reset(self, message: str) -> None:
+        self._event("warning", message)
+
+    def report_recovery_reset_not_needed(self) -> None:
+        self._event(
+            "info",
+            "Сброс не требуется: контроллеры не находятся в аварийном состоянии.",
+        )
+
+    def fail_recovery_reset(self, now: float, reason: str) -> None:
+        if self.transaction is not None and self.transaction.kind == "recovery_reset":
+            self.transaction.require_recovery(now, reason)
+        self.recovery_reason = reason
+        self._event("warning", f"Восстановление не завершено: {reason}")
+        self._event(
+            "warning",
+            "Автоматическое управление остаётся заблокированным. "
+            "После устранения причины повторите reset.",
+        )
+
+    def complete_recovery_reset(self, now: float) -> None:
+        if self.transaction is not None and self.transaction.kind == "recovery_reset":
+            self.transaction.complete(now, "Исходное безопасное состояние подтверждено.")
+        self.phase = SupervisorPhase.NORMAL
+        self.session = None
+        self.transaction = None
+        self.recovery_reason = None
+        self.desired_generators = {
+            GeneratorSlot.A: False,
+            GeneratorSlot.B: False,
+        }
+        self._event("info", "Восстановление завершено; управление снова разрешено.")
+
     def mark_connection_lost(self, now: float) -> None:
         """Отметить только действительно прерванную физическую операцию."""
         if self.transaction is None:
@@ -209,20 +278,6 @@ class EnergySupervisor:
                 SupervisorPhase.MANUAL_GENERATOR_IDLE,
             }
         )
-
-    def recovery_reset_result(self, succeeded: bool, message: str) -> None:
-        if succeeded:
-            self.phase = SupervisorPhase.NORMAL
-            self.session = None
-            self.transaction = None
-            self.recovery_reason = None
-            self.desired_generators = {
-                GeneratorSlot.A: False,
-                GeneratorSlot.B: False,
-            }
-            self._event("info", message)
-        else:
-            self._event("warning", message)
 
     def step(self, now: float, observation: SupervisorObservation) -> SupervisorDecision:
         if not self.initialized:
@@ -265,7 +320,8 @@ class EnergySupervisor:
             self._manual_start_requested = False
             self._manual_stop_requested = False
             self._require_recovery(
-                observation.power.fault or "Power Transfer требует восстановления."
+                observation.power.fault or "Power Transfer требует восстановления.",
+                user_message=self._power_transfer_recovery_message(observation),
             )
             return self._decision(observation)
 
@@ -584,7 +640,10 @@ class EnergySupervisor:
                 now,
                 "Целевой Grid path или Battery path подтверждён.",
             )
-            if self.session.stop_requested or self.session.reason != SessionReason.MANUAL_BACKUP:
+            if (
+                self.session.stop_requested
+                or self.session.reason != SessionReason.MANUAL_GENERATOR_START
+            ):
                 self.desired_generators[slot] = False
                 self.phase = SupervisorPhase.STOPPING_GENERATOR
                 self.transaction = Transaction.begin(
@@ -620,7 +679,7 @@ class EnergySupervisor:
                 self.desired_source = PowerSource.for_generator(slot)
                 self.phase = SupervisorPhase.TRANSFERRING_TO_GENERATOR
                 self.transaction = Transaction.begin(
-                    "restore_manual_backup",
+                    "restore_manual_generator_start",
                     self.desired_source.value,
                     now,
                     "transfer_to_generator",
@@ -687,7 +746,11 @@ class EnergySupervisor:
                 f"Ручной ввод резерва отклонён: обнаружен внешний запуск ({names}).",
             )
             return
-        self._begin_session(now, observation, SessionReason.MANUAL_BACKUP)
+        self._begin_session(
+            now,
+            observation,
+            SessionReason.MANUAL_GENERATOR_START,
+        )
         if self.session is not None:
             self.automatic_start_suppressed_until_grid = False
 
@@ -964,12 +1027,61 @@ class EnergySupervisor:
         if self.transaction is not None:
             self.transaction.complete(now, message)
 
-    def _require_recovery(self, reason: str) -> None:
+    def _require_recovery(
+        self,
+        reason: str,
+        *,
+        user_message: str | None = None,
+    ) -> None:
         if self.phase == SupervisorPhase.RECOVERY_REQUIRED:
             return
         self.phase = SupervisorPhase.RECOVERY_REQUIRED
         self.recovery_reason = reason
-        self._event("critical", f"Требуется восстановление управления: {reason}")
+        self._event(
+            "critical",
+            user_message
+            or (
+                "Energy ATS остановил автоматическое управление. "
+                "Проверьте состояние электроснабжения дома. "
+                "Дополнительная информация находится в логе Energy ATS."
+            ),
+        )
+        self._event("warning", f"Техническая причина: {reason}")
+        self._event(
+            "warning",
+            "Требуется вмешательство: после проверки оборудования выполните reset.",
+        )
+
+    def _power_transfer_recovery_message(
+        self,
+        observation: SupervisorObservation,
+    ) -> str:
+        if (
+            self.phase == SupervisorPhase.TRANSFERRING_TO_GENERATOR
+            and self.session is not None
+        ):
+            generator = observation.generators[self.session.generator].display_name
+            if (
+                observation.power.last_confirmed_source == PowerSource.GRID
+                and observation.power.failed_phase
+                == TransferPhase.DISCONNECTING_GRID
+            ):
+                power_state = "Дом по-прежнему питается от основной сети."
+            elif observation.power.last_confirmed_source == PowerSource.BATTERY:
+                power_state = "Дом остаётся на питании от аккумуляторов МАП."
+            else:
+                power_state = "Переключение на генератор не подтверждено."
+            return (
+                f"При переходе питания дома на {generator} возникла ошибка. "
+                f"{power_state} Дополнительная информация находится в логе "
+                "Energy ATS."
+            )
+
+        return (
+            "При переключении источника питания дома возникла ошибка. "
+            "Автоматическое управление остановлено. Дополнительная информация "
+            "находится в логе Energy ATS."
+        )
 
     def _event(self, level: str, message: str, entity_id: str | None = None) -> None:
         self._events.append(SupervisorEvent(level, message, entity_id))
@@ -1001,6 +1113,18 @@ class EnergySupervisor:
 
     def status_text(self, observation: SupervisorObservation) -> str:
         if self.phase == SupervisorPhase.RECOVERY_REQUIRED:
+            if self.recovery_reset_in_progress and self.transaction is not None:
+                recovery_statuses = {
+                    "restore_grid_path": "Восстановление: возврат в Grid path",
+                    "stop_managed_generator": (
+                        "Восстановление: охлаждение и остановка генератора"
+                    ),
+                    "reset_controllers": "Восстановление: проверка результата",
+                }
+                return recovery_statuses.get(
+                    self.transaction.step,
+                    "Выполняется безопасное восстановление",
+                )
             return "Управление прервано — требуется восстановление"
         if not observation.required_states_known:
             return "Ожидание обязательных физических данных"

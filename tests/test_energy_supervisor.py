@@ -415,6 +415,44 @@ def test_readiness_loss_during_transfer_immediately_targets_safe_power_path():
     assert decision.desired_generators[GeneratorSlot.A] is False
 
 
+def test_transfer_failure_has_user_message_and_separate_technical_reason():
+    supervisor = EnergySupervisor()
+    supervisor.step(0.0, observation())
+    supervisor.request_manual_start()
+    supervisor.step(1.0, observation())
+    supervisor.step(2.0, observation(a=ready_a()))
+    assert supervisor.phase == SupervisorPhase.TRANSFERRING_TO_GENERATOR
+
+    transfer_failure = PowerTransferStatus(
+        phase=TransferPhase.RECOVERY_REQUIRED,
+        actual_source=PowerSource.UNKNOWN,
+        actual_path=PowerPath.UNKNOWN,
+        target_source=PowerSource.GENERATOR_A,
+        transition_in_progress=False,
+        recovery_required=True,
+        fault="Не получено подтверждение силового шага disconnecting_grid за 60 с.",
+        failed_phase=TransferPhase.DISCONNECTING_GRID,
+        last_confirmed_source=PowerSource.GRID,
+        last_confirmed_path=PowerPath.GRID,
+    )
+
+    decision = supervisor.step(
+        3.0,
+        observation(a=ready_a(), transfer_status=transfer_failure),
+    )
+    messages = [event.message for event in decision.events]
+
+    assert "При переходе питания дома на Elemax возникла ошибка." in messages[0]
+    assert "Дом по-прежнему питается от основной сети." in messages[0]
+    assert messages[1] == (
+        "Техническая причина: Не получено подтверждение силового шага "
+        "disconnecting_grid за 60 с."
+    )
+    assert messages[2] == (
+        "Требуется вмешательство: после проверки оборудования выполните reset."
+    )
+
+
 def test_connection_loss_during_fault_isolation_cannot_be_mistaken_for_stable():
     supervisor = EnergySupervisor()
     enter_manual_session(
@@ -837,7 +875,7 @@ def test_restore_rejects_failed_or_unknown_journal_schema():
     data = supervisor.to_dict()
     data["session"] = {
         "session_id": "session",
-        "reason": "manual_backup",
+        "reason": "manual_generator_start",
         "generator": "A",
         "started_at": 0.0,
         "grid_was_unavailable": False,
@@ -850,6 +888,21 @@ def test_restore_rejects_failed_or_unknown_journal_schema():
 
     data["schema_version"] = 999
     with pytest.raises(ValueError, match="версия журнала"):
+        EnergySupervisor.from_dict(data)
+
+
+def test_legacy_manual_backup_session_is_not_migrated():
+    supervisor = EnergySupervisor()
+    data = supervisor.to_dict()
+    data["session"] = {
+        "session_id": "legacy-session",
+        "reason": "manual_backup",
+        "generator": "A",
+        "started_at": 0.0,
+        "grid_was_unavailable": False,
+    }
+
+    with pytest.raises(ValueError, match="manual_backup"):
         EnergySupervisor.from_dict(data)
 
 

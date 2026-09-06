@@ -86,6 +86,9 @@ class PowerTransferStatus:
     transition_in_progress: bool
     recovery_required: bool
     fault: str | None
+    failed_phase: TransferPhase | None = None
+    last_confirmed_source: PowerSource = PowerSource.UNKNOWN
+    last_confirmed_path: PowerPath = PowerPath.UNKNOWN
 
 
 class PowerTransferController:
@@ -110,6 +113,9 @@ class PowerTransferController:
         self.transaction: Transaction | None = None
         self.commanded_generator: GeneratorSlot | None = None
         self.initialized = False
+        self.failed_phase: TransferPhase | None = None
+        self.last_confirmed_source = PowerSource.UNKNOWN
+        self.last_confirmed_path = PowerPath.UNKNOWN
 
     @property
     def transition_in_progress(self) -> bool:
@@ -124,6 +130,9 @@ class PowerTransferController:
             transition_in_progress=self.transition_in_progress,
             recovery_required=self.phase == TransferPhase.RECOVERY_REQUIRED,
             fault=self.fault,
+            failed_phase=self.failed_phase,
+            last_confirmed_source=self.last_confirmed_source,
+            last_confirmed_path=self.last_confirmed_path,
         )
 
     def mark_interrupted(self, now: float, reason: str) -> None:
@@ -133,16 +142,130 @@ class PowerTransferController:
             self._require_recovery(reason)
 
     def request_recovery_reset(self, observation: PowerTransferObservation) -> bool:
-        """Снять локальную блокировку только из однозначной топологии."""
+        """Снять локальную блокировку только из подтверждённого Grid path."""
         topology = self._infer_stable_topology(observation)
-        if topology is None:
+        if topology is None or topology.path != PowerPath.GRID:
             return False
         self._set_stable(topology)
         self.target_source = topology.source
         self.fault = None
+        self.failed_phase = None
         self.transaction = None
         self.initialized = True
         return True
+
+    def begin_recovery_to_grid_path(self) -> None:
+        """Начать явно разрешённую процедуру восстановления ES-18/TPC-14.
+
+        Старая незавершённая силовая транзакция не продолжается. Дальнейшие
+        шаги будут выбраны заново исключительно по физическим обратным связям.
+        """
+        self.phase = TransferPhase.RECOVERY_REQUIRED
+        self.actual_source = PowerSource.UNKNOWN
+        self.actual_path = PowerPath.UNKNOWN
+        self.target_source = PowerSource.GRID
+        self.deadline = None
+        self.feedback_lost_since = None
+        self.fault = None
+        self.failed_phase = None
+        self.commanded_generator = None
+        self.transaction = None
+        self.initialized = True
+
+    def recovery_blocker(
+        self,
+        observation: PowerTransferObservation,
+    ) -> str | None:
+        """Объяснить, почему автоматическое восстановление сейчас опасно."""
+        if not observation.required_states_known:
+            return "Неизвестны обязательные состояния силовой схемы."
+        if observation.emergency_stop is not False:
+            return "Активен Generators Emergency Stop."
+
+        grid_side_active = (
+            observation.grid_connected is True
+            or observation.house_on_grid is True
+        )
+        generator_side_active = (
+            observation.generator_selected is True
+            or observation.house_on_generator is True
+        )
+        if grid_side_active and generator_side_active:
+            return (
+                "Одновременно обнаружены признаки подключённых Grid и "
+                "генераторного ввода."
+            )
+        return None
+
+    def step_recovery_to_grid_path(
+        self,
+        now: float,
+        observation: PowerTransferObservation,
+    ) -> tuple[list[TransferAction], str | None]:
+        """Безопасно вернуть силовую схему в Grid path.
+
+        Метод никогда не выбирает генераторную шину. Даже в recovery сначала
+        подтверждается её снятие, и только затем разрешается CONNECT_GRID.
+        """
+        blocker = self.recovery_blocker(observation)
+        if blocker is not None:
+            return [], blocker
+
+        if self._deadline_reached(now):
+            reason = (
+                "Не получено подтверждение шага восстановления "
+                f"{self.phase.value} за {int(self.confirmation_timeout)} с."
+            )
+            self._require_recovery(reason)
+            return [], reason
+
+        if self.phase == TransferPhase.DISCONNECTING_GENERATOR:
+            if (
+                observation.generator_selected is not False
+                or observation.house_on_generator is not False
+            ):
+                return [], None
+            self._advance_transaction(now, "generator_disconnected")
+            if observation.grid_connected is True:
+                self._wait_for_grid_path_confirmation(now)
+                return [], None
+            return self._begin_connect_grid(now), None
+
+        if self.phase == TransferPhase.CONNECTING_GRID:
+            if (
+                observation.generator_selected is not False
+                or observation.house_on_generator is not False
+            ):
+                reason = (
+                    "Генераторная шина перестала быть изолированной во время "
+                    "восстановления Grid path."
+                )
+                self._require_recovery(reason)
+                return [], reason
+            if observation.grid_connected is not True:
+                return [], None
+
+            topology = self._infer_stable_topology(observation)
+            if topology is not None and topology.path == PowerPath.GRID:
+                self._complete_transition(now, topology)
+            return [], None
+
+        topology = self._infer_stable_topology(observation)
+        if topology is not None and topology.path == PowerPath.GRID:
+            self._set_stable(topology)
+            return [], None
+
+        generator_side_active = (
+            observation.generator_selected is True
+            or observation.house_on_generator is True
+        )
+        if generator_side_active:
+            return self._begin_deselect_generator(now, PowerSource.GRID), None
+
+        if observation.grid_connected is True:
+            self._wait_for_grid_path_confirmation(now)
+            return [], None
+        return self._begin_connect_grid(now), None
 
     def step(
         self,
@@ -178,6 +301,15 @@ class PowerTransferController:
                 "Одновременно обнаружены несовместимые положения Grid и "
                 "генераторного ввода."
             )
+            return []
+
+        if self.phase == TransferPhase.RECOVERY_REQUIRED:
+            # В recovery продолжаем отображать распознаваемую физическую
+            # топологию, но не снимаем саму блокировку без процедуры ES-18.
+            topology = self._infer_stable_topology(observation)
+            if topology is not None:
+                self.actual_source = topology.source
+                self.actual_path = topology.path
             return []
 
         if not self.transition_in_progress:
@@ -493,6 +625,17 @@ class PowerTransferController:
             "Генераторная шина изолирована; подключаем Grid path.",
         )]
 
+    def _wait_for_grid_path_confirmation(self, now: float) -> None:
+        """Ждать обратную связь уже включённого Grid path без лишней команды."""
+        self._begin_or_advance_transaction(
+            now,
+            kind="recover_grid_path",
+            target=PowerSource.GRID.value,
+            step="confirm_grid_path",
+        )
+        self.phase = TransferPhase.CONNECTING_GRID
+        self.deadline = now + self.confirmation_timeout
+
     def _begin_select_generator(
         self, now: float, generator: GeneratorSlot
     ) -> list[TransferAction]:
@@ -562,6 +705,8 @@ class PowerTransferController:
     def _set_stable(self, topology: PowerTopology) -> None:
         self.actual_source = topology.source
         self.actual_path = topology.path
+        self.last_confirmed_source = topology.source
+        self.last_confirmed_path = topology.path
         self.deadline = None
         self.feedback_lost_since = None
         self.commanded_generator = None
@@ -628,6 +773,8 @@ class PowerTransferController:
         )
 
     def _require_recovery(self, reason: str) -> None:
+        if self.phase != TransferPhase.RECOVERY_REQUIRED:
+            self.failed_phase = self.phase
         self.phase = TransferPhase.RECOVERY_REQUIRED
         self.actual_source = PowerSource.UNKNOWN
         self.actual_path = PowerPath.UNKNOWN

@@ -176,6 +176,112 @@ class GeneratorController:
         self.fault = reason
         self.initialized = True
 
+    def step_recovery_shutdown(
+        self,
+        now: float,
+        observation: GeneratorObservation,
+        *,
+        owned_by_interrupted_session: bool,
+    ) -> tuple[list[GeneratorAction], str | None]:
+        """Остановить только свой разгруженный генератор во время ES-18.
+
+        Это намеренно отдельный путь, а не ослабление обычной блокировки
+        ``RECOVERY_REQUIRED``. Внешний двигатель здесь никогда не захватывается.
+        """
+        if not observation.required_states_known:
+            return [], f"{self.profile.display_name}: неизвестны RUNNING или REMOTE."
+        if observation.emergency_stop is not False:
+            return [], "Активен Generators Emergency Stop."
+        if observation.load_connected is not False:
+            return [], (
+                f"{self.profile.display_name}: нагрузка генератора не подтверждена "
+                "как отключённая."
+            )
+
+        generator_active = (
+            observation.running is True or observation.remote_on is True
+        )
+        if generator_active and not owned_by_interrupted_session:
+            # Внешний двигатель только распознаём. Recovery не получает права
+            # ждать или инициировать его остановку: это остаётся обязанностью
+            # человека, который запустил генератор.
+            self.phase = GeneratorPhase.EXTERNAL_RUNNING
+            self.deadline = None
+            self.fault = None
+            self.initialized = True
+            return [], (
+                f"{self.profile.display_name} запущен вне управляемой сессии."
+            )
+
+        if observation.running is False and observation.remote_on is False:
+            self._return_to_idle()
+            return [], None
+
+        if self.phase == GeneratorPhase.COOLING_DOWN:
+            if observation.running is False:
+                self.phase = GeneratorPhase.WAITING_FOR_STOP
+                self.deadline = now + self.profile.stop_timeout_seconds
+                if observation.remote_on is True:
+                    return [self._action(
+                        GeneratorActionKind.REMOTE_OFF,
+                        f"{self.profile.display_name}: двигатель уже остановлен; "
+                        "снимаем оставшийся REMOTE START.",
+                    )], None
+                return [], None
+            if observation.remote_on is not True:
+                self.phase = GeneratorPhase.WAITING_FOR_STOP
+                self.deadline = now + self.profile.stop_timeout_seconds
+                return [], None
+            if self._deadline_reached(now):
+                self.phase = GeneratorPhase.WAITING_FOR_STOP
+                self.deadline = now + self.profile.stop_timeout_seconds
+                return [self._action(
+                    GeneratorActionKind.REMOTE_OFF,
+                    f"{self.profile.display_name}: cooldown завершён, снимаем "
+                    "REMOTE START.",
+                )], None
+            return [], None
+
+        if self.phase == GeneratorPhase.WAITING_FOR_STOP:
+            if observation.running is False and observation.remote_on is False:
+                self._return_to_idle()
+                return [], None
+            if self._deadline_reached(now):
+                reason = (
+                    f"{self.profile.display_name} не подтвердил остановку за "
+                    f"{int(self.profile.stop_timeout_seconds)} с."
+                )
+                self.require_recovery(reason)
+                return [], reason
+            return [], None
+
+        # Начало специальной recovery-остановки. Работающему двигателю даём
+        # штатный cooldown; уже остановленному только снимаем REMOTE.
+        self.fault = None
+        if observation.running is True:
+            self.phase = GeneratorPhase.COOLING_DOWN
+            self.deadline = now + self.profile.cooldown_seconds
+            return [self._action(
+                GeneratorActionKind.CHOKE_TO_RUN,
+                f"{self.profile.display_name}: восстановление управления; "
+                "переводим заслонку в рабочее положение перед cooldown.",
+            )], None
+
+        self.phase = GeneratorPhase.WAITING_FOR_STOP
+        self.deadline = now + self.profile.stop_timeout_seconds
+        return [
+            self._action(
+                GeneratorActionKind.CHOKE_TO_RUN,
+                f"{self.profile.display_name}: восстановление управления; "
+                "переводим заслонку в рабочее положение.",
+            ),
+            self._action(
+                GeneratorActionKind.REMOTE_OFF,
+                f"{self.profile.display_name}: двигатель остановлен; снимаем "
+                "REMOTE START.",
+            ),
+        ], None
+
     def status(self, observation: GeneratorObservation) -> GeneratorStatus:
         ready = (
             self.phase in self._READY_PHASES

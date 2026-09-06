@@ -441,6 +441,56 @@ def test_explicit_battery_target_disconnects_available_grid_and_can_return():
     )
     assert kinds(actions) == [TransferActionKind.DISCONNECT_GRID]
 
+
+def test_recovery_returns_from_generator_to_grid_path_break_before_make():
+    controller = PowerTransferController(confirmation_timeout=10.0)
+    on_generator = observed(
+        house_on_grid=False,
+        house_on_generator=True,
+        grid_connected=False,
+        generator_selected=True,
+        active_generator=GeneratorSlot.A,
+    )
+    controller.begin_recovery_to_grid_path()
+
+    actions, error = controller.step_recovery_to_grid_path(1.0, on_generator)
+    assert error is None
+    assert kinds(actions) == [TransferActionKind.DESELECT_GENERATOR]
+
+    generator_disconnected = replace(
+        on_generator,
+        generator_selected=False,
+        house_on_generator=False,
+        active_generator=None,
+    )
+    actions, error = controller.step_recovery_to_grid_path(
+        2.0,
+        generator_disconnected,
+    )
+    assert error is None
+    assert kinds(actions) == [TransferActionKind.CONNECT_GRID]
+
+    actions, error = controller.step_recovery_to_grid_path(3.0, observed())
+    assert error is None
+    assert actions == []
+    assert controller.phase == TransferPhase.STABLE_GRID_PATH
+
+
+def test_recovery_refuses_overlapping_sources_without_actions():
+    controller = PowerTransferController()
+    controller.begin_recovery_to_grid_path()
+    overlap = observed(
+        generator_selected=True,
+        house_on_generator=True,
+        active_generator=GeneratorSlot.A,
+    )
+
+    actions, error = controller.step_recovery_to_grid_path(1.0, overlap)
+
+    assert actions == []
+    assert error is not None
+    assert "Одновременно" in error
+
     battery_path = observed(grid_connected=False, house_on_grid=False)
     actions = controller.step(
         2.0,
@@ -449,26 +499,8 @@ def test_explicit_battery_target_disconnects_available_grid_and_can_return():
         desired_generator_ready=False,
     )
     assert actions == []
-    assert controller.phase == TransferPhase.STABLE_BATTERY_PATH
+    assert controller.phase == TransferPhase.RECOVERY_REQUIRED
     assert controller.status().actual_path == PowerPath.BATTERY
-
-    actions = controller.step(
-        3.0,
-        battery_path,
-        PowerSource.GRID,
-        desired_generator_ready=False,
-    )
-    assert kinds(actions) == [TransferActionKind.CONNECT_GRID]
-
-    controller.step(
-        4.0,
-        observed(),
-        PowerSource.GRID,
-        desired_generator_ready=False,
-    )
-    assert controller.phase == TransferPhase.STABLE_GRID_PATH
-    assert controller.status().actual_source == PowerSource.GRID
-    assert controller.status().actual_path == PowerPath.GRID
 
 
 def test_generator_is_selected_directly_from_battery_path():

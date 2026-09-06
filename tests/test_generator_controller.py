@@ -193,10 +193,57 @@ def test_cancelled_start_waits_for_remote_off_confirmation():
         GeneratorActionKind.REMOTE_OFF,
         GeneratorActionKind.CHOKE_TO_RUN,
     ]
-    assert controller.phase == GeneratorPhase.WAITING_FOR_STOP
+
+
+def test_recovery_shutdown_uses_cooldown_for_owned_unloaded_generator():
+    controller = GeneratorController(profile())
+    running = observed(running=True, remote_on=True, load_connected=False)
+    controller.require_recovery("test")
+
+    actions, error = controller.step_recovery_shutdown(
+        1.0,
+        running,
+        owned_by_interrupted_session=True,
+    )
+    assert error is None
+    assert action_kinds(actions) == [GeneratorActionKind.CHOKE_TO_RUN]
+    assert controller.phase == GeneratorPhase.COOLING_DOWN
+
+    actions, error = controller.step_recovery_shutdown(
+        4.0,
+        running,
+        owned_by_interrupted_session=True,
+    )
+    assert error is None
+    assert action_kinds(actions) == [GeneratorActionKind.REMOTE_OFF]
+
+    actions, error = controller.step_recovery_shutdown(
+        5.0,
+        observed(),
+        owned_by_interrupted_session=True,
+    )
+    assert error is None
+    assert actions == []
+    assert controller.phase == GeneratorPhase.IDLE
+
+
+def test_recovery_shutdown_never_adopts_external_generator():
+    controller = GeneratorController(profile())
+    external = observed(running=True, remote_on=True, load_connected=False)
+
+    actions, error = controller.step_recovery_shutdown(
+        1.0,
+        external,
+        owned_by_interrupted_session=False,
+    )
+
+    assert actions == []
+    assert error is not None
+    assert "вне управляемой сессии" in error
+    assert controller.phase == GeneratorPhase.EXTERNAL_RUNNING
 
     controller.step(2.5, observed(remote_on=True), False)
-    assert controller.phase == GeneratorPhase.WAITING_FOR_STOP
+    assert controller.phase == GeneratorPhase.EXTERNAL_RUNNING
     controller.step(3.0, observed(remote_on=False), False)
     assert controller.phase == GeneratorPhase.IDLE
 

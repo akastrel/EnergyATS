@@ -167,7 +167,7 @@ selector Generator OFF
 
 Supervisor владеет длительной генераторной сессией и причиной её появления:
 
-- `MANUAL_BACKUP` — ручная команда `start_generator`;
+- `MANUAL_GENERATOR_START` — ручная команда `start_generator`;
 - `GRID_OUTAGE` — автоматическая политика при разрешённом АВР;
 - `BATTERY_CHARGE` и `TEST_RUN` зарезервированы для будущих сценариев.
 

@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from domain import GeneratorSlot, SupervisorEvent
+from domain import GeneratorSlot, PowerPath, PowerSource, SupervisorEvent
 from energy_supervisor import (
     EnergySupervisor,
     SupervisorConfig,
@@ -36,7 +36,7 @@ from power_transfer import PowerTransferController, TransferAction
 from state_store import StateStore
 
 
-APP_VERSION = "0.3.5"
+APP_VERSION = "0.3.4"
 
 
 DEFAULT_OPTIONS: dict[str, Any] = {
@@ -237,7 +237,11 @@ class EnergySupervisorApp:
         self._refresh_component_views(now, hardware)
 
         if self.supervisor.consume_recovery_reset_request():
-            self._attempt_recovery_reset(now, hardware)
+            self._start_recovery_reset(now, hardware)
+
+        if self.supervisor.recovery_reset_in_progress:
+            await self._tick_recovery_reset(now, hardware)
+            return
 
         observation = self._supervisor_observation(hardware)
         decision = self.supervisor.step(now, observation)
@@ -274,19 +278,10 @@ class EnergySupervisorApp:
             actions_allowed=actions_allowed,
         )
 
-        # Журнал с точным списком pending-команд записывается ДО первого
-        # service call. После успешного исполнения список очищается отдельной
-        # атомарной записью.
-        self._pending_action_records = self._describe_actions(
+        await self._execute_controller_actions(
             transfer_actions,
             generator_actions,
         )
-        self._save_state(force=bool(self._pending_action_records))
-
-        if self._pending_action_records:
-            await self.adapter.execute_actions(transfer_actions, generator_actions)
-            self._pending_action_records = []
-            self._save_state(force=True)
 
         updated_observation = self._supervisor_observation(hardware)
         self._log_events(decision.events)
@@ -344,9 +339,13 @@ class EnergySupervisorApp:
             power_inputs_known=hardware.power_transfer.required_states_known,
         )
 
-    def _attempt_recovery_reset(
+    def _start_recovery_reset(
         self, now: float, hardware: HardwareSnapshot
     ) -> None:
+        if self.supervisor.recovery_reset_in_progress:
+            self.supervisor.begin_recovery_reset(now)
+            return
+
         needs_reset = (
             self.supervisor.phase == SupervisorPhase.RECOVERY_REQUIRED
             or self.power_transfer.status().recovery_required
@@ -357,74 +356,203 @@ class EnergySupervisorApp:
             )
         )
         if not needs_reset:
-            self.supervisor.recovery_reset_result(
-                False,
-                "Сброс не требуется: контроллеры не находятся в аварийном состоянии.",
-            )
+            self.supervisor.report_recovery_reset_not_needed()
             return
 
-        generators_safe = all(
-            item.running is False
-            and item.remote_on is False
-            and item.load_connected is not True
-            for item in hardware.generators.values()
-        )
-        if hardware.emergency_stop is not False or not generators_safe:
-            self.supervisor.recovery_reset_result(
-                False,
-                "Сброс отклонён: сначала снимите Emergency Stop, остановите оба "
-                "генератора и отключите генераторную шину.",
-            )
+        blocker = self._recovery_blocker(hardware)
+        if blocker is not None:
+            self.supervisor.reject_recovery_reset(f"Сброс отклонён: {blocker}")
             return
 
-        grid_path_confirmed = (
-            hardware.power_transfer.generator_selected is False
-            and hardware.power_transfer.house_on_generator is False
-            and hardware.power_transfer.grid_connected is True
-            and (
-                (
-                    hardware.power_transfer.grid_ready is True
-                    and hardware.power_transfer.house_on_grid is True
-                )
-                or (
-                    hardware.power_transfer.grid_ready is False
-                    and hardware.power_transfer.house_on_grid is False
-                )
+        self.supervisor.begin_recovery_reset(now)
+        self.power_transfer.begin_recovery_to_grid_path()
+
+    async def _tick_recovery_reset(
+        self,
+        now: float,
+        hardware: HardwareSnapshot,
+    ) -> None:
+        """Продвинуть только безопасную процедуру ES-18 и ничего больше."""
+        blocker = self._recovery_blocker(hardware)
+        if blocker is not None:
+            self.supervisor.fail_recovery_reset(now, blocker)
+            await self._finish_recovery_tick(now, hardware)
+            return
+
+        transfer_actions, transfer_error = (
+            self.power_transfer.step_recovery_to_grid_path(
+                now,
+                hardware.power_transfer,
             )
         )
-        if not grid_path_confirmed:
-            self.supervisor.recovery_reset_result(
-                False,
-                "Сброс отклонён: сначала вручную верните схему в Grid path.",
-            )
+        if transfer_error is not None:
+            self.supervisor.fail_recovery_reset(now, transfer_error)
+            await self._finish_recovery_tick(now, hardware)
             return
 
-        if not self.power_transfer.request_recovery_reset(hardware.power_transfer):
-            self.supervisor.recovery_reset_result(
-                False,
-                "Сброс отклонён: силовая топология не подтверждена как Grid/МАП.",
+        if transfer_actions:
+            self.supervisor.advance_recovery_reset(
+                now,
+                "restore_grid_path",
+                confirmed="recovery_action_requested",
             )
+            await self._execute_controller_actions(transfer_actions, [])
+            await self._finish_recovery_tick(now, hardware)
             return
 
+        if not self._grid_path_confirmed(hardware):
+            self._save_state()
+            await self._finish_recovery_tick(now, hardware)
+            return
+
+        self.supervisor.advance_recovery_reset(
+            now,
+            "stop_managed_generator",
+            confirmed="grid_path_confirmed",
+        )
+
+        managed_slot = (
+            self.supervisor.session.generator
+            if self.supervisor.session is not None
+            else None
+        )
+        generator_actions: list[GeneratorAction] = []
         for slot, controller in self.generator_controllers.items():
-            controller.request_fault_reset()
-            controller.step(
+            actions, error = controller.step_recovery_shutdown(
                 now,
                 hardware.generators[slot],
-                desired_running=False,
-                actions_allowed=False,
+                owned_by_interrupted_session=slot == managed_slot,
+            )
+            if error is not None:
+                self.supervisor.fail_recovery_reset(now, error)
+                await self._finish_recovery_tick(now, hardware)
+                return
+            generator_actions.extend(actions)
+
+        if generator_actions:
+            await self._execute_controller_actions([], generator_actions)
+            await self._finish_recovery_tick(now, hardware)
+            return
+
+        generators_stopped = all(
+            hardware.generators[slot].running is False
+            and hardware.generators[slot].remote_on is False
+            and controller.phase == GeneratorPhase.IDLE
+            for slot, controller in self.generator_controllers.items()
+        )
+        if not generators_stopped:
+            self._save_state()
+            await self._finish_recovery_tick(now, hardware)
+            return
+
+        self.supervisor.advance_recovery_reset(
+            now,
+            "reset_controllers",
+            confirmed="generators_stopped",
+        )
+        if not self.power_transfer.request_recovery_reset(hardware.power_transfer):
+            self.supervisor.fail_recovery_reset(
+                now,
+                "Grid path не получил окончательного физического подтверждения.",
+            )
+            await self._finish_recovery_tick(now, hardware)
+            return
+
+        self.supervisor.complete_recovery_reset(now)
+        self._save_state(force=True)
+        await self._finish_recovery_tick(now, hardware)
+
+    def _recovery_blocker(self, hardware: HardwareSnapshot) -> str | None:
+        if hardware.emergency_stop is not False:
+            return "сначала снимите Generators Emergency Stop."
+
+        power_blocker = self.power_transfer.recovery_blocker(
+            hardware.power_transfer
+        )
+        if power_blocker is not None:
+            return power_blocker
+
+        for observation in hardware.generators.values():
+            if not observation.required_states_known:
+                return "неизвестны обязательные состояния генераторов."
+
+        active_slots = {
+            slot
+            for slot, observation in hardware.generators.items()
+            if observation.running is True or observation.remote_on is True
+        }
+        managed_slot = (
+            self.supervisor.session.generator
+            if self.supervisor.session is not None
+            else None
+        )
+        external_slots = active_slots - ({managed_slot} if managed_slot else set())
+        if external_slots:
+            names = ", ".join(
+                self.profiles[slot].display_name
+                for slot in sorted(external_slots, key=lambda item: item.value)
+            )
+            return (
+                f"обнаружен внешний запуск ({names}); остановите его вручную."
             )
 
-        reset_succeeded = all(
-            controller.phase == GeneratorPhase.IDLE
-            for controller in self.generator_controllers.values()
+        if (
+            hardware.power_transfer.house_on_generator is True
+            and hardware.power_transfer.active_generator != managed_slot
+        ):
+            return (
+                "невозможно однозначно связать питание дома с управляемым "
+                "генератором."
+            )
+        return None
+
+    @staticmethod
+    def _grid_path_confirmed(hardware: HardwareSnapshot) -> bool:
+        power = hardware.power_transfer
+        return (
+            power.generator_selected is False
+            and power.house_on_generator is False
+            and power.grid_connected is True
+            and (
+                (
+                    power.grid_ready is True
+                    and power.house_on_grid is True
+                )
+                or (
+                    power.grid_ready is False
+                    and power.house_on_grid is False
+                )
+            )
         )
-        self.supervisor.recovery_reset_result(
-            reset_succeeded,
-            "Аварийная транзакция сброшена; управление снова разрешено."
-            if reset_succeeded
-            else "Сброс отклонён одним из контроллеров генераторов.",
+
+    async def _execute_controller_actions(
+        self,
+        transfer_actions: list[TransferAction],
+        generator_actions: list[GeneratorAction],
+    ) -> None:
+        """Записать pending-команды до первого аппаратного service call."""
+        self._pending_action_records = self._describe_actions(
+            transfer_actions,
+            generator_actions,
         )
+        self._save_state(force=bool(self._pending_action_records))
+
+        if not self._pending_action_records:
+            return
+        await self.adapter.execute_actions(transfer_actions, generator_actions)
+        self._pending_action_records = []
+        self._save_state(force=True)
+
+    async def _finish_recovery_tick(
+        self,
+        now: float,
+        hardware: HardwareSnapshot,
+    ) -> None:
+        observation = self._supervisor_observation(hardware)
+        decision = self.supervisor.step(now, observation)
+        self._log_events(decision.events)
+        await self.adapter.publish_events(decision.events)
+        self._log_runtime_if_changed(observation)
 
     async def _wait_until_required_entities_ready(self) -> None:
         last_log_at = 0.0
@@ -618,7 +746,7 @@ class EnergySupervisorApp:
         }
         for event in events:
             log = log_methods.get(event.level, self.log.info)
-            log("ES: %s", event.message)
+            log("%s", event.message)
 
     async def _stop_requested_within(self, seconds: float) -> bool:
         try:

@@ -13,6 +13,7 @@ sys.path.insert(0, str(APP_DIR))
 
 from domain import (  # noqa: E402
     GeneratorSlot,
+    PowerPath,
     PowerSource,
     SessionReason,
     SupervisorEvent,
@@ -178,6 +179,7 @@ def test_supervisor_events_are_written_to_app_log(tmp_path, caplog):
     assert "INFO     energy_supervisor" in caplog.text
     assert "WARNING  energy_supervisor" in caplog.text
     assert "CRITICAL energy_supervisor" in caplog.text
+    assert "ES:" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -254,11 +256,12 @@ def test_manual_command_is_not_queued_before_app_is_ready(tmp_path):
 
     assert app.supervisor._manual_start_requested is False
 
+
+@pytest.mark.asyncio
 @pytest.mark.skipif(
     os.name == "nt",
-    reason="Асинхронный stdin Home Assistant App проверяется только на Linux",
+    reason="Асинхронный stdin App использует Linux pipe Home Assistant OS",
 )
-@pytest.mark.asyncio
 async def test_stdin_reader_accepts_home_assistant_json(tmp_path, monkeypatch):
     app = EnergySupervisorApp(
         {
@@ -374,7 +377,7 @@ def saved_supervisor_payload(
     supervisor = EnergySupervisor()
     supervisor.phase = phase
     supervisor.session = GeneratorSession.begin(
-        reason=SessionReason.MANUAL_BACKUP,
+        reason=SessionReason.MANUAL_GENERATOR_START,
         generator=GeneratorSlot.A,
         now=1.0,
         grid_was_unavailable=False,
@@ -768,7 +771,7 @@ async def test_recovery_reset_succeeds_only_from_safe_normal_topology(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_recovery_reset_is_rejected_from_battery_path(tmp_path):
+async def test_recovery_reset_connects_grid_path_from_battery_path(tmp_path):
     journal = tmp_path / "state.json"
     app = EnergySupervisorApp(
         {
@@ -795,6 +798,70 @@ async def test_recovery_reset_is_rejected_from_battery_path(tmp_path):
     await app._tick(1.0)
 
     assert app.supervisor.phase == SupervisorPhase.RECOVERY_REQUIRED
+    assert fake.states[ENTITIES["grid_power"]] == "on"
+
+    await app._tick(2.0)
+
+    assert app.supervisor.phase == SupervisorPhase.NORMAL
+    assert app.power_transfer.status().actual_path == PowerPath.GRID
+
+
+@pytest.mark.asyncio
+async def test_recovery_reset_returns_from_generator_then_stops_it(tmp_path):
+    journal = tmp_path / "state.json"
+    app = EnergySupervisorApp(
+        {
+            **DEFAULT_OPTIONS,
+            "armed": True,
+            "state_file": str(journal),
+        },
+        token="test",
+    )
+    fake = PhysicalFakeClient(journal)
+    fake.states = populated_states()
+    attach_fake_client(app, fake)
+    await app._tick(0.0)
+
+    app.supervisor.session = GeneratorSession.begin(
+        reason=SessionReason.MANUAL_GENERATOR_START,
+        generator=GeneratorSlot.A,
+        now=0.0,
+        grid_was_unavailable=False,
+    )
+    app.supervisor.desired_generators[GeneratorSlot.A] = True
+    app.supervisor.require_recovery("test")
+    fake.states.update(
+        {
+            ENTITIES["grid_power"]: "off",
+            ENTITIES["house_grid"]: "off",
+            ENTITIES["source_generator"]: "on",
+            ENTITIES["house_generator"]: "on",
+            ENTITIES["generator_a_running"]: "on",
+            ENTITIES["generator_a_remote"]: "on",
+        }
+    )
+
+    app.supervisor.request_recovery_reset()
+    await app._tick(1.0)    # снять генераторную шину
+    await app._tick(2.0)    # подключить Grid path
+    await app._tick(3.0)    # начать cooldown
+    await app._tick(303.0)  # снять REMOTE
+    fake.states[ENTITIES["generator_a_running"]] = "off"
+    await app._tick(304.0)  # подтвердить остановку и завершить reset
+
+    assert app.supervisor.phase == SupervisorPhase.NORMAL
+    assert app.supervisor.session is None
+    hardware_calls = [
+        (domain, service, data.get("entity_id"))
+        for domain, service, data in fake.calls
+        if domain in {"switch", "button"}
+    ]
+    assert hardware_calls[-4:] == [
+        ("switch", "turn_off", ENTITIES["source_generator"]),
+        ("switch", "turn_on", ENTITIES["grid_power"]),
+        ("button", "press", ENTITIES["generator_a_choke_run"]),
+        ("switch", "turn_off", ENTITIES["generator_a_remote"]),
+    ]
 
 
 @pytest.mark.asyncio
