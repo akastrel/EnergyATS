@@ -84,7 +84,7 @@ pytest -q
 ## Сквозные сценарии App
 
 В `tests/test_end_to_end_scenarios.py` проверены полные цепочки от физических
-входов до HA service calls и журна:
+входов до HA service calls и журнала:
 
 - отказ генератора во время прогрева и под нагрузкой;
 - HOLD после внешнего отключения Grid path и после restart;
