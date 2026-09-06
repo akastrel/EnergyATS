@@ -18,20 +18,19 @@ class HomeAssistantConnectionError(RuntimeError):
 
 class HomeAssistantClient:
     """
-    Минимальный асинхронный клиент Home Assistant WebSocket API.
+    Минимальный асинхронный клиент Home Assistant.
 
-    Почему здесь WebSocket, а не REST polling:
-      * ATS должен быстро видеть смену физических датчиков;
-      * в доме много сущностей, поэтому запрашивать `/api/states` каждую секунду
-        было бы избыточно;
-      * WebSocket даёт один начальный снимок и затем только события state_changed.
+    Для оперативного чтения состояний и service calls используется WebSocket,
+    а REST API — только для публикации собственных диагностических сущностей
+    Energy ATS в state machine Home Assistant.
 
     Клиент намеренно ничего не знает про алгоритм АВР. Его обязанности:
       1. авторизоваться через SUPERVISOR_TOKEN;
       2. получить исходный список состояний;
       3. подписаться на state_changed;
       4. поддерживать локальный cache entity_id -> state;
-      5. выполнять HA service calls по запросу Energy ATS App.
+      5. выполнять HA service calls по запросу Energy ATS App;
+      6. публиковать принадлежащие App состояния через REST State API.
 
     Важный принцип надёжности:
     чтением WebSocket занимается только `_reader_loop()`. Все остальные корутины
@@ -44,11 +43,13 @@ class HomeAssistantClient:
         token: str,
         *,
         url: str = "ws://supervisor/core/websocket",
+        api_url: str = "http://supervisor/core/api",
         logger: logging.Logger | None = None,
         request_timeout: float = 15.0,
     ) -> None:
         self.token = token
         self.url = url
+        self.api_url = api_url.rstrip("/")
         self.log = logger or logging.getLogger(__name__)
         self.request_timeout = request_timeout
 
@@ -231,6 +232,47 @@ class HomeAssistantClient:
             service=service,
             service_data=service_data or {},
         )
+
+    async def set_state(
+        self,
+        entity_id: str,
+        state: str,
+        *,
+        attributes: dict[str, Any] | None = None,
+    ) -> None:
+        """Опубликовать принадлежащее App состояние через HA REST State API.
+
+        Этот метод не регистрирует entity в Entity Registry. Он создаёт/обновляет
+        состояние в HA state machine, что достаточно для диагностических
+        read-only сенсоров самого App.
+        """
+        if self._session is None or self._session.closed:
+            raise HomeAssistantConnectionError("HTTP-сессия Home Assistant не создана")
+
+        url = f"{self.api_url}/states/{entity_id}"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        payload = {"state": state, "attributes": attributes or {}}
+        try:
+            async with self._session.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=self.request_timeout),
+            ) as response:
+                if response.status not in {200, 201}:
+                    text = await response.text()
+                    raise HomeAssistantConnectionError(
+                        f"State API {entity_id} вернул HTTP {response.status}: "
+                        f"{text[:300]}"
+                    )
+        except asyncio.TimeoutError as exc:
+            raise HomeAssistantConnectionError(
+                f"Timeout публикации состояния {entity_id}"
+            ) from exc
+        except aiohttp.ClientError as exc:
+            raise HomeAssistantConnectionError(
+                f"Ошибка HTTP при публикации состояния {entity_id}: {exc}"
+            ) from exc
 
     async def _reader_loop(self) -> None:
         """Единственный постоянный consumer WebSocket входящего потока."""
