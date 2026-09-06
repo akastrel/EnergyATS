@@ -1,8 +1,8 @@
 """Energy ATS entry point with a published Home Assistant status sensor.
 
-The core control logic remains in ``main.py``.  This thin application layer
+The core control logic remains in ``main.py``. This thin application layer
 publishes the already calculated state of the controller as
-``sensor.energy_ats_status``.  It deliberately does not make any control
+``sensor.energy_ats_status``. It deliberately does not make any control
 choices of its own.
 """
 
@@ -17,7 +17,6 @@ from typing import Any
 
 import aiohttp
 
-from domain import GeneratorSlot, PowerSource
 from energy_supervisor import SupervisorObservation, SupervisorPhase
 from main import EnergySupervisorApp, configure_logging, load_options
 
@@ -51,6 +50,11 @@ class EnergyATSStatusApp(EnergySupervisorApp):
 
     async def _connected_loop(self) -> None:
         """Run the normal control tick and then publish its read-only view."""
+        # A state created through /api/states is not persistent in HA's entity
+        # registry. After a Home Assistant restart the App may still be alive,
+        # so force the first publication after every WebSocket reconnect.
+        self._last_status_payload = None
+
         while not self.stop_event.is_set():
             if not self.client.connected.is_set():
                 from ha_client import HomeAssistantConnectionError
@@ -60,7 +64,7 @@ class EnergyATSStatusApp(EnergySupervisorApp):
             now = time.time()
             await self._tick(now)
 
-            # Build the public view only after the normal control tick.  No
+            # Build the public view only after the normal control tick. No
             # decisions or hardware commands are made in this path.
             hardware = self.adapter.snapshot()
             observation = self._supervisor_observation(hardware)
@@ -155,7 +159,7 @@ class EnergyATSStatusApp(EnergySupervisorApp):
         """Return the countdown of the currently meaningful ATS wait.
 
         The value is derived only from deadlines/timestamps already owned by
-        the real state machines.  There is intentionally no separate timer for
+        the real state machines. There is intentionally no separate timer for
         the Home Assistant entity.
         """
 
