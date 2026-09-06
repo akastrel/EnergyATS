@@ -323,17 +323,17 @@ def test_generator_names_are_mapped_to_internal_slots(tmp_path):
 
     assert app.supervisor.config.primary_generator == GeneratorSlot.B
 
-def test_legacy_generator_slot_allows_in_place_update(tmp_path):
-    app = EnergySupervisorApp(
-        {
-            **DEFAULT_OPTIONS,
-            "primary_generator": "A",
-            "state_file": str(tmp_path / "state.json"),
-        },
-        token="test",
-    )
-
-    assert app.supervisor.config.primary_generator == GeneratorSlot.A
+def test_legacy_generator_slot_is_rejected(tmp_path):
+    # Совместимость снята: конфигурация принимает отображаемые имена.
+    with pytest.raises(ValueError, match="primary_generator"):
+        EnergySupervisorApp(
+            {
+                **DEFAULT_OPTIONS,
+                "primary_generator": "A",
+                "state_file": str(tmp_path / "state.json"),
+            },
+            token="test",
+        )
 
 def test_adapter_reads_positive_grid_switch_and_external_temperature():
     fake = FakeClient()
@@ -645,3 +645,29 @@ async def test_home_assistant_websocket_client_roundtrip():
     finally:
         await client.close()
         await runner.cleanup()
+
+
+@pytest.mark.parametrize("legacy_phase", ["manual_generator_idle", "returning_to_normal"])
+def test_obsolete_session_phase_requires_recovery(tmp_path, legacy_phase):
+    payload = saved_supervisor_payload(
+        phase=SupervisorPhase.ON_GENERATOR, transaction_complete=True
+    )
+    payload["supervisor"]["phase"] = legacy_phase
+    journal = tmp_path / "state.json"
+    StateStore(journal).save(payload)
+    app = EnergySupervisorApp(
+        {**DEFAULT_OPTIONS, "state_file": str(journal)}, token="test"
+    )
+    assert app.supervisor.phase == SupervisorPhase.RECOVERY_REQUIRED
+
+
+def test_unwrapped_supervisor_journal_requires_recovery(tmp_path):
+    payload = saved_supervisor_payload(
+        phase=SupervisorPhase.ON_GENERATOR, transaction_complete=True
+    )
+    journal = tmp_path / "state.json"
+    StateStore(journal).save(payload["supervisor"])
+    app = EnergySupervisorApp(
+        {**DEFAULT_OPTIONS, "state_file": str(journal)}, token="test"
+    )
+    assert app.supervisor.phase == SupervisorPhase.RECOVERY_REQUIRED

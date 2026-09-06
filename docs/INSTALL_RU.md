@@ -86,7 +86,6 @@ tick_seconds: 1.0
 log_level: info
 grid_failure_delay: 5
 grid_restore_stable_time: 60
-manual_idle_warning_seconds: 600
 transfer_confirmation_timeout: 60
 primary_generator: Elemax
 generator_a_enabled: true
@@ -195,3 +194,13 @@ data:
 Поле `app` проще не вводить вручную: в визуальном редакторе действия выбрать
 **Write data to app stdin**, затем выбрать **Energy ATS**. Home Assistant сам
 подставит фактический ID установленного App.
+
+
+## Подготовка конфигурации после удаления совместимости
+
+Перед запуском выберите `primary_generator: Elemax` либо `Вепрь`.
+Значения A/B больше не поддерживаются. Удалите
+`manual_idle_warning_seconds`: продолжительный холостой ход больше не является
+отдельным режимом ES. Старые форматы журналов не преобразуются автоматически;
+их отклонение приводит к recovery. Обновление выполняется при остановленных
+генераторах и подтверждённом Grid path.

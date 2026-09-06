@@ -24,7 +24,6 @@ options:
 
   grid_failure_delay: 5
   grid_restore_stable_time: 60
-  manual_idle_warning_seconds: 600
   transfer_confirmation_timeout: 60
 
   # Политика выбора. Названия, модели, заслонка, прогрев и cooldown находятся
@@ -41,10 +40,8 @@ schema:
 
   grid_failure_delay: "float(0,300)"
   grid_restore_stable_time: "float(0,900)"
-  manual_idle_warning_seconds: "float(0,86400)"
   transfer_confirmation_timeout: "float(1,300)"
 
-  # A/B временно оставлены для обновления поверх сохранённых options.
-  primary_generator: "list(Elemax|Вепрь|A|B)"
+  primary_generator: "list(Elemax|Вепрь)"
   generator_a_enabled: bool
   generator_b_enabled: bool

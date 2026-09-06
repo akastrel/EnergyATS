@@ -485,23 +485,9 @@ class PowerTransferController:
             return []
 
         self._advance_transaction(now, "grid_disconnected")
-        target_generator = desired_source.generator
-        if (
-            target_generator is not None
-            and desired_generator_ready
-            and observation.emergency_stop is False
-        ):
-            return self._begin_select_generator(now, target_generator)
-        if desired_source == PowerSource.GRID:
-            return self._begin_connect_grid(now)
-
-        # Battery path уже полностью подтверждён. Если генератор потерял
-        # готовность, ES увидит безопасное положение на следующем цикле.
-        self._complete_transition(
-            now,
-            PowerTopology(PowerPath.BATTERY, PowerSource.BATTERY),
+        return self._continue_from_isolated_bus(
+            now, observation, desired_source, desired_generator_ready
         )
-        return []
 
     def _confirm_generator_selected(
         self,
@@ -560,6 +546,22 @@ class PowerTransferController:
             return []
 
         self._advance_transaction(now, "generator_disconnected")
+        return self._continue_from_isolated_bus(
+            now, observation, desired_source, desired_generator_ready
+        )
+
+    def _continue_from_isolated_bus(
+        self,
+        now: float,
+        observation: PowerTransferObservation,
+        desired_source: PowerSource,
+        desired_generator_ready: bool,
+    ) -> list[TransferAction]:
+        """Выбрать следующий шаг только после подтверждения обоих вводов OFF.
+
+        Проверки текущего движения и их аварийные сообщения остаются у
+        вызывающего метода. Здесь применяется общая логика выбора новой цели.
+        """
         target_generator = desired_source.generator
         if (
             target_generator is not None

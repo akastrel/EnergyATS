@@ -51,7 +51,6 @@ DEFAULT_OPTIONS: dict[str, Any] = {
     # Энергетическая политика.
     "grid_failure_delay": 5,
     "grid_restore_stable_time": 60,
-    "manual_idle_warning_seconds": 600,
     "primary_generator": "Elemax",
     "generator_a_enabled": True,
     "generator_b_enabled": True,
@@ -626,19 +625,10 @@ class EnergySupervisorApp:
             if saved is None:
                 return EnergySupervisor(config)
 
-            if "supervisor" in saved:
-                journal_version = saved.get("journal_schema_version")
-                if not isinstance(journal_version, int) or isinstance(
-                    journal_version,
-                    bool,
-                ):
-                    raise ValueError("Некорректная версия общего журнала")
-                if journal_version != 1:
-                    raise ValueError(
-                        "Неподдерживаемая версия общего журнала "
-                        f"{journal_version}"
-                    )
-            payload = saved.get("supervisor", saved)
+            journal_version = saved.get("journal_schema_version")
+            if type(journal_version) is not int or journal_version != 1:
+                raise ValueError("Неподдерживаемая версия общего журнала")
+            payload = saved.get("supervisor")
             if not isinstance(payload, dict):
                 raise ValueError("В журнале отсутствует объект supervisor")
             supervisor = EnergySupervisor.from_dict(payload, config)
@@ -662,9 +652,6 @@ class EnergySupervisorApp:
             grid_restore_stable_time=float(
                 self.options["grid_restore_stable_time"]
             ),
-            manual_idle_warning_seconds=float(
-                self.options["manual_idle_warning_seconds"]
-            ),
             primary_generator=self._configured_primary_generator(),
             generator_a_enabled=_boolean_option(
                 self.options,
@@ -678,10 +665,6 @@ class EnergySupervisorApp:
 
     def _configured_primary_generator(self) -> GeneratorSlot:
         configured_name = str(self.options["primary_generator"])
-        # Совместимость для обновления с версий, где в options сохранено A/B.
-        # После обновления пользователь может выбрать отображаемое имя.
-        if configured_name in {slot.value for slot in GeneratorSlot}:
-            return GeneratorSlot(configured_name)
         for slot, profile in self.profiles.items():
             if profile.display_name == configured_name:
                 return slot
@@ -890,10 +873,6 @@ class EnergySupervisorApp:
             return True
         except asyncio.TimeoutError:
             return False
-
-
-# Имя оставлено как совместимый alias для внешних тестов/импортов 0.2.x.
-EnergyATSApp = EnergySupervisorApp
 
 
 def _seconds_left(value: float) -> int:
