@@ -15,6 +15,7 @@ from domain import (  # noqa: E402
     GeneratorSlot,
     PowerSource,
     SessionReason,
+    SupervisorEvent,
     Transaction,
 )
 from energy_supervisor import (  # noqa: E402
@@ -29,6 +30,7 @@ from generator_controller import (  # noqa: E402
     GeneratorPhase,
 )
 from ha_adapter import (  # noqa: E402
+    ENERGY_ATS_LOG_ENTITY,
     ENTITIES,
     HomeAssistantAdapter,
     UnsafeHardwareCommand,
@@ -156,6 +158,71 @@ def test_stdin_commands_are_dispatched_without_ha_helpers(tmp_path, monkeypatch)
     app.handle_stdin_line('{"command":"reset"}')
 
     assert received == ["start_generator", "stop_generator", "reset"]
+
+
+def test_supervisor_events_are_written_to_app_log(tmp_path, caplog):
+    app = EnergySupervisorApp(
+        {**DEFAULT_OPTIONS, "state_file": str(tmp_path / "state.json")},
+        token="test",
+    )
+
+    with caplog.at_level("INFO", logger="energy_supervisor"):
+        app._log_events(
+            (
+                SupervisorEvent("info", "Информация"),
+                SupervisorEvent("warning", "Предупреждение"),
+                SupervisorEvent("critical", "Авария"),
+            )
+        )
+
+    assert "INFO     energy_supervisor" in caplog.text
+    assert "WARNING  energy_supervisor" in caplog.text
+    assert "CRITICAL energy_supervisor" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_events_use_energy_ats_logbook_entity_and_only_critical_notifies():
+    fake = FakeClient()
+    adapter = HomeAssistantAdapter(fake, armed=True)
+
+    await adapter.publish_events(
+        (
+            SupervisorEvent("info", "Информация"),
+            SupervisorEvent("warning", "Предупреждение"),
+            SupervisorEvent("critical", "Авария"),
+        )
+    )
+
+    assert fake.calls == [
+        (
+            "logbook",
+            "log",
+            {
+                "name": "Energy ATS",
+                "message": "Информация",
+                "entity_id": ENERGY_ATS_LOG_ENTITY,
+            },
+        ),
+        (
+            "logbook",
+            "log",
+            {
+                "name": "Energy ATS",
+                "message": "Предупреждение",
+                "entity_id": ENERGY_ATS_LOG_ENTITY,
+            },
+        ),
+        (
+            "logbook",
+            "log",
+            {
+                "name": "Energy ATS",
+                "message": "Авария",
+                "entity_id": ENERGY_ATS_LOG_ENTITY,
+            },
+        ),
+        ("script", "notify_critical", {"message": "Авария"})
+    ]
 
 
 def test_disarmed_app_ignores_manual_stdin_commands(tmp_path):

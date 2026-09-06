@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from domain import GeneratorSlot
+from domain import GeneratorSlot, SupervisorEvent
 from energy_supervisor import (
     EnergySupervisor,
     SupervisorConfig,
@@ -289,6 +289,7 @@ class EnergySupervisorApp:
             self._save_state(force=True)
 
         updated_observation = self._supervisor_observation(hardware)
+        self._log_events(decision.events)
         await self.adapter.publish_events(decision.events)
         self._log_runtime_if_changed(updated_observation)
 
@@ -607,6 +608,17 @@ class EnergySupervisorApp:
             observation.generators[GeneratorSlot.A].phase.value,
             observation.generators[GeneratorSlot.B].phase.value,
         )
+
+    def _log_events(self, events: tuple[SupervisorEvent, ...]) -> None:
+        """Всегда записывать сообщения Supervisor в журнал самого App."""
+        log_methods = {
+            "info": self.log.info,
+            "warning": self.log.warning,
+            "critical": self.log.critical,
+        }
+        for event in events:
+            log = log_methods.get(event.level, self.log.info)
+            log("ES: %s", event.message)
 
     async def _stop_requested_within(self, seconds: float) -> bool:
         try:

@@ -42,6 +42,10 @@ ENTITIES = {
     "source_generator": "switch.use_generator_as_power_source",
 }
 
+# Entity обновления создаётся Supervisor для установленного App и принадлежит
+# HA device "Energy ATS". Через неё записи Logbook связываются с этим device.
+ENERGY_ATS_LOG_ENTITY = "update.energy_ats_update"
+
 
 @dataclass(frozen=True)
 class HardwareSnapshot:
@@ -207,30 +211,33 @@ class HomeAssistantAdapter:
         await self._publish_log_entries(log_entries)
 
     async def publish_events(self, events: tuple[SupervisorEvent, ...]) -> None:
+        """Отправлять в HA только события, требующие немедленного внимания.
+
+        Все события уже записаны в журнал App. Обычные ``info`` и ``warning``
+        не должны превращаться в пользовательские уведомления.
+        """
         for event in events:
-            if not self.armed:
-                self.log.info("DISARMED: %s", event.message)
-                continue
-            # Уведомление выполняется после всех силовых команд текущего tick.
             try:
-                if event.level == "warning":
-                    await self.client.call_service(
-                        "script",
-                        "notify_warning",
-                        service_data={"message": event.message},
-                    )
-                elif event.level == "critical":
-                    await self.client.call_service(
-                        "script",
-                        "notify_critical",
-                        service_data={"message": event.message},
-                    )
-                await self._logbook(
-                    event.message,
-                    event.entity_id,
+                await self._logbook(event.message, ENERGY_ATS_LOG_ENTITY)
+            except Exception as exc:
+                self.log.warning(
+                    "Не удалось записать событие Energy ATS в Logbook: %s",
+                    exc,
+                )
+
+            if not self.armed or event.level != "critical":
+                continue
+            try:
+                await self.client.call_service(
+                    "script",
+                    "notify_critical",
+                    service_data={"message": event.message},
                 )
             except Exception as exc:
-                self.log.warning("Не удалось опубликовать событие в HA: %s", exc)
+                self.log.warning(
+                    "Не удалось отправить критическое уведомление: %s",
+                    exc,
+                )
 
     def bool_state(self, entity_id: str) -> bool | None:
         state = self.client.get_state(entity_id)
@@ -338,7 +345,7 @@ class HomeAssistantAdapter:
 
     async def _logbook(self, message: str, entity_id: str | None) -> None:
         service_data = {
-            "name": "Energy Supervisor",
+            "name": "Energy ATS",
             "message": message,
         }
         if entity_id is not None:
