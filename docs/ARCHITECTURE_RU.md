@@ -26,7 +26,7 @@
 Supervisor выдаёт две уровневые цели:
 
 ```python
-desired_source = GRID | BATTERY | GENERATOR_A | GENERATOR_B
+desired_source = None | GRID | BATTERY | GENERATOR_A | GENERATOR_B
 
 desired_generators = {
     A: True | False,
@@ -36,6 +36,10 @@ desired_generators = {
 
 Это именно желаемые состояния, а не импульсные команды. Supervisor не знает,
 как двигается заслонка и какой контактор надо выключить первым.
+
+`desired_source = None` означает HOLD: управляемой сессии нет, поэтому TPC
+только принимает подтверждённую безопасную топологию как внешний факт и не
+переключает контакторы. Так ручное отключение Grid не отменяется Energy ATS.
 
 `GeneratorController` возвращает Supervisor только состояние своего объекта:
 

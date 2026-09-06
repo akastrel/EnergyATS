@@ -37,7 +37,7 @@ from power_transfer import PowerTransferController, TransferAction
 from state_store import StateStore
 
 
-APP_VERSION = "0.3.7"
+APP_VERSION = "0.3.8"
 
 
 DEFAULT_OPTIONS: dict[str, Any] = {
@@ -274,7 +274,11 @@ class EnergySupervisorApp:
             slot: controller.status(hardware.generators[slot])
             for slot, controller in self.generator_controllers.items()
         }
-        desired_generator = decision.desired_source.generator
+        desired_generator = (
+            decision.desired_source.generator
+            if decision.desired_source is not None
+            else None
+        )
         desired_generator_ready = (
             desired_generator is not None
             and generator_statuses[desired_generator].ready_for_load
@@ -320,7 +324,11 @@ class EnergySupervisorApp:
                 stable_managed_session=self.supervisor.manages_stable_generator(slot),
             )
 
-        desired_generator = self.supervisor.desired_source.generator
+        desired_generator = (
+            self.supervisor.desired_source.generator
+            if self.supervisor.desired_source is not None
+            else None
+        )
         ready = (
             desired_generator is not None
             and self.generator_controllers[desired_generator]

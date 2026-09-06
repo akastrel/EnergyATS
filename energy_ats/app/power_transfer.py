@@ -82,7 +82,7 @@ class PowerTransferStatus:
     phase: TransferPhase
     actual_source: PowerSource
     actual_path: PowerPath
-    target_source: PowerSource
+    target_source: PowerSource | None
     transition_in_progress: bool
     recovery_required: bool
     fault: str | None
@@ -106,7 +106,7 @@ class PowerTransferController:
         self.phase = TransferPhase.WAITING_FOR_DATA
         self.actual_source = PowerSource.UNKNOWN
         self.actual_path = PowerPath.UNKNOWN
-        self.target_source = PowerSource.UNKNOWN
+        self.target_source: PowerSource | None = None
         self.deadline: float | None = None
         self.feedback_lost_since: float | None = None
         self.fault: str | None = None
@@ -271,7 +271,7 @@ class PowerTransferController:
         self,
         now: float,
         observation: PowerTransferObservation,
-        desired_source: PowerSource,
+        desired_source: PowerSource | None,
         *,
         desired_generator_ready: bool,
         actions_allowed: bool = True,
@@ -332,7 +332,7 @@ class PowerTransferController:
                     self._set_stable(topology)
             elif (
                 self.phase == TransferPhase.STABLE_GENERATOR
-                and desired_source.generator is None
+                and (desired_source is None or desired_source.generator is None)
             ):
                 # Даже при пропавшем RUNNING разрешено единственное безопасное
                 # действие: снять ранее подтверждённую генераторную шину.
@@ -346,6 +346,16 @@ class PowerTransferController:
                         "подтверждение."
                     )
                 return []
+
+        if desired_source is None:
+            # HOLD: безопасная устойчивая топология принята как внешний факт.
+            # Незавершённая собственная транзакция без цели, напротив,
+            # неоднозначна и не должна молча забываться.
+            if self.transition_in_progress:
+                self._require_recovery(
+                    "Во время силовой транзакции потеряна цель Supervisor."
+                )
+            return []
 
         if not actions_allowed or self.phase == TransferPhase.RECOVERY_REQUIRED:
             return []

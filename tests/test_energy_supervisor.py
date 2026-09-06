@@ -794,7 +794,7 @@ def test_external_session_never_moves_power_path_after_engine_stops():
     )
     assert supervisor.phase == SupervisorPhase.EXTERNAL_RUNNING
     assert decision.actions_allowed is False
-    assert decision.desired_source == PowerSource.GENERATOR_B
+    assert decision.desired_source is None
 
     supervisor.request_manual_start()
     decision = supervisor.step(
@@ -866,6 +866,42 @@ def test_disabling_automatic_transfer_restarts_grid_failure_delay():
         ),
     )
     assert supervisor.session is not None
+
+
+def test_without_session_holds_manual_battery_path_while_grid_is_available():
+    supervisor = EnergySupervisor()
+    manual_battery = observation(
+        grid_ready=True,
+        source=PowerSource.BATTERY,
+        path=PowerPath.BATTERY,
+        automatic=False,
+    )
+
+    decision = supervisor.step(0.0, manual_battery)
+
+    assert supervisor.session is None
+    assert decision.desired_source is None
+    assert decision.status_text == (
+        "Grid доступна · Grid path отключён · питание от аккумуляторов МАП"
+    )
+
+
+def test_manual_start_preserves_preselected_battery_path_during_warmup():
+    supervisor = EnergySupervisor()
+    manual_battery = observation(
+        grid_ready=True,
+        source=PowerSource.BATTERY,
+        path=PowerPath.BATTERY,
+        automatic=False,
+    )
+    supervisor.step(0.0, manual_battery)
+    supervisor.request_manual_start()
+
+    started = supervisor.step(1.0, manual_battery)
+    warming = supervisor.step(2.0, manual_battery)
+
+    assert started.desired_source == PowerSource.BATTERY
+    assert warming.desired_source == PowerSource.BATTERY
 
 
 def test_restore_rejects_failed_or_unknown_journal_schema():

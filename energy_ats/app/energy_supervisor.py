@@ -133,7 +133,7 @@ class SupervisorObservation:
 
 @dataclass(frozen=True)
 class SupervisorDecision:
-    desired_source: PowerSource
+    desired_source: PowerSource | None
     desired_generators: Mapping[GeneratorSlot, bool]
     actions_allowed: bool
     stable_managed_generator: GeneratorSlot | None
@@ -149,7 +149,9 @@ class EnergySupervisor:
         self.phase = SupervisorPhase.WAITING_FOR_DATA
         self.session: GeneratorSession | None = None
         self.transaction: Transaction | None = None
-        self.desired_source = PowerSource.UNKNOWN
+        # None означает HOLD: ES не владеет силовой схемой и TPC должен
+        # только наблюдать подтверждённую физическую топологию.
+        self.desired_source: PowerSource | None = None
         self.desired_generators: dict[GeneratorSlot, bool] = {
             GeneratorSlot.A: False,
             GeneratorSlot.B: False,
@@ -393,7 +395,7 @@ class EnergySupervisor:
                     "без изменений."
                 )
             return
-        self.desired_source = observation.power.actual_source
+        self.desired_source = None
         self.phase = SupervisorPhase.NORMAL
 
     def _step_without_session(
@@ -414,6 +416,7 @@ class EnergySupervisor:
                 GeneratorSlot.A: False,
                 GeneratorSlot.B: False,
             }
+            self.desired_source = None
             # Внешний запуск только наблюдаем; силовую цель не меняем.
             return
 
@@ -442,9 +445,9 @@ class EnergySupervisor:
             if self.phase == SupervisorPhase.GRID_FAILURE_DELAY
             else SupervisorPhase.NORMAL
         )
-        self.desired_source = self._safe_source_for_grid_state(
-            observation.grid_ready
-        )
+        # Без управляемой сессии ES не владеет силовой схемой. Подтверждённое
+        # ручное положение Grid path / Battery path сохраняется как есть.
+        self.desired_source = None
 
         if observation.grid_ready is True:
             self.automatic_start_suppressed_until_grid = False
@@ -550,11 +553,18 @@ class EnergySupervisor:
                     self._begin_return_to_safe_source(now, observation)
                 return
 
-            # Пока генератор не готов, при доступной Grid дом остаётся на Grid
-            # path, а при её отсутствии — на Battery path.
-            self.desired_source = self._safe_source_for_grid_state(
-                observation.grid_ready
-            )
+            # Пока генератор не готов, ручная сессия сохраняет уже выбранный
+            # человеком безопасный путь. Поэтому запуск из Battery path при
+            # доступной Grid не подключает Grid обратно на время прогрева.
+            if (
+                self.session.reason == SessionReason.MANUAL_GENERATOR_START
+                and observation.power.actual_path == PowerPath.BATTERY
+            ):
+                self.desired_source = PowerSource.BATTERY
+            else:
+                self.desired_source = self._safe_source_for_grid_state(
+                    observation.grid_ready
+                )
             if generator.externally_started:
                 self._require_recovery(
                     f"{generator.display_name} запущен внешне во время управляемой сессии."
@@ -793,9 +803,10 @@ class EnergySupervisor:
         self.desired_generators[slot] = True
         other = GeneratorSlot.B if slot == GeneratorSlot.A else GeneratorSlot.A
         self.desired_generators[other] = False
-        self.desired_source = self._safe_source_for_grid_state(
-            observation.grid_ready
-        )
+        # Начинаем управляемую сессию из фактически подтверждённого источника.
+        # В частности, ручной Battery path не должен кратковременно
+        # подключаться обратно к Grid во время запуска и прогрева генератора.
+        self.desired_source = observation.power.actual_source
         self.phase = SupervisorPhase.STARTING_GENERATOR
         self.transaction = Transaction.begin(
             "enter_generator", slot.value, now, "start_generator"
@@ -918,9 +929,7 @@ class EnergySupervisor:
             GeneratorSlot.A: False,
             GeneratorSlot.B: False,
         }
-        self.desired_source = self._safe_source_for_grid_state(
-            observation.grid_ready
-        )
+        self.desired_source = None
         self.phase = SupervisorPhase.NORMAL
         self.generator_idle_since = None
         self.idle_warning_sent = False
@@ -1141,9 +1150,19 @@ class EnergySupervisor:
         if self.phase == SupervisorPhase.GRID_FAILURE_DELAY:
             return "Основная сеть OFF — выдержка перед запуском"
         if self.session is None:
-            if observation.grid_ready is True:
+            if (
+                observation.power.actual_source == PowerSource.GRID
+                and observation.power.actual_path == PowerPath.GRID
+            ):
                 return "Питание от основной сети"
-            if observation.grid_ready is False:
+            if observation.power.actual_source == PowerSource.BATTERY:
+                if observation.power.actual_path == PowerPath.BATTERY:
+                    if observation.grid_ready is True:
+                        return (
+                            "Grid доступна · Grid path отключён · "
+                            "питание от аккумуляторов МАП"
+                        )
+                    return "Основная сеть OFF · Grid path отключён · UPS от МАП"
                 if self.automatic_start_suppressed_until_grid:
                     return "Основная сеть OFF — автозапуск подавлен, UPS от МАП"
                 return "Основная сеть OFF — UPS от МАП"
@@ -1175,7 +1194,9 @@ class EnergySupervisor:
             "phase": self.phase.value,
             "session": self.session.to_dict() if self.session else None,
             "transaction": self.transaction.to_dict() if self.transaction else None,
-            "desired_source": self.desired_source.value,
+            "desired_source": (
+                self.desired_source.value if self.desired_source is not None else None
+            ),
             "desired_generators": {
                 slot.value: desired
                 for slot, desired in self.desired_generators.items()
@@ -1220,7 +1241,10 @@ class EnergySupervisor:
             if isinstance(transaction, Mapping)
             else None
         )
-        supervisor.desired_source = PowerSource(str(data["desired_source"]))
+        desired_source = data.get("desired_source")
+        supervisor.desired_source = (
+            PowerSource(str(desired_source)) if desired_source is not None else None
+        )
         desired = data.get("desired_generators") or {}
         if not isinstance(desired, Mapping):
             raise ValueError("desired_generators должен быть JSON object")

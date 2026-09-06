@@ -442,6 +442,28 @@ def test_explicit_battery_target_disconnects_available_grid_and_can_return():
     assert kinds(actions) == [TransferActionKind.DISCONNECT_GRID]
 
 
+def test_hold_accepts_manual_battery_path_without_reconnecting_grid():
+    controller = PowerTransferController(confirmation_timeout=10.0)
+    controller.step(0.0, observed(), None, desired_generator_ready=False)
+    battery_path = observed(
+        grid_ready=True,
+        house_on_grid=False,
+        grid_connected=False,
+    )
+
+    actions = controller.step(
+        1.0,
+        battery_path,
+        None,
+        desired_generator_ready=False,
+    )
+
+    assert actions == []
+    assert controller.phase == TransferPhase.STABLE_BATTERY_PATH
+    assert controller.status().actual_source == PowerSource.BATTERY
+    assert controller.status().target_source is None
+
+
 def test_recovery_returns_from_generator_to_grid_path_break_before_make():
     controller = PowerTransferController(confirmation_timeout=10.0)
     on_generator = observed(

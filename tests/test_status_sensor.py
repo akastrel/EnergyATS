@@ -91,6 +91,20 @@ def test_status_payload_uses_confirmed_source_and_public_contract(tmp_path):
     }
 
 
+def test_status_reports_manual_battery_path_when_grid_is_available(tmp_path):
+    app, fake = _app_with_fake(tmp_path)
+    fake.states[ENTITIES["grid_power"]] = "off"
+    fake.states[ENTITIES["house_grid"]] = "off"
+    observation = _normal_grid_observation(app, 100.0)
+
+    payload = app._status_payload(100.0, observation)
+
+    assert payload["state"] == (
+        "Grid доступна · Grid path отключён · питание от аккумуляторов МАП"
+    )
+    assert payload["attributes"]["source"] == "battery"
+
+
 @pytest.mark.asyncio
 async def test_status_publication_is_deduplicated(tmp_path):
     app, fake = _app_with_fake(tmp_path)

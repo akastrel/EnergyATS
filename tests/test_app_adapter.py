@@ -127,6 +127,39 @@ def populated_states() -> dict[str, str]:
     }
 
 
+@pytest.mark.asyncio
+async def test_idle_app_does_not_reconnect_manually_disabled_grid(tmp_path):
+    app = EnergySupervisorApp(
+        {
+            **DEFAULT_OPTIONS,
+            "armed": True,
+            "state_file": str(tmp_path / "state.json"),
+        },
+        token="test",
+    )
+    fake = PhysicalFakeClient()
+    fake.states = populated_states()
+    attach_fake_client(app, fake)
+    await app._tick(0.0)
+    fake.calls.clear()
+
+    # Grid перед контактором доступна, но пользователь вручную выбрал
+    # Battery path.
+    fake.states[ENTITIES["grid_power"]] = "off"
+    fake.states[ENTITIES["house_grid"]] = "off"
+    await app._tick(1.0)
+
+    assert fake.states[ENTITIES["grid_power"]] == "off"
+    assert not any(
+        domain == "switch"
+        and service == "turn_on"
+        and data.get("entity_id") == ENTITIES["grid_power"]
+        for domain, service, data in fake.calls
+    )
+    assert app.supervisor.desired_source is None
+    assert app.power_transfer.status().actual_path == PowerPath.BATTERY
+
+
 def test_load_options_merges_small_public_configuration(tmp_path):
     path = tmp_path / "options.json"
     path.write_text(
