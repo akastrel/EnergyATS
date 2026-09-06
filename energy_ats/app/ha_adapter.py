@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import Any
 
 from domain import GeneratorSlot, SupervisorEvent
 from generator_controller import (
@@ -45,6 +46,10 @@ ENTITIES = {
 # Entity обновления создаётся Supervisor для установленного App и принадлежит
 # HA device "Energy ATS". Через неё записи Logbook связываются с этим device.
 ENERGY_ATS_LOG_ENTITY = "update.energy_ats_update"
+
+# Диагностический read-only sensor принадлежит самому App. Он создаётся через
+# HA State API и не участвует ни в одном управляющем решении.
+ENERGY_ATS_STATUS_ENTITY = "sensor.energy_ats_status"
 
 
 @dataclass(frozen=True)
@@ -238,6 +243,28 @@ class HomeAssistantAdapter:
                     "Не удалось отправить критическое уведомление: %s",
                     exc,
                 )
+
+    async def publish_status(self, state: str, attributes: dict[str, Any]) -> bool:
+        """Best-effort публикация диагностического состояния Energy ATS.
+
+        Сенсор нужен человеку и dashboard, но не является частью контура
+        управления. Поэтому любая ошибка State API только попадает в журнал и
+        никогда не прерывает основной цикл ATS.
+        """
+        try:
+            await self.client.set_state(
+                ENERGY_ATS_STATUS_ENTITY,
+                state,
+                attributes=attributes,
+            )
+        except Exception as exc:
+            self.log.warning(
+                "Не удалось опубликовать %s: %s",
+                ENERGY_ATS_STATUS_ENTITY,
+                exc,
+            )
+            return False
+        return True
 
     def bool_state(self, entity_id: str) -> bool | None:
         state = self.client.get_state(entity_id)
