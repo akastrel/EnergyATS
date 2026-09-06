@@ -653,6 +653,7 @@ class EnergySupervisor:
             if (
                 self.session.stop_requested
                 or self.session.reason != SessionReason.MANUAL_GENERATOR_START
+                or self.session.grid_was_unavailable
             ):
                 self.desired_generators[slot] = False
                 self.phase = SupervisorPhase.STOPPING_GENERATOR

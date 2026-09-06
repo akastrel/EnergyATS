@@ -37,7 +37,7 @@ from power_transfer import PowerTransferController, TransferAction
 from state_store import StateStore
 
 
-APP_VERSION = "0.3.8"
+APP_VERSION = "0.3.9"
 
 
 DEFAULT_OPTIONS: dict[str, Any] = {

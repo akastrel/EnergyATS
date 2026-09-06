@@ -201,7 +201,7 @@ def test_manual_start_is_rejected_while_emergency_stop_is_active():
     assert decision.actions_allowed is False
 
 
-def test_manual_outage_session_returns_house_to_grid_but_leaves_engine_running():
+def test_manual_outage_session_returns_house_to_grid_and_stops_engine():
     supervisor = EnergySupervisor(
         SupervisorConfig(grid_restore_stable_time=60.0)
     )
@@ -234,9 +234,17 @@ def test_manual_outage_session_returns_house_to_grid_but_leaves_engine_running()
         71.0,
         observation(grid_ready=True, source=PowerSource.GRID, a=ready_a()),
     )
-    assert supervisor.phase == SupervisorPhase.MANUAL_GENERATOR_IDLE
-    assert decision.desired_generators[GeneratorSlot.A] is True
+    assert supervisor.phase == SupervisorPhase.STOPPING_GENERATOR
+    assert decision.desired_generators[GeneratorSlot.A] is False
     assert decision.desired_source == PowerSource.GRID
+
+    decision = supervisor.step(
+        72.0,
+        observation(grid_ready=True, source=PowerSource.GRID),
+    )
+    assert supervisor.phase == SupervisorPhase.NORMAL
+    assert supervisor.session is None
+    assert decision.desired_generators[GeneratorSlot.A] is False
 
 
 def test_manual_stop_without_grid_targets_battery_without_warning():
@@ -537,49 +545,7 @@ def test_connection_loss_blocks_only_an_in_progress_transaction():
     assert stable.phase == SupervisorPhase.ON_GENERATOR
 
 
-def test_idle_manual_generator_creates_warning_but_is_not_stopped():
-    supervisor = EnergySupervisor(
-        SupervisorConfig(
-            grid_restore_stable_time=1.0,
-            manual_idle_warning_seconds=10.0,
-        )
-    )
-    enter_manual_session(
-        supervisor,
-        grid_ready=False,
-        initial_source=PowerSource.BATTERY,
-    )
-    supervisor.step(
-        10.0,
-        observation(
-            grid_ready=True,
-            source=PowerSource.GENERATOR_A,
-            a=ready_a(),
-        ),
-    )
-    supervisor.step(
-        11.0,
-        observation(
-            grid_ready=True,
-            source=PowerSource.GENERATOR_A,
-            a=ready_a(),
-        ),
-    )
-    supervisor.step(
-        12.0,
-        observation(grid_ready=True, source=PowerSource.GRID, a=ready_a()),
-    )
-    decision = supervisor.step(
-        22.0,
-        observation(grid_ready=True, source=PowerSource.GRID, a=ready_a()),
-    )
-
-    assert supervisor.phase == SupervisorPhase.MANUAL_GENERATOR_IDLE
-    assert decision.desired_generators[GeneratorSlot.A] is True
-    assert any("без нагрузки" in event.message for event in decision.events)
-
-
-def test_local_stop_of_idle_manual_generator_finishes_session_without_recovery():
+def test_grid_failure_during_manual_outage_cooldown_reuses_running_generator():
     supervisor = EnergySupervisor(
         SupervisorConfig(grid_restore_stable_time=1.0)
     )
@@ -608,17 +574,21 @@ def test_local_stop_of_idle_manual_generator_finishes_session_without_recovery()
         12.0,
         observation(grid_ready=True, source=PowerSource.GRID, a=ready_a()),
     )
-    assert supervisor.phase == SupervisorPhase.MANUAL_GENERATOR_IDLE
+    assert supervisor.phase == SupervisorPhase.STOPPING_GENERATOR
 
     decision = supervisor.step(
         13.0,
-        observation(grid_ready=True, source=PowerSource.GRID),
+        observation(
+            grid_ready=False,
+            source=PowerSource.BATTERY,
+            a=ready_a(),
+        ),
     )
 
-    assert supervisor.phase == SupervisorPhase.NORMAL
-    assert supervisor.session is None
-    assert decision.actions_allowed is True
-    assert any("остановлен локально" in event.message for event in decision.events)
+    assert supervisor.phase == SupervisorPhase.TRANSFERRING_TO_GENERATOR
+    assert decision.desired_generators[GeneratorSlot.A] is True
+    assert decision.desired_source == PowerSource.GENERATOR_A
+    assert any("Grid снова пропала" in event.message for event in decision.events)
 
 
 def test_grid_failure_during_automatic_cooldown_reuses_running_generator():
