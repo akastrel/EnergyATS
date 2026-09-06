@@ -702,8 +702,10 @@ class EnergySupervisor:
             return
 
         if self.phase == SupervisorPhase.STOPPING_GENERATOR:
-            self.desired_source = self._safe_source_for_grid_state(
-                observation.grid_ready
+            self.desired_source = (
+                PowerSource.GRID
+                if self.session.stop_requested
+                else self._safe_source_for_grid_state(observation.grid_ready)
             )
             if (
                 observation.grid_ready is False
@@ -821,8 +823,10 @@ class EnergySupervisor:
     def _begin_return_to_safe_source(
         self, now: float, observation: SupervisorObservation
     ) -> None:
-        self.desired_source = self._safe_source_for_grid_state(
-            observation.grid_ready
+        self.desired_source = (
+            PowerSource.GRID
+            if self.session is not None and self.session.stop_requested
+            else self._safe_source_for_grid_state(observation.grid_ready)
         )
         self.phase = SupervisorPhase.RETURNING_TO_GRID_OR_BATTERY
         self.transaction = Transaction.begin(
@@ -950,6 +954,17 @@ class EnergySupervisor:
     def _safe_power_path_confirmed(
         self, observation: SupervisorObservation
     ) -> bool:
+        if self.session is not None and self.session.stop_requested:
+            expected_source = (
+                PowerSource.GRID
+                if observation.grid_ready is True
+                else PowerSource.BATTERY
+            )
+            return (
+                observation.power.actual_source == expected_source
+                and observation.power.actual_path == PowerPath.GRID
+                and not observation.power.transition_in_progress
+            )
         expected = self._safe_source_for_grid_state(observation.grid_ready)
         expected_path = PowerPath.for_source(expected)
         return (

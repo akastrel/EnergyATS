@@ -247,7 +247,7 @@ def test_manual_outage_session_returns_house_to_grid_and_stops_engine():
     assert decision.desired_generators[GeneratorSlot.A] is False
 
 
-def test_manual_stop_without_grid_targets_battery_without_warning():
+def test_manual_stop_without_grid_restores_grid_path_without_warning():
     supervisor = EnergySupervisor()
     enter_manual_session(
         supervisor,
@@ -265,15 +265,21 @@ def test_manual_stop_without_grid_targets_battery_without_warning():
         ),
     )
     assert supervisor.phase == SupervisorPhase.RETURNING_TO_GRID_OR_BATTERY
-    assert decision.desired_source == PowerSource.BATTERY
+    assert decision.desired_source == PowerSource.GRID
     assert not any("невозмож" in event.message.lower() for event in decision.events)
 
     decision = supervisor.step(
         5.0,
-        observation(grid_ready=False, source=PowerSource.BATTERY, a=ready_a()),
+        observation(
+            grid_ready=False,
+            source=PowerSource.BATTERY,
+            path=PowerPath.GRID,
+            a=ready_a(),
+        ),
     )
     assert supervisor.phase == SupervisorPhase.STOPPING_GENERATOR
     assert decision.desired_generators[GeneratorSlot.A] is False
+    assert decision.desired_source == PowerSource.GRID
 
 
 def test_manual_stop_without_grid_suppresses_automatic_restart():
@@ -298,6 +304,7 @@ def test_manual_stop_without_grid_suppresses_automatic_restart():
         observation(
             grid_ready=False,
             source=PowerSource.BATTERY,
+            path=PowerPath.GRID,
             automatic=True,
             a=ready_a(),
         ),
@@ -307,6 +314,7 @@ def test_manual_stop_without_grid_suppresses_automatic_restart():
         observation(
             grid_ready=False,
             source=PowerSource.BATTERY,
+            path=PowerPath.GRID,
             automatic=True,
         ),
     )
@@ -323,6 +331,7 @@ def test_manual_stop_without_grid_suppresses_automatic_restart():
         observation(
             grid_ready=False,
             source=PowerSource.BATTERY,
+            path=PowerPath.GRID,
             automatic=True,
         ),
     )
@@ -334,6 +343,7 @@ def test_manual_stop_without_grid_suppresses_automatic_restart():
         observation(
             grid_ready=False,
             source=PowerSource.BATTERY,
+            path=PowerPath.GRID,
             automatic=True,
         ),
     )

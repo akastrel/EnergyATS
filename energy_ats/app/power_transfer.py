@@ -422,8 +422,6 @@ class PowerTransferController:
             return []
 
         if desired_source == PowerSource.GRID:
-            if observation.grid_ready is not True:
-                return []
             if self.actual_path == PowerPath.GRID:
                 return []
             if self.actual_path == PowerPath.BATTERY:
@@ -494,7 +492,7 @@ class PowerTransferController:
             and observation.emergency_stop is False
         ):
             return self._begin_select_generator(now, target_generator)
-        if desired_source == PowerSource.GRID and observation.grid_ready is True:
+        if desired_source == PowerSource.GRID:
             return self._begin_connect_grid(now)
 
         # Battery path уже полностью подтверждён. Если генератор потерял
@@ -569,7 +567,7 @@ class PowerTransferController:
             and observation.emergency_stop is False
         ):
             return self._begin_select_generator(now, target_generator)
-        if desired_source == PowerSource.GRID and observation.grid_ready is True:
+        if desired_source == PowerSource.GRID:
             return self._begin_connect_grid(now)
 
         self._complete_transition(
@@ -601,7 +599,7 @@ class PowerTransferController:
             return self._begin_disconnect_grid(now, desired_source)
 
         topology = self._infer_stable_topology(observation)
-        if topology == PowerTopology(PowerPath.GRID, PowerSource.GRID):
+        if topology is not None and topology.path == PowerPath.GRID:
             self._complete_transition(now, topology)
         return []
 

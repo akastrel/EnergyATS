@@ -356,7 +356,7 @@ def test_generator_specific_settings_live_in_generator_controller(tmp_path):
     assert app.profiles[GeneratorSlot.B].choke_temperature == 10.0
     assert app.profiles[GeneratorSlot.A].start_timeout_seconds == 90.0
     assert app.profiles[GeneratorSlot.A].stop_timeout_seconds == 90.0
-    assert app.profiles[GeneratorSlot.A].cooldown_seconds == 300.0
+    assert app.profiles[GeneratorSlot.A].cooldown_seconds == 60.0
 
 
 def test_generator_names_are_mapped_to_internal_slots(tmp_path):
@@ -944,13 +944,13 @@ async def test_complete_manual_session_obeys_controller_boundaries(tmp_path):
     await app._tick(49.0)  # Grid power -> ON
     await app._tick(50.0)  # подтверждение Grid path
     await app._tick(51.0)  # начинается cooldown
-    await app._tick(350.0)
+    await app._tick(110.0)
     assert fake.states[ENTITIES["generator_a_remote"]] == "on"
-    await app._tick(351.0)  # cooldown окончен, REMOTE OFF
+    await app._tick(111.0)  # cooldown окончен, REMOTE OFF
 
     fake.states[ENTITIES["generator_a_running"]] = "off"
-    await app._tick(352.0)
-    await app._tick(353.0)
+    await app._tick(112.0)
+    await app._tick(113.0)
     assert app.supervisor.session is None
 
     hardware_calls = [
@@ -968,6 +968,84 @@ async def test_complete_manual_session_obeys_controller_boundaries(tmp_path):
         ("switch", "turn_on", ENTITIES["grid_power"]),
         ("switch", "turn_off", ENTITIES["generator_a_remote"]),
     ]
+
+
+@pytest.mark.asyncio
+async def test_manual_stop_without_grid_restores_grid_relay_before_engine_stop(
+    tmp_path,
+):
+    journal = tmp_path / "state.json"
+    app = EnergySupervisorApp(
+        {
+            **DEFAULT_OPTIONS,
+            "armed": True,
+            "state_file": str(journal),
+        },
+        token="test",
+    )
+    fake = PhysicalFakeClient(journal)
+    fake.states = populated_states()
+    fake.states[ENTITIES["grid_ready"]] = "off"
+    fake.states[ENTITIES["house_grid"]] = "off"
+    fake.states[ENTITIES["ambient_temperature_external"]] = "20"
+    attach_fake_client(app, fake)
+
+    await app._tick(0.0)
+    app.supervisor.request_manual_start()
+    await app._tick(1.0)
+    await app._tick(2.0)
+    fake.states[ENTITIES["generator_a_running"]] = "on"
+    await app._tick(3.0)
+    await app._tick(13.0)
+    await app._tick(43.0)
+    await app._tick(44.0)
+    await app._tick(45.0)
+    await app._tick(46.0)
+    await app._tick(47.0)
+
+    assert fake.states[ENTITIES["grid_power"]] == "off"
+    assert fake.states[ENTITIES["source_generator"]] == "on"
+    fake.calls.clear()
+
+    app.supervisor.request_manual_stop()
+    await app._tick(48.0)
+    await app._tick(49.0)
+    await app._tick(50.0)
+    await app._tick(51.0)
+    await app._tick(52.0)
+
+    hardware_calls = [
+        (domain, service, data["entity_id"])
+        for domain, service, data in fake.calls
+        if domain in {"switch", "button"} and "entity_id" in data
+    ]
+    assert hardware_calls[:2] == [
+        ("switch", "turn_off", ENTITIES["source_generator"]),
+        ("switch", "turn_on", ENTITIES["grid_power"]),
+    ]
+    assert fake.states[ENTITIES["grid_power"]] == "on"
+    assert fake.states[ENTITIES["house_grid"]] == "off"
+    assert fake.states[ENTITIES["generator_a_remote"]] == "on"
+    assert app.power_transfer.status().actual_source == PowerSource.BATTERY
+    assert app.power_transfer.status().actual_path == PowerPath.GRID
+    assert app.supervisor.phase == SupervisorPhase.STOPPING_GENERATOR
+
+    await app._tick(112.0)
+    assert fake.states[ENTITIES["generator_a_remote"]] == "off"
+    hardware_calls = [
+        (domain, service, data["entity_id"])
+        for domain, service, data in fake.calls
+        if domain in {"switch", "button"} and "entity_id" in data
+    ]
+    assert hardware_calls[-1] == (
+        "switch",
+        "turn_off",
+        ENTITIES["generator_a_remote"],
+    )
+    fake.states[ENTITIES["generator_a_running"]] = "off"
+    await app._tick(113.0)
+    await app._tick(114.0)
+    assert app.supervisor.session is None
 
 
 @pytest.mark.asyncio

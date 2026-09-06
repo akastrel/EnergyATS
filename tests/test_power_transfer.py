@@ -149,6 +149,61 @@ def test_return_without_grid_selects_battery_path():
     assert controller.status().actual_path == PowerPath.BATTERY
 
 
+def test_grid_target_restores_grid_path_without_grid_voltage():
+    controller = PowerTransferController(confirmation_timeout=10.0)
+    on_generator = observed(
+        grid_ready=False,
+        house_on_grid=False,
+        house_on_generator=True,
+        grid_connected=False,
+        generator_selected=True,
+        active_generator=GeneratorSlot.A,
+    )
+    controller.step(
+        0.0,
+        on_generator,
+        PowerSource.GENERATOR_A,
+        desired_generator_ready=True,
+    )
+
+    actions = controller.step(
+        1.0,
+        on_generator,
+        PowerSource.GRID,
+        desired_generator_ready=False,
+    )
+    assert kinds(actions) == [TransferActionKind.DESELECT_GENERATOR]
+
+    generator_disconnected = replace(
+        on_generator,
+        generator_selected=False,
+        house_on_generator=False,
+        active_generator=None,
+    )
+    actions = controller.step(
+        2.0,
+        generator_disconnected,
+        PowerSource.GRID,
+        desired_generator_ready=False,
+    )
+    assert kinds(actions) == [TransferActionKind.CONNECT_GRID]
+
+    grid_path_without_voltage = replace(
+        generator_disconnected,
+        grid_connected=True,
+    )
+    actions = controller.step(
+        3.0,
+        grid_path_without_voltage,
+        PowerSource.GRID,
+        desired_generator_ready=False,
+    )
+    assert actions == []
+    assert controller.phase == TransferPhase.STABLE_GRID_PATH
+    assert controller.status().actual_source == PowerSource.BATTERY
+    assert controller.status().actual_path == PowerPath.GRID
+
+
 def test_transfer_timeout_requires_recovery_without_guessing():
     controller = PowerTransferController(confirmation_timeout=2.0)
     controller.step(0.0, observed(), PowerSource.GRID, desired_generator_ready=False)
