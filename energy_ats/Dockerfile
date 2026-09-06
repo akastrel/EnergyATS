@@ -8,8 +8,9 @@ LABEL \
   io.hass.type="app" \
   io.hass.arch="${BUILD_ARCH}"
 
-# aiohttp используется как WebSocket-клиент Home Assistant.
-# Всё остальное в ATS core — только стандартная библиотека Python.
+# aiohttp используется для WebSocket Home Assistant и небольшой REST-публикации
+# диагностического sensor.energy_ats_status. Всё остальное в ATS core — только
+# стандартная библиотека Python.
 RUN apk add --no-cache \
     python3 \
     py3-aiohttp
