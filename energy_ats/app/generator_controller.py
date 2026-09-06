@@ -60,7 +60,7 @@ class GeneratorProfile:
     cold_start_choke_hold_seconds: float = 10.0
     start_timeout_seconds: float = 90.0
     stop_timeout_seconds: float = 90.0
-    cooldown_seconds: float = 300.0
+    cooldown_seconds: float = 60.0
     warm_temperature: float = 10.0
     cool_temperature: float = -5.0
     cold_temperature: float = -10.0
@@ -101,13 +101,13 @@ def default_generator_profiles() -> dict[GeneratorSlot, GeneratorProfile]:
         GeneratorSlot.A: GeneratorProfile(
             slot=GeneratorSlot.A,
             display_name="Elemax",
-            model="Elemax (точная модель пока не указана)",
+            model="SH7600EX 6.5 / 5.6 кВт",
             choke_strategy=ChokeStrategy.ALWAYS,
         ),
         GeneratorSlot.B: GeneratorProfile(
             slot=GeneratorSlot.B,
             display_name="Вепрь",
-            model="Вепрь 6.5 kW (точная модель пока не указана)",
+            model="АПБ 6-230 ВХ-БСГ 6.0 / 5.5 кВт",
             # Для обоих реальных двигателей положение холодного запуска
             # используется всегда. Внешняя температура влияет только на
             # длительность последующего прогрева.
