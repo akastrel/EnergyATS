@@ -35,6 +35,8 @@ class SupervisorPhase(str, Enum):
     TRANSFERRING_TO_GENERATOR = "transferring_to_generator"
     ON_GENERATOR = "on_generator"
     RETURNING_TO_GRID_OR_BATTERY = "returning_to_grid_or_battery"
+    # Новые сессии сюда больше не переходят. Фаза сохранена, чтобы безопасно
+    # прочитать устойчивый журнал 0.3.8 и затем принять stop_generator.
     MANUAL_GENERATOR_IDLE = "manual_generator_idle"
     STOPPING_GENERATOR = "stopping_generator"
     ISOLATING_FAILED_SOURCE = "isolating_failed_source"
@@ -152,10 +154,7 @@ class EnergySupervisor:
         # None означает HOLD: ES не владеет силовой схемой и TPC должен
         # только наблюдать подтверждённую физическую топологию.
         self.desired_source: PowerSource | None = None
-        self.desired_generators: dict[GeneratorSlot, bool] = {
-            GeneratorSlot.A: False,
-            GeneratorSlot.B: False,
-        }
+        self.desired_generators = self._stopped_generator_targets()
         self.grid_failed_since: float | None = None
         self.grid_ready_since: float | None = None
         self.generator_idle_since: float | None = None
@@ -202,10 +201,7 @@ class EnergySupervisor:
             now,
             "restore_grid_path",
         )
-        self.desired_generators = {
-            GeneratorSlot.A: False,
-            GeneratorSlot.B: False,
-        }
+        self.desired_generators = self._stopped_generator_targets()
         self._event("info", "Начато безопасное восстановление Energy ATS.")
 
     def advance_recovery_reset(
@@ -245,10 +241,7 @@ class EnergySupervisor:
         self.session = None
         self.transaction = None
         self.recovery_reason = None
-        self.desired_generators = {
-            GeneratorSlot.A: False,
-            GeneratorSlot.B: False,
-        }
+        self.desired_generators = self._stopped_generator_targets()
         self._event("info", "Восстановление завершено; управление снова разрешено.")
 
     def mark_connection_lost(self, now: float) -> None:
@@ -292,8 +285,7 @@ class EnergySupervisor:
             command_waiting = (
                 self._manual_start_requested or self._manual_stop_requested
             )
-            self._manual_start_requested = False
-            self._manual_stop_requested = False
+            self._discard_manual_requests()
             if command_waiting:
                 self._event(
                     "warning",
@@ -308,19 +300,16 @@ class EnergySupervisor:
                     "warning",
                     "Ручная команда отклонена до завершения recovery.",
                 )
-            self._manual_start_requested = False
-            self._manual_stop_requested = False
+            self._discard_manual_requests()
             return self._decision(observation)
 
         if observation.emergency_stop is True:
-            self._manual_start_requested = False
-            self._manual_stop_requested = False
+            self._discard_manual_requests()
             self._require_recovery("Активен Generators Emergency Stop.")
             return self._decision(observation)
 
         if observation.power.recovery_required:
-            self._manual_start_requested = False
-            self._manual_stop_requested = False
+            self._discard_manual_requests()
             self._require_recovery(
                 observation.power.fault or "Power Transfer требует восстановления.",
                 user_message=self._power_transfer_recovery_message(observation),
@@ -340,8 +329,7 @@ class EnergySupervisor:
             in {GeneratorPhase.FAULT, GeneratorPhase.RECOVERY_REQUIRED}
         ]
         if unsafe_generators:
-            self._manual_start_requested = False
-            self._manual_stop_requested = False
+            self._discard_manual_requests()
             names = ", ".join(
                 status.display_name for status in unsafe_generators
             )
@@ -412,10 +400,7 @@ class EnergySupervisor:
                     f"Обнаружен внешний запуск ({names}). Supervisor только наблюдает.",
                 )
             self.phase = SupervisorPhase.EXTERNAL_RUNNING
-            self.desired_generators = {
-                GeneratorSlot.A: False,
-                GeneratorSlot.B: False,
-            }
+            self.desired_generators = self._stopped_generator_targets()
             self.desired_source = None
             # Внешний запуск только наблюдаем; силовую цель не меняем.
             return
@@ -430,10 +415,7 @@ class EnergySupervisor:
                 # пока человек сам не вернёт силовую схему в Grid path или
                 # Battery path.
                 # Никаких команд контакторам здесь не формируем.
-                self.desired_generators = {
-                    GeneratorSlot.A: False,
-                    GeneratorSlot.B: False,
-                }
+                self.desired_generators = self._stopped_generator_targets()
                 return
             if observation.grid_ready is False:
                 self.automatic_start_suppressed_until_grid = True
@@ -520,7 +502,7 @@ class EnergySupervisor:
                 f"{generator.display_name} остановлен локально; "
                 "ручная сессия завершена.",
             )
-            self._finish_session(observation)
+            self._finish_session()
             return
 
         if (
@@ -728,7 +710,7 @@ class EnergySupervisor:
                 return
             if generator.running is False and generator.phase == GeneratorPhase.IDLE:
                 self._complete_transaction(now, "Генератор остановлен.")
-                self._finish_session(observation)
+                self._finish_session()
 
     def _handle_manual_start(
         self, now: float, observation: SupervisorObservation
@@ -928,17 +910,24 @@ class EnergySupervisor:
             "Grid снова пропала во время возврата; повторно вводим генератор.",
         )
 
-    def _finish_session(self, observation: SupervisorObservation) -> None:
+    def _finish_session(self) -> None:
         self.session = None
-        self.desired_generators = {
-            GeneratorSlot.A: False,
-            GeneratorSlot.B: False,
-        }
+        self.desired_generators = self._stopped_generator_targets()
         self.desired_source = None
         self.phase = SupervisorPhase.NORMAL
         self.generator_idle_since = None
         self.idle_warning_sent = False
         self.grid_failed_since = None
+
+    @staticmethod
+    def _stopped_generator_targets() -> dict[GeneratorSlot, bool]:
+        """Создать независимый набор STOP-целей для обоих генераторов."""
+        return {slot: False for slot in GeneratorSlot}
+
+    def _discard_manual_requests(self) -> None:
+        """Не переносить импульсную ручную команду через защитный барьер."""
+        self._manual_start_requested = False
+        self._manual_stop_requested = False
 
     def _should_return_after_grid_restore(
         self, now: float, observation: SupervisorObservation

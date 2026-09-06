@@ -17,7 +17,7 @@ from generator_controller import GeneratorPhase
 from ha_adapter import ENTITIES
 from main import DEFAULT_OPTIONS, EnergySupervisorApp
 from state_store import StateStore
-from test_app_adapter import (
+from app_test_support import (
     PhysicalFakeClient,
     attach_fake_client,
     populated_states,
