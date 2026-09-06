@@ -43,6 +43,18 @@ from power_transfer import TransferAction, TransferActionKind  # noqa: E402
 from state_store import StateStore  # noqa: E402
 
 
+def test_app_version_matches_addon_manifest():
+    """Версия в журнале App не должна расходиться с версией HA App."""
+    config_path = APP_DIR.parent / "config.yaml"
+    version_line = next(
+        line for line in config_path.read_text(encoding="utf-8").splitlines()
+        if line.startswith("version:")
+    )
+    manifest_version = version_line.split(":", 1)[1].strip().strip('"')
+
+    assert app_main.APP_VERSION == manifest_version
+
+
 class FakeClient:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, dict]] = []

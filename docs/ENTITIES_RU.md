@@ -1,4 +1,4 @@
-# Home Assistant entities и команды — Energy ATS 0.3.4
+# Home Assistant entities и команды — Energy ATS 0.3.6
 
 Вся привязка к конкретным `entity_id` находится в `ha_adapter.py`. Остальные
 Python-контроллеры этих имён не знают.
@@ -55,7 +55,8 @@ data:
 - `start_generator` — создать управляемую ручную сессию и ввести резерв;
 - `stop_generator` — безопасно снять нагрузку и остановить управляемый
   генератор; при отсутствующей Grid перейти на МАП;
-- `reset` — после осмотра запросить выход из `RECOVERY_REQUIRED`.
+- `reset` — после осмотра запустить безопасный возврат в Grid path и выход из
+  `RECOVERY_REQUIRED`.
 
 Положение АВР берётся из `input_boolean.automatic_generator_transfer`, который
 определён в корневом `ats.yaml`. При `armed: false` ручные команды игнорируются,
@@ -87,5 +88,5 @@ data:
 - `button.generator_b_choke_open`
 - `button.generator_b_choke_close`
 
-Energy ATS 0.3.4 их не вызывает. Удалить их можно в следующем согласованном
+Energy ATS 0.3.6 их не вызывает. Удалить их можно в следующем согласованном
 релизе после обновления работающей установки.

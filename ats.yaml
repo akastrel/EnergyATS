@@ -1,4 +1,4 @@
-# Home Assistant package для Energy ATS 0.3.4.
+# Home Assistant package для Energy ATS 0.3.6.
 #
 # Подключите этот файл как package Home Assistant. Сам App не создаёт entities.
 # Единственное состояние UI, принадлежащее ATS, — разрешение АВР ниже. При
