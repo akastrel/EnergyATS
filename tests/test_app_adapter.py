@@ -254,7 +254,10 @@ def test_manual_command_is_not_queued_before_app_is_ready(tmp_path):
 
     assert app.supervisor._manual_start_requested is False
 
-
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Асинхронный stdin Home Assistant App проверяется только на Linux",
+)
 @pytest.mark.asyncio
 async def test_stdin_reader_accepts_home_assistant_json(tmp_path, monkeypatch):
     app = EnergySupervisorApp(

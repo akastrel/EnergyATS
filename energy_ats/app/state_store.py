@@ -33,8 +33,14 @@ class StateStore:
         os.replace(temporary, self.path)
 
         # fsync файла гарантирует его содержимое, fsync каталога — сам факт
-        # атомарного rename после внезапной потери питания хоста.
-        directory = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        # атомарного rename после внезапной потери питания хоста. Windows не
+        # поддерживает открытие каталога через O_DIRECTORY; сам App работает
+        # в Linux, а на Windows этот дополнительный шаг безопасно пропускается.
+        directory_flag = getattr(os, "O_DIRECTORY", None)
+        if directory_flag is None:
+            return
+
+        directory = os.open(self.path.parent, os.O_RDONLY | directory_flag)
         try:
             os.fsync(directory)
         finally:
