@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.3.7
+
+- Добавлен диагностический `sensor.energy_ats_status`, который публикуется
+  самим Energy ATS в Home Assistant и не требует отдельного helper-а.
+- Состояние sensor содержит человекочитаемый статус, а атрибуты показывают
+  фактический `source`, текущую `phase`, активный генератор, `generator_slot`,
+  `session_reason`, состояние `armed` и `remaining_seconds`.
+- `remaining_seconds` вычисляется только из существующих deadline/timestamp
+  автоматов Energy Supervisor, Generator Controller и Power Transfer; отдельного
+  независимого таймера для UI нет.
+- Публикация статуса вынесена через штатные слои `main.py` ->
+  `HomeAssistantAdapter` -> `HomeAssistantClient.set_state()` и выполняется
+  через Home Assistant REST State API.
+- Ошибка публикации status sensor считается диагностической и не может
+  прервать управляющий цикл или аппаратную последовательность ATS.
+- После переподключения к Home Assistant sensor принудительно публикуется
+  заново, чтобы восстановиться после restart HA.
+
 ## 0.3.6
 
 - Ошибка силового перехода сообщает пользователю понятный результат, а
