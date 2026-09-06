@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import signal
 import sys
@@ -36,7 +37,7 @@ from power_transfer import PowerTransferController, TransferAction
 from state_store import StateStore
 
 
-APP_VERSION = "0.3.6"
+APP_VERSION = "0.3.7"
 
 
 DEFAULT_OPTIONS: dict[str, Any] = {
@@ -99,6 +100,11 @@ class EnergySupervisorApp:
         self.stop_event = asyncio.Event()
         self.commands_ready = False
         self._last_runtime_signature: tuple[Any, ...] | None = None
+
+        # Последний успешно опубликованный HA status. Нужен только для
+        # подавления одинаковых REST-записей. После каждого reconnect cache
+        # сбрасывается, чтобы HA гарантированно получил sensor заново.
+        self._last_status_payload: dict[str, Any] | None = None
 
     def request_stop(self) -> None:
         self.stop_event.set()
@@ -201,6 +207,9 @@ class EnergySupervisorApp:
         while not self.stop_event.is_set():
             try:
                 await self.client.connect()
+                # Динамический sensor живёт в HA state machine, а не Entity
+                # Registry. После reconnect/рестарта HA публикуем его заново.
+                self._last_status_payload = None
                 await self._wait_until_required_entities_ready()
                 if self.stop_event.is_set():
                     break
@@ -283,10 +292,14 @@ class EnergySupervisorApp:
             generator_actions,
         )
 
+        # hardware — это подтверждённый снимок начала tick. Поэтому status
+        # никогда не выдаёт только что отправленную команду за уже состоявшийся
+        # физический переход; новое source появится после обратной связи HA.
         updated_observation = self._supervisor_observation(hardware)
         self._log_events(decision.events)
         await self.adapter.publish_events(decision.events)
         self._log_runtime_if_changed(updated_observation)
+        await self._publish_status(now, updated_observation)
 
     def _refresh_component_views(
         self, now: float, hardware: HardwareSnapshot
@@ -553,6 +566,7 @@ class EnergySupervisorApp:
         self._log_events(decision.events)
         await self.adapter.publish_events(decision.events)
         self._log_runtime_if_changed(observation)
+        await self._publish_status(now, observation)
 
     async def _wait_until_required_entities_ready(self) -> None:
         last_log_at = 0.0
@@ -709,6 +723,120 @@ class EnergySupervisorApp:
         )
         return described
 
+    async def _publish_status(
+        self,
+        now: float,
+        observation: SupervisorObservation,
+    ) -> None:
+        """Опубликовать read-only представление уже принятого состояния ATS."""
+        payload = self._status_payload(now, observation)
+        if payload == self._last_status_payload:
+            return
+
+        published = await self.adapter.publish_status(
+            payload["state"],
+            payload["attributes"],
+        )
+        if published:
+            self._last_status_payload = payload
+
+    def _status_payload(
+        self,
+        now: float,
+        observation: SupervisorObservation,
+    ) -> dict[str, Any]:
+        """Собрать стабильный публичный контракт sensor.energy_ats_status."""
+        session = self.supervisor.session
+        slot = observation.power.actual_source.generator
+
+        # Если дом пока не переведён на генератор, наиболее полезен генератор
+        # текущей управляемой сессии (запуск, прогрев, cooldown).
+        if slot is None and session is not None:
+            slot = session.generator
+
+        # Внешний ручной запуск тоже видим в диагностике, но только если он
+        # однозначный — при двух одновременно активных генераторах не гадаем.
+        if slot is None:
+            external_slots = [
+                candidate
+                for candidate, status in observation.generators.items()
+                if status.externally_started
+            ]
+            if len(external_slots) == 1:
+                slot = external_slots[0]
+
+        generator_name = (
+            self.profiles[slot].display_name if slot is not None else None
+        )
+        state = (
+            self.supervisor.status_text(observation)
+            if self.armed
+            else "DISARMED — только наблюдение"
+        )
+
+        return {
+            "state": state,
+            "attributes": {
+                "friendly_name": "Energy ATS Status",
+                "icon": "mdi:transfer-switch",
+                "source": observation.power.actual_source.value,
+                "phase": self.supervisor.phase.value,
+                "generator": generator_name,
+                "generator_slot": slot.value if slot is not None else None,
+                "remaining_seconds": self._remaining_seconds(now, observation),
+                "session_reason": (
+                    session.reason.value if session is not None else None
+                ),
+                "armed": self.armed,
+                "schema_version": 1,
+            },
+        }
+
+    def _remaining_seconds(
+        self,
+        now: float,
+        observation: SupervisorObservation,
+    ) -> int | None:
+        """Остаток только реально существующей выдержки/дедлайна автомата.
+
+        Отдельного countdown для UI здесь нет: sensor лишь отображает таймеры,
+        которыми уже владеют Supervisor, PowerTransfer и GeneratorController.
+        """
+        if (
+            observation.power.transition_in_progress
+            and self.power_transfer.deadline is not None
+        ):
+            return _seconds_left(self.power_transfer.deadline - now)
+
+        session = self.supervisor.session
+        if session is not None:
+            controller = self.generator_controllers[session.generator]
+            if controller.deadline is not None:
+                return _seconds_left(controller.deadline - now)
+
+        if (
+            self.supervisor.phase == SupervisorPhase.GRID_FAILURE_DELAY
+            and self.supervisor.grid_failed_since is not None
+        ):
+            elapsed = now - self.supervisor.grid_failed_since
+            return _seconds_left(
+                self.supervisor.config.grid_failure_delay - elapsed
+            )
+
+        if (
+            self.supervisor.phase == SupervisorPhase.ON_GENERATOR
+            and session is not None
+            and session.grid_was_unavailable
+            and observation.grid_ready is True
+            and self.supervisor.grid_ready_since is not None
+        ):
+            elapsed = now - self.supervisor.grid_ready_since
+            return _seconds_left(
+                self.supervisor.config.grid_restore_stable_time - elapsed
+            )
+
+        return None
+
     def _log_runtime_if_changed(self, observation: SupervisorObservation) -> None:
         signature = (
             self.supervisor.phase,
@@ -758,6 +886,10 @@ class EnergySupervisorApp:
 
 # Имя оставлено как совместимый alias для внешних тестов/импортов 0.2.x.
 EnergyATSApp = EnergySupervisorApp
+
+
+def _seconds_left(value: float) -> int:
+    return max(0, int(math.ceil(value)))
 
 
 def _boolean_option(options: dict[str, Any], name: str) -> bool:
