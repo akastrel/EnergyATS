@@ -20,12 +20,9 @@ configuration:
   transfer_confirmation_timeout:
     name: "Transfer confirmation timeout, s"
     description: "Maximum wait for physical house_powered_by_* feedback after a power transfer step."
-  primary_generator:
-    name: "Primary generator"
-    description: "First candidate for a new managed session. If both generators are enabled, the other one is the secondary candidate. Automatic failover after an actual generator fault is still disabled."
   generator_a_enabled:
-    name: "Enable Elemax"
-    description: "Allow the Supervisor to select Elemax for a new session."
+    name: "Enable generator A"
+    description: "Allow the Supervisor to select physical generator slot A for a new session. Name and model are read from Home Assistant."
   generator_b_enabled:
-    name: "Enable Vepr"
-    description: "Allow the Supervisor to select Vepr for a new session."
+    name: "Enable generator B"
+    description: "Allow the Supervisor to select physical generator slot B for a new session. Name and model are read from Home Assistant."
