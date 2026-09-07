@@ -37,7 +37,7 @@ from power_transfer import PowerTransferController, TransferAction
 from state_store import StateStore
 
 
-APP_VERSION = "0.3.11"
+APP_VERSION = "0.3.12"
 
 
 DEFAULT_OPTIONS: dict[str, Any] = {
@@ -638,20 +638,35 @@ class EnergySupervisorApp:
             return supervisor
 
     def _supervisor_config(self) -> SupervisorConfig:
+        primary_generator = self._configured_primary_generator()
+        generator_a_enabled = _boolean_option(
+            self.options,
+            "generator_a_enabled",
+        )
+        generator_b_enabled = _boolean_option(
+            self.options,
+            "generator_b_enabled",
+        )
+        primary_enabled = (
+            generator_a_enabled
+            if primary_generator == GeneratorSlot.A
+            else generator_b_enabled
+        )
+        if not primary_enabled:
+            primary_name = self.profiles[primary_generator].display_name
+            raise ValueError(
+                f"Некорректная конфигурация: основной генератор {primary_name} "
+                "отключён. Включите его или выберите другой основной генератор."
+            )
+
         return SupervisorConfig(
             grid_failure_delay=float(self.options["grid_failure_delay"]),
             grid_restore_stable_time=float(
                 self.options["grid_restore_stable_time"]
             ),
-            primary_generator=self._configured_primary_generator(),
-            generator_a_enabled=_boolean_option(
-                self.options,
-                "generator_a_enabled",
-            ),
-            generator_b_enabled=_boolean_option(
-                self.options,
-                "generator_b_enabled",
-            ),
+            primary_generator=primary_generator,
+            generator_a_enabled=generator_a_enabled,
+            generator_b_enabled=generator_b_enabled,
         )
 
     def _configured_primary_generator(self) -> GeneratorSlot:
