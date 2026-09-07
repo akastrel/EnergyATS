@@ -35,6 +35,11 @@ def _grid_states() -> dict[str, str]:
         ENTITIES["generator_b_running"]: "off",
         ENTITIES["generator_a_remote"]: "off",
         ENTITIES["generator_b_remote"]: "off",
+        ENTITIES["generator_a_name"]: "Elemax",
+        ENTITIES["generator_b_name"]: "Вепрь",
+        ENTITIES["generator_a_model"]: "SH7600EX 6.5 / 5.6 кВт",
+        ENTITIES["generator_b_model"]: "АПБ 6-230 ВХ-БСГ 6.0 / 5.5 кВт",
+        ENTITIES["primary_generator"]: "Elemax",
         ENTITIES["emergency_stop"]: "off",
         ENTITIES["ambient_temperature_external"]: "7.5",
         ENTITIES["grid_power"]: "on",
@@ -63,6 +68,7 @@ def _app_with_fake(tmp_path):
 
 def _normal_grid_observation(app: EnergySupervisorApp, now: float):
     hardware = app.adapter.snapshot()
+    app._sync_generator_configuration(hardware)
     app._refresh_component_views(now, hardware)
     observation = app._supervisor_observation(hardware)
     app.supervisor.step(now, observation)
