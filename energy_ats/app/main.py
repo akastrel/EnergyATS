@@ -37,7 +37,7 @@ from power_transfer import PowerTransferController, TransferAction
 from state_store import StateStore
 
 
-APP_VERSION = "0.3.11"
+APP_VERSION = "0.3.12"
 
 
 DEFAULT_OPTIONS: dict[str, Any] = {
@@ -196,10 +196,7 @@ class EnergySupervisorApp:
         while not self.stop_event.is_set():
             try:
                 await self.client.connect()
-                # Динамический sensor живёт в HA state machine, а не Entity
-                # Registry. После reconnect/рестарта HA публикуем его заново.
                 self._last_status_payload = None
-                # Готовность определяют данные HA, а не время после запуска.
                 await self._wait_until_required_entities_ready()
                 if self.stop_event.is_set():
                     break
@@ -286,9 +283,6 @@ class EnergySupervisorApp:
             generator_actions,
         )
 
-        # hardware — это подтверждённый снимок начала tick. Поэтому status
-        # никогда не выдаёт только что отправленную команду за уже состоявшийся
-        # физический переход; новое source появится после обратной связи HA.
         updated_observation = self._supervisor_observation(hardware)
         self._log_events(decision.events)
         await self.adapter.publish_events(decision.events)
@@ -298,13 +292,6 @@ class EnergySupervisorApp:
     def _refresh_component_views(
         self, now: float, hardware: HardwareSnapshot
     ) -> None:
-        """До решения Supervisor обновить автоматы только наблюдениями.
-
-        Первый вызов восстанавливает физическую картину. Последующие нужны,
-        чтобы после разрыва HA или внешнего ручного действия Supervisor увидел
-        новое положение до формирования цели и не применил старую цель снова.
-        ``actions_allowed=False`` гарантирует отсутствие service calls.
-        """
         for slot, controller in self.generator_controllers.items():
             controller.step(
                 now,
@@ -383,7 +370,6 @@ class EnergySupervisorApp:
         now: float,
         hardware: HardwareSnapshot,
     ) -> None:
-        """Продвинуть только безопасную процедуру ES-18 и ничего больше."""
         blocker = self._recovery_blocker(hardware)
         if blocker is not None:
             self.supervisor.fail_recovery_reset(now, blocker)
@@ -541,7 +527,6 @@ class EnergySupervisorApp:
         transfer_actions: list[TransferAction],
         generator_actions: list[GeneratorAction],
     ) -> None:
-        """Записать pending-команды до первого аппаратного service call."""
         self._pending_action_records = self._describe_actions(
             transfer_actions,
             generator_actions,
@@ -638,20 +623,35 @@ class EnergySupervisorApp:
             return supervisor
 
     def _supervisor_config(self) -> SupervisorConfig:
+        primary_generator = self._configured_primary_generator()
+        generator_a_enabled = _boolean_option(
+            self.options,
+            "generator_a_enabled",
+        )
+        generator_b_enabled = _boolean_option(
+            self.options,
+            "generator_b_enabled",
+        )
+        primary_enabled = (
+            generator_a_enabled
+            if primary_generator == GeneratorSlot.A
+            else generator_b_enabled
+        )
+        if not primary_enabled:
+            primary_name = self.profiles[primary_generator].display_name
+            raise ValueError(
+                f"Некорректная конфигурация: основной генератор {primary_name} "
+                "отключён. Включите его или выберите другой основной генератор."
+            )
+
         return SupervisorConfig(
             grid_failure_delay=float(self.options["grid_failure_delay"]),
             grid_restore_stable_time=float(
                 self.options["grid_restore_stable_time"]
             ),
-            primary_generator=self._configured_primary_generator(),
-            generator_a_enabled=_boolean_option(
-                self.options,
-                "generator_a_enabled",
-            ),
-            generator_b_enabled=_boolean_option(
-                self.options,
-                "generator_b_enabled",
-            ),
+            primary_generator=primary_generator,
+            generator_a_enabled=generator_a_enabled,
+            generator_b_enabled=generator_b_enabled,
         )
 
     def _configured_primary_generator(self) -> GeneratorSlot:
@@ -710,7 +710,6 @@ class EnergySupervisorApp:
         now: float,
         observation: SupervisorObservation,
     ) -> None:
-        """Опубликовать read-only представление уже принятого состояния ATS."""
         payload = self._status_payload(now, observation)
         if payload == self._last_status_payload:
             return
@@ -727,17 +726,12 @@ class EnergySupervisorApp:
         now: float,
         observation: SupervisorObservation,
     ) -> dict[str, Any]:
-        """Собрать стабильный публичный контракт sensor.energy_ats_status."""
         session = self.supervisor.session
         slot = observation.power.actual_source.generator
 
-        # Если дом пока не переведён на генератор, наиболее полезен генератор
-        # текущей управляемой сессии (запуск, прогрев, cooldown).
         if slot is None and session is not None:
             slot = session.generator
 
-        # Внешний ручной запуск тоже видим в диагностике, но только если он
-        # однозначный — при двух одновременно активных генераторах не гадаем.
         if slot is None:
             external_slots = [
                 candidate
@@ -779,11 +773,6 @@ class EnergySupervisorApp:
         now: float,
         observation: SupervisorObservation,
     ) -> int | None:
-        """Остаток только реально существующей выдержки/дедлайна автомата.
-
-        Отдельного countdown для UI здесь нет: sensor лишь отображает таймеры,
-        которыми уже владеют Supervisor, PowerTransfer и GeneratorController.
-        """
         if (
             observation.power.transition_in_progress
             and self.power_transfer.deadline is not None
@@ -848,7 +837,6 @@ class EnergySupervisorApp:
         )
 
     def _log_events(self, events: tuple[SupervisorEvent, ...]) -> None:
-        """Всегда записывать сообщения Supervisor в журнал самого App."""
         log_methods = {
             "info": self.log.info,
             "warning": self.log.warning,
