@@ -26,12 +26,9 @@ configuration:
   transfer_confirmation_timeout:
     name: "Timeout подтверждения силового переключения, с"
     description: "Ожидание физических house_powered_by_* после каждого шага силовой коммутации."
-  primary_generator:
-    name: "Основной генератор"
-    description: "Первый кандидат для новой управляемой сессии. Если разрешены оба генератора, второй является резервным кандидатом. Автоматического fallback после фактического отказа основного пока нет."
   generator_a_enabled:
-    name: "Разрешить Elemax"
-    description: "Разрешить Supervisor выбирать Elemax для новой сессии."
+    name: "Разрешить генератор A"
+    description: "Разрешить Supervisor выбирать физический слот генератора A для новой сессии. Имя и модель читаются из Home Assistant."
   generator_b_enabled:
-    name: "Разрешить Вепрь"
-    description: "Разрешить Supervisor выбирать Вепрь для новой сессии."
+    name: "Разрешить генератор B"
+    description: "Разрешить Supervisor выбирать физический слот генератора B для новой сессии. Имя и модель читаются из Home Assistant."
