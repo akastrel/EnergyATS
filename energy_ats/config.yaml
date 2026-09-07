@@ -1,5 +1,5 @@
 name: "Energy ATS"
-version: "0.3.12"
+version: "0.3.13"
 slug: "energy_ats"
 description: >-
   Energy Supervisor: политика источников, безопасная силовая коммутация и
@@ -25,9 +25,9 @@ options:
   grid_restore_stable_time: 60
   transfer_confirmation_timeout: 60
 
-  # Политика выбора. Названия, модели, заслонка, прогрев и cooldown находятся
-  # в GeneratorProfile внутри generator_controller.py.
-  primary_generator: "Elemax"
+  # Имя, модель и выбор основного генератора являются конфигурацией
+  # Generator Controller и читаются из Home Assistant. В App остаются только
+  # разрешения на использование физических слотов A/B.
   generator_a_enabled: true
   generator_b_enabled: true
 
@@ -40,6 +40,5 @@ schema:
   grid_restore_stable_time: "float(0,900)"
   transfer_confirmation_timeout: "float(1,300)"
 
-  primary_generator: "list(Elemax|Вепрь)"
   generator_a_enabled: bool
   generator_b_enabled: bool
