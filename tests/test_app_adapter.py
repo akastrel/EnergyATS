@@ -42,6 +42,7 @@ from main import DEFAULT_OPTIONS, EnergySupervisorApp, load_options  # noqa: E40
 from power_transfer import TransferAction, TransferActionKind  # noqa: E402
 from state_store import StateStore  # noqa: E402
 
+
 def test_app_version_matches_addon_manifest():
     """Версия в журнале App не должна расходиться с версией HA App."""
     config_path = APP_DIR.parent / "config.yaml"
@@ -52,6 +53,7 @@ def test_app_version_matches_addon_manifest():
     manifest_version = version_line.split(":", 1)[1].strip().strip('"')
 
     assert app_main.APP_VERSION == manifest_version
+
 
 class FakeClient:
     def __init__(self) -> None:
@@ -66,6 +68,7 @@ class FakeClient:
 
     def has_entity(self, entity_id):
         return entity_id in self.states
+
 
 class PhysicalFakeClient(FakeClient):
     """Минимальная физическая обратная связь для сквозного теста App."""
@@ -97,9 +100,11 @@ class PhysicalFakeClient(FakeClient):
         elif entity_id == ENTITIES["source_generator"] and service == "turn_off":
             self.states[ENTITIES["house_generator"]] = "off"
 
+
 def attach_fake_client(app: EnergySupervisorApp, fake: FakeClient) -> None:
     app.client = fake
     app.adapter.client = fake
+
 
 def populated_states() -> dict[str, str]:
     return {
@@ -111,6 +116,11 @@ def populated_states() -> dict[str, str]:
         ENTITIES["generator_b_running"]: "off",
         ENTITIES["generator_a_remote"]: "off",
         ENTITIES["generator_b_remote"]: "off",
+        ENTITIES["generator_a_name"]: "Elemax",
+        ENTITIES["generator_b_name"]: "Вепрь",
+        ENTITIES["generator_a_model"]: "SH7600EX 6.5 / 5.6 кВт",
+        ENTITIES["generator_b_model"]: "АПБ 6-230 ВХ-БСГ 6.0 / 5.5 кВт",
+        ENTITIES["primary_generator"]: "Elemax",
         ENTITIES["emergency_stop"]: "off",
         ENTITIES["ambient_temperature_external"]: "7.5",
         ENTITIES["grid_power"]: "on",
@@ -120,6 +130,7 @@ def populated_states() -> dict[str, str]:
         ENTITIES["generator_b_choke_cold_start"]: "unknown",
         ENTITIES["generator_b_choke_run"]: "unknown",
     }
+
 
 def test_load_options_merges_small_public_configuration(tmp_path):
     path = tmp_path / "options.json"
@@ -131,6 +142,8 @@ def test_load_options_merges_small_public_configuration(tmp_path):
     assert options["armed"] is True
     assert options["grid_failure_delay"] == 7
     assert options["transfer_confirmation_timeout"] == 60
+    assert "primary_generator" not in options
+
 
 def test_stdin_commands_are_dispatched_without_ha_helpers(tmp_path, monkeypatch):
     app = EnergySupervisorApp(
@@ -165,6 +178,7 @@ def test_stdin_commands_are_dispatched_without_ha_helpers(tmp_path, monkeypatch)
 
     assert received == ["start_generator", "stop_generator", "reset"]
 
+
 def test_supervisor_events_are_written_to_app_log(tmp_path, caplog):
     app = EnergySupervisorApp(
         {**DEFAULT_OPTIONS, "state_file": str(tmp_path / "state.json")},
@@ -184,6 +198,7 @@ def test_supervisor_events_are_written_to_app_log(tmp_path, caplog):
     assert "WARNING  energy_supervisor" in caplog.text
     assert "CRITICAL energy_supervisor" in caplog.text
     assert "ES:" not in caplog.text
+
 
 @pytest.mark.asyncio
 async def test_events_use_energy_ats_logbook_entity_and_only_critical_notifies():
@@ -229,6 +244,7 @@ async def test_events_use_energy_ats_logbook_entity_and_only_critical_notifies()
         ("script", "notify_critical", {"message": "Авария"})
     ]
 
+
 def test_disarmed_app_ignores_manual_stdin_commands(tmp_path):
     app = EnergySupervisorApp(
         {
@@ -243,6 +259,7 @@ def test_disarmed_app_ignores_manual_stdin_commands(tmp_path):
 
     assert app.supervisor._manual_start_requested is False
 
+
 def test_manual_command_is_not_queued_before_app_is_ready(tmp_path):
     app = EnergySupervisorApp(
         {
@@ -256,6 +273,7 @@ def test_manual_command_is_not_queued_before_app_is_ready(tmp_path):
     app.handle_stdin_line('{"command":"start_generator"}')
 
     assert app.supervisor._manual_start_requested is False
+
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(
@@ -284,6 +302,7 @@ async def test_stdin_reader_accepts_home_assistant_json(tmp_path, monkeypatch):
 
     assert app.supervisor._manual_start_requested is True
 
+
 def test_string_false_can_never_arm_hardware(tmp_path):
     with pytest.raises(ValueError, match="armed.*JSON boolean"):
         EnergySupervisorApp(
@@ -295,45 +314,78 @@ def test_string_false_can_never_arm_hardware(tmp_path):
             token="test",
         )
 
-def test_generator_specific_settings_live_in_generator_controller(tmp_path):
+
+def test_generator_runtime_settings_remain_in_generator_controller(tmp_path):
     app = EnergySupervisorApp(
         {**DEFAULT_OPTIONS, "state_file": str(tmp_path / "state.json")},
         token="test",
     )
+    assert "primary_generator" not in DEFAULT_OPTIONS
     assert "generator_a_name" not in DEFAULT_OPTIONS
+    assert "generator_a_model" not in DEFAULT_OPTIONS
     assert "generator_a_choke_mode" not in DEFAULT_OPTIONS
-    assert app.profiles[GeneratorSlot.A].display_name == "Elemax"
+    assert app.profiles[GeneratorSlot.A].display_name == "Generator A"
+    assert app.profiles[GeneratorSlot.A].model == ""
     assert app.profiles[GeneratorSlot.A].choke_strategy == ChokeStrategy.ALWAYS
-    assert app.profiles[GeneratorSlot.B].display_name == "Вепрь"
+    assert app.profiles[GeneratorSlot.B].display_name == "Generator B"
+    assert app.profiles[GeneratorSlot.B].model == ""
     assert app.profiles[GeneratorSlot.B].choke_strategy == ChokeStrategy.ALWAYS
     assert app.profiles[GeneratorSlot.B].choke_temperature == 10.0
     assert app.profiles[GeneratorSlot.A].start_timeout_seconds == 90.0
     assert app.profiles[GeneratorSlot.A].stop_timeout_seconds == 90.0
     assert app.profiles[GeneratorSlot.A].cooldown_seconds == 60.0
 
-def test_generator_names_are_mapped_to_internal_slots(tmp_path):
+
+def test_generator_identity_and_primary_are_read_from_home_assistant(tmp_path):
     app = EnergySupervisorApp(
-        {
-            **DEFAULT_OPTIONS,
-            "primary_generator": "Вепрь",
-            "state_file": str(tmp_path / "state.json"),
-        },
+        {**DEFAULT_OPTIONS, "state_file": str(tmp_path / "state.json")},
         token="test",
     )
+    fake = FakeClient()
+    fake.states = populated_states()
+    fake.states[ENTITIES["primary_generator"]] = "Вепрь"
+    attach_fake_client(app, fake)
 
+    hardware = app.adapter.snapshot()
+    app._sync_generator_configuration(hardware)
+
+    assert app.profiles[GeneratorSlot.A].display_name == "Elemax"
+    assert app.profiles[GeneratorSlot.A].model == "SH7600EX 6.5 / 5.6 кВт"
+    assert app.profiles[GeneratorSlot.B].display_name == "Вепрь"
+    assert app.profiles[GeneratorSlot.B].model == "АПБ 6-230 ВХ-БСГ 6.0 / 5.5 кВт"
     assert app.supervisor.config.primary_generator == GeneratorSlot.B
 
-def test_legacy_generator_slot_is_rejected(tmp_path):
-    # Совместимость снята: конфигурация принимает отображаемые имена.
-    with pytest.raises(ValueError, match="primary_generator"):
-        EnergySupervisorApp(
-            {
-                **DEFAULT_OPTIONS,
-                "primary_generator": "A",
-                "state_file": str(tmp_path / "state.json"),
-            },
-            token="test",
-        )
+
+def test_primary_generator_change_affects_next_selection_without_app_restart(tmp_path):
+    app = EnergySupervisorApp(
+        {**DEFAULT_OPTIONS, "state_file": str(tmp_path / "state.json")},
+        token="test",
+    )
+    fake = FakeClient()
+    fake.states = populated_states()
+    attach_fake_client(app, fake)
+
+    app._sync_generator_configuration(app.adapter.snapshot())
+    assert app.supervisor.config.primary_generator == GeneratorSlot.A
+
+    fake.states[ENTITIES["primary_generator"]] = "Вепрь"
+    app._sync_generator_configuration(app.adapter.snapshot())
+    assert app.supervisor.config.primary_generator == GeneratorSlot.B
+
+
+def test_invalid_primary_generator_is_rejected_before_commands(tmp_path):
+    app = EnergySupervisorApp(
+        {**DEFAULT_OPTIONS, "state_file": str(tmp_path / "state.json")},
+        token="test",
+    )
+    fake = FakeClient()
+    fake.states = populated_states()
+    fake.states[ENTITIES["primary_generator"]] = "Generator C"
+    attach_fake_client(app, fake)
+
+    with pytest.raises(ValueError, match="select.primary_generator"):
+        app._sync_generator_configuration(app.adapter.snapshot())
+
 
 def test_adapter_reads_positive_grid_switch_and_external_temperature():
     fake = FakeClient()
@@ -344,12 +396,16 @@ def test_adapter_reads_positive_grid_switch_and_external_temperature():
     assert snapshot.automatic_transfer_enabled is False
     assert snapshot.power_transfer.grid_connected is True
     assert snapshot.power_transfer.generator_selected is False
+    assert snapshot.primary_generator == GeneratorSlot.A
+    assert snapshot.generator_metadata[GeneratorSlot.A].name == "Elemax"
+    assert snapshot.generator_metadata[GeneratorSlot.B].name == "Вепрь"
     assert (
         snapshot.generators[GeneratorSlot.A].ambient_temperature_external == 7.5
     )
 
     fake.states[ENTITIES["automatic_transfer"]] = "on"
     assert adapter.snapshot().automatic_transfer_enabled is True
+
 
 def test_control_entities_are_required_only_in_armed_mode():
     fake = FakeClient()
@@ -361,6 +417,7 @@ def test_control_entities_are_required_only_in_armed_mode():
     assert ENTITIES["generator_a_choke_cold_start"] not in adapter.missing_required_entities(
         include_control_entities=False
     )
+
 
 def saved_supervisor_payload(
     *,
@@ -392,6 +449,7 @@ def saved_supervisor_payload(
         "pending_actions": [],
     }
 
+
 def test_pending_hardware_command_restores_only_to_recovery(tmp_path):
     journal = tmp_path / "state.json"
     payload = saved_supervisor_payload(
@@ -414,6 +472,7 @@ def test_pending_hardware_command_restores_only_to_recovery(tmp_path):
 
     assert restored.supervisor.phase == SupervisorPhase.RECOVERY_REQUIRED
 
+
 def test_unknown_envelope_schema_is_not_silently_loaded(tmp_path):
     journal = tmp_path / "state.json"
     payload = saved_supervisor_payload(
@@ -430,6 +489,7 @@ def test_unknown_envelope_schema_is_not_silently_loaded(tmp_path):
 
     assert restored.supervisor.phase == SupervisorPhase.RECOVERY_REQUIRED
 
+
 @pytest.mark.asyncio
 async def test_disarmed_adapter_never_calls_hardware():
     fake = FakeClient()
@@ -445,6 +505,7 @@ async def test_disarmed_adapter_never_calls_hardware():
         ],
     )
     assert fake.calls == []
+
 
 @pytest.mark.asyncio
 async def test_adapter_isolates_bus_before_stopping_engine():
@@ -486,6 +547,7 @@ async def test_adapter_isolates_bus_before_stopping_engine():
         ),
     ]
 
+
 @pytest.mark.asyncio
 async def test_adapter_refuses_to_start_second_generator():
     fake = FakeClient()
@@ -506,6 +568,7 @@ async def test_adapter_refuses_to_start_second_generator():
         )
     assert fake.calls == []
 
+
 @pytest.mark.asyncio
 async def test_adapter_refuses_make_before_break():
     fake = FakeClient()
@@ -518,6 +581,7 @@ async def test_adapter_refuses_make_before_break():
             [],
         )
     assert fake.calls == []
+
 
 @pytest.mark.asyncio
 async def test_adapter_refuses_remote_off_while_generator_is_loaded():
@@ -540,6 +604,7 @@ async def test_adapter_refuses_remote_off_while_generator_is_loaded():
             ],
         )
     assert fake.calls == []
+
 
 @pytest.mark.asyncio
 async def test_home_assistant_websocket_client_roundtrip():
