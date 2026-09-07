@@ -19,16 +19,19 @@ configuration:
   grid_restore_stable_time:
     name: "Стабилизация вернувшейся Grid, с"
     description: "Сколько Grid Input Ready должен непрерывно быть ON перед возвратом дома на сеть."
-
-  manual_idle_warning_seconds:
-    name: "Предупреждение о холостом ходе, с"
-    description: "Когда напомнить, что вручную запущенный генератор продолжает работать после возврата дома на Grid. Автоматической остановки нет."
   transfer_confirmation_timeout:
     name: "Timeout подтверждения силового переключения, с"
     description: "Ожидание физических house_powered_by_* после каждого шага силовой коммутации."
+
   generator_a_enabled:
     name: "Разрешить генератор A"
-    description: "Разрешить Supervisor выбирать физический слот генератора A для новой сессии. Имя и модель читаются из Home Assistant."
+    description: >-
+      Разрешить Energy Supervisor использовать физический слот A для новой
+      управляемой сессии. Это policy-флаг Energy ATS; имя, модель и primary
+      читаются из Home Assistant.
   generator_b_enabled:
     name: "Разрешить генератор B"
-    description: "Разрешить Supervisor выбирать физический слот генератора B для новой сессии. Имя и модель читаются из Home Assistant."
+    description: >-
+      Разрешить Energy Supervisor использовать физический слот B для новой
+      управляемой сессии. Это policy-флаг Energy ATS; имя, модель и primary
+      читаются из Home Assistant.
