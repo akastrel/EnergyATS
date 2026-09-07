@@ -81,7 +81,6 @@ preheat_*
 
 ```yaml
 armed: false
-startup_delay: 30
 tick_seconds: 1.0
 log_level: info
 grid_failure_delay: 5

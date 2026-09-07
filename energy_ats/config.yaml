@@ -1,5 +1,5 @@
 name: "Energy ATS"
-version: "0.3.10"
+version: "0.3.11"
 slug: "energy_ats"
 description: >-
   Energy Supervisor: политика источников, безопасная силовая коммутация и
@@ -18,7 +18,6 @@ stdin: true
 
 options:
   armed: false
-  startup_delay: 30
   tick_seconds: 1.0
   log_level: "info"
 
@@ -34,7 +33,6 @@ options:
 
 schema:
   armed: bool
-  startup_delay: "int(0,300)"
   tick_seconds: "float(0.2,10)"
   log_level: "list(debug|info|warning|error)"
 

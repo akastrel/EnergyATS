@@ -2,9 +2,6 @@ configuration:
   armed:
     name: "Arm hardware control"
     description: "Master deployment safety switch. Keep disabled for the first run."
-  startup_delay:
-    name: "Startup delay, s"
-    description: "Wait for Home Assistant, ESPHome and Bolid entities before reading the physical state."
   tick_seconds:
     name: "ATS tick, s"
     description: "State-machine evaluation interval."
