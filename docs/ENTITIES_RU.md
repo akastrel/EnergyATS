@@ -1,46 +1,109 @@
-# Home Assistant entities и команды — Energy ATS 0.3.12
+# Home Assistant entities и команды — Energy ATS 0.3.13
 
-Вся привязка к конкретным `entity_id` находится в `ha_adapter.py`. Остальные
-Python-контроллеры этих имён не знают.
+Вся привязка Energy ATS к конкретным `entity_id` находится в
+`energy_ats/app/ha_adapter.py`. Доменные автоматы не знают имён Home Assistant
+entities.
 
-## Обязательная физическая обратная связь
+## 1. Стабильные аппаратные слоты
 
-- `input_boolean.automatic_generator_transfer` — разрешение АВР и его
-  отображаемое состояние в HA
-- `binary_sensor.grid_input_ready`
-- `binary_sensor.house_powered_by_grid`
-- `binary_sensor.house_powered_by_generator`
-- `binary_sensor.generator_a_is_running`
-- `binary_sensor.generator_b_is_running`
-- `switch.generator_a_remote_start`
-- `switch.generator_b_remote_start`
-- `switch.grid_power` — ON означает подключённый Grid path
-- `switch.use_generator_as_power_source` — ON означает генераторную шину
-- `switch.generators_emergency_stop`
+Внутри Energy ATS генераторы обозначаются как `A` и `B`. Это стабильные
+аппаратные слоты и часть машинного контракта. Они не являются именами или
+моделями установленных генераторов.
 
-## Команды Generator Controller firmware 0.3.1
+Человеко-читаемая идентичность поступает из Generator Controller через Home
+Assistant.
 
-- `button.generator_a_choke_to_cold_start`
-- `button.generator_a_choke_to_run`
-- `button.generator_b_choke_to_cold_start`
-- `button.generator_b_choke_to_run`
+## 2. Обязательная физическая обратная связь
 
-Названия описывают физический результат. В отличие от старых
-`choke_open/choke_close`, здесь не требуется помнить обратную механику привода.
+```text
+input_boolean.automatic_generator_transfer
+binary_sensor.grid_input_ready
+binary_sensor.house_powered_by_grid
+binary_sensor.house_powered_by_generator
+binary_sensor.generator_a_is_running
+binary_sensor.generator_b_is_running
+switch.generator_a_remote_start
+switch.generator_b_remote_start
+switch.grid_power
+switch.use_generator_as_power_source
+switch.generators_emergency_stop
+```
 
-## Внешняя температура
+Назначение:
 
-- `sensor.garage_temperature` → поле Python
-  `ambient_temperature_external`
+- `automatic_generator_transfer` — разрешение автоматического АВР;
+- `grid_input_ready` — Grid пригодна для использования;
+- `house_powered_by_*` — физическое подтверждение источника дома;
+- `generator_*_is_running` — физический RUNNING соответствующего слота;
+- `generator_*_remote_start` — состояние/команда REMOTE DKG116;
+- `grid_power` — подключение Grid path;
+- `use_generator_as_power_source` — генераторная шина;
+- `generators_emergency_stop` — общий Emergency Stop.
 
-Датчик optional. При `unknown/unavailable` температурная стратегия выбирает
-холодный запуск и максимальный прогрев. В ESPHome Generator Controller этот
-датчик не импортируется.
+## 3. Идентичность генераторов и primary
 
-## Команды Energy ATS
+Energy ATS 0.3.13 обязательно читает:
 
-Однократные ручные команды Home Assistant передаёт непосредственно в App через
-`hassio.app_stdin`:
+```text
+sensor.generator_a_name
+sensor.generator_b_name
+sensor.generator_a_model
+sensor.generator_b_model
+select.primary_generator
+```
+
+Пример текущей установки:
+
+```text
+sensor.generator_a_name   = Elemax
+sensor.generator_b_name   = Вепрь
+sensor.generator_a_model  = SH7600EX 6.5 / 5.6 кВт
+sensor.generator_b_model  = АПБ 6-230 ВХ-БСГ 6.0 / 5.5 кВт
+select.primary_generator  = Elemax
+```
+
+Правила:
+
+1. имена A и B должны быть непустыми и различными;
+2. модели должны быть доступны как строки;
+3. состояние `select.primary_generator` должно в точности совпадать с одним из
+   `sensor.generator_*_name`;
+4. Energy ATS преобразует имя primary во внутренний `GeneratorSlot.A/B`;
+5. изменение primary влияет только на выбор следующей новой управляемой
+   сессии и не переключает уже работающий генератор.
+
+Если эти entities отсутствуют или имеют `unknown/unavailable`, App не считается
+готовым к аппаратным действиям.
+
+## 4. Команды заслонки Generator Controller
+
+```text
+button.generator_a_choke_to_cold_start
+button.generator_a_choke_to_run
+button.generator_b_choke_to_cold_start
+button.generator_b_choke_to_run
+```
+
+Названия описывают физический результат, а не электрическое направление
+привода. Energy ATS не использует исторические `choke_open/choke_close`.
+
+## 5. Внешняя температура
+
+```text
+sensor.garage_temperature
+```
+
+Преобразуется в `ambient_temperature_external`. Температура не является
+источником истины для RUNNING и не участвует в силовой коммутации. При
+`unknown/unavailable` Generator Controller применяет консервативный сценарий
+прогрева.
+
+## 6. Команды Energy ATS
+
+Однократные команды передаются непосредственно в App через
+`hassio.app_stdin`.
+
+Пример:
 
 ```yaml
 action: hassio.app_stdin
@@ -50,43 +113,64 @@ data:
     command: start_generator
 ```
 
-Поддерживаются ровно три команды:
+Поддерживаются ровно:
 
-- `start_generator` — создать управляемую ручную сессию и ввести резерв;
-- `stop_generator` — безопасно снять нагрузку и остановить управляемый
-  генератор; при отсутствующей Grid перейти на МАП;
-- `reset` — после осмотра запустить безопасный возврат в Grid path и выход из
-  `RECOVERY_REQUIRED`.
+```text
+start_generator
+stop_generator
+reset
+```
 
-Положение АВР берётся из `input_boolean.automatic_generator_transfer`, который
-определён в корневом `ats.yaml`. При `armed: false` ручные команды игнорируются,
-а положение helper-а не приводит к аппаратным действиям.
+- `start_generator` — создать управляемую ручную сессию;
+- `stop_generator` — безопасно снять генераторную нагрузку, выполнить cooldown
+  и остановить управляемый генератор;
+- `reset` — после осмотра выполнить ограниченную recovery-процедуру.
 
-Текущие состояния Supervisor, TPC и обоих GC записываются в журнал App. App не
-создаёт для них отдельные HA-сущности.
+При `armed: false` аппаратные команды запрещены.
 
-`app` — фактический ID установленного Energy ATS. Надёжнее всего добавить
-действие через визуальный редактор Home Assistant и выбрать **Energy ATS** из
-списка: HA подставит нужный ID самостоятельно.
+## 7. Диагностический sensor Energy ATS
 
-## Уведомления
+Сам App публикует:
 
-- `script.notify_warning`
-- `script.notify_critical`
-- `logbook.log`
+```text
+sensor.energy_ats_status
+```
 
-Ошибка необязательного уведомления или Logbook не прерывает уже начатую
-аппаратную последовательность.
+Это read-only диагностика. Sensor не используется контроллерами как вход.
 
-## Устаревший интерфейс заслонки
+Основные атрибуты schema version 2:
 
-Прошивка 0.3.1 временно оставляет старые кнопки, чтобы обновление с Energy ATS
-0.2.5 можно было выполнить безопасно:
+```text
+source
+generator
+generator_model
+generator_slot
+primary_generator
+primary_generator_slot
+phase
+remaining_seconds
+session_reason
+armed
+schema_version
+```
 
-- `button.generator_a_choke_open`
-- `button.generator_a_choke_close`
-- `button.generator_b_choke_open`
-- `button.generator_b_choke_close`
+`generator` и `generator_model` относятся к активной управляемой сессии либо
+подтверждённому генераторному источнику, когда он однозначно известен.
 
-Energy ATS 0.3.12 их не вызывает. Удалить их можно в следующем согласованном
-релизе после обновления работающей установки.
+## 8. Необязательные уведомления
+
+```text
+script.notify_warning
+script.notify_critical
+logbook.log
+```
+
+Ошибка диагностического уведомления или Logbook не должна прерывать уже
+начатую аппаратную последовательность.
+
+## 9. UI helper-ы
+
+Такие сущности, как `sensor.house_powered_by_generator_name` или текстовые
+label-сенсоры для dashboard, являются представлением UI и не входят в
+управляющий контракт Energy ATS. Их можно строить поверх обязательных entities
+без изменения алгоритма App.
