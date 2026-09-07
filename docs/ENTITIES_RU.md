@@ -1,4 +1,4 @@
-# Home Assistant entities и команды — Energy ATS 0.3.6
+# Home Assistant entities и команды — Energy ATS 0.3.12
 
 Вся привязка к конкретным `entity_id` находится в `ha_adapter.py`. Остальные
 Python-контроллеры этих имён не знают.
@@ -88,5 +88,5 @@ data:
 - `button.generator_b_choke_open`
 - `button.generator_b_choke_close`
 
-Energy ATS 0.3.6 их не вызывает. Удалить их можно в следующем согласованном
+Energy ATS 0.3.12 их не вызывает. Удалить их можно в следующем согласованном
 релизе после обновления работающей установки.
