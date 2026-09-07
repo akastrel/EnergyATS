@@ -1,4 +1,4 @@
-# Energy ATS 0.3.6
+# Energy ATS 0.3.12
 
 Energy ATS теперь содержит Energy Supervisor, безопасный Power Transfer и два
 независимых Generator Controller в одном Python-процессе.
