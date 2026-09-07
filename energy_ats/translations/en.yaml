@@ -8,21 +8,20 @@ configuration:
   log_level:
     name: "Log level"
     description: "Use info normally and debug for diagnostics."
+
   grid_failure_delay:
     name: "Grid failure delay, s"
     description: "How long Grid Input Ready must stay OFF before a generator start is initiated."
   grid_restore_stable_time:
     name: "Grid restore stability time, s"
     description: "How long Grid Input Ready must stay ON before returning the house to Grid."
-  manual_idle_warning_seconds:
-    name: "Manual idle warning, s"
-    description: "When to remind the operator that a manually started generator is still idling after the house returned to Grid. It is not stopped automatically."
   transfer_confirmation_timeout:
     name: "Transfer confirmation timeout, s"
     description: "Maximum wait for physical house_powered_by_* feedback after a power transfer step."
+
   generator_a_enabled:
     name: "Enable generator A"
-    description: "Allow the Supervisor to select physical generator slot A for a new session. Name and model are read from Home Assistant."
+    description: "Allow the Energy Supervisor to use physical slot A for a new managed session. This is Energy ATS policy; name, model and primary are read from Home Assistant."
   generator_b_enabled:
     name: "Enable generator B"
-    description: "Allow the Supervisor to select physical generator slot B for a new session. Name and model are read from Home Assistant."
+    description: "Allow the Energy Supervisor to use physical slot B for a new managed session. This is Energy ATS policy; name, model and primary are read from Home Assistant."
