@@ -1,12 +1,18 @@
-# Home Assistant package для Energy ATS 0.3.6.
+# Home Assistant package для Energy ATS 0.3.13.
 #
-# Подключите этот файл как package Home Assistant. Сам App не создаёт entities.
-# Единственное состояние UI, принадлежащее ATS, — разрешение АВР ниже. При
-# первом создании оно равно OFF; затем Home Assistant восстанавливает последнее
-# состояние.
+# Подключите этот файл как package Home Assistant.
+# Сам package создаёт только helper разрешения АВР ниже. Energy ATS отдельно
+# публикует диагностический sensor.energy_ats_status через Home Assistant API.
+#
+# A/B — стабильные аппаратные слоты. Человеко-читаемые имя, модель и выбор
+# основного генератора принадлежат Generator Controller и читаются Energy ATS
+# из Home Assistant.
 #
 # Обязательные внешние entities (их создают силовой шкаф, Generator Controller,
 # ESPHome либо другая существующая конфигурация HA):
+#
+# input_boolean.automatic_generator_transfer
+#   Разрешение автоматического ввода резерва. Создаётся этим package ниже.
 #
 # binary_sensor.grid_input_ready
 #   Grid пригодна для подключения дома.
@@ -14,9 +20,10 @@
 #   Подтверждение питания дома от Grid.
 # binary_sensor.house_powered_by_generator
 #   Подтверждение питания дома от генераторной шины.
+#
 # binary_sensor.generator_a_is_running
 # binary_sensor.generator_b_is_running
-#   Физическая обратная связь RUNNING от Elemax и Вепря.
+#   Физическая обратная связь RUNNING от аппаратных слотов A/B.
 # switch.generator_a_remote_start
 # switch.generator_b_remote_start
 #   Команды REMOTE START для DKG116.
@@ -25,14 +32,31 @@
 # button.generator_b_choke_to_cold_start
 # button.generator_b_choke_to_run
 #   Команды двух устойчивых положений заслонки.
+#
+# sensor.generator_a_name
+# sensor.generator_b_name
+#   Человеко-читаемые имена генераторов, установленных в слотах A/B.
+# sensor.generator_a_model
+# sensor.generator_b_model
+#   Модели генераторов, установленных в слотах A/B.
+# select.primary_generator
+#   Основной генератор. Значение select должно в точности совпадать с состоянием
+#   sensor.generator_a_name либо sensor.generator_b_name.
+#
 # switch.generators_emergency_stop
 #   Общий аварийный останов генераторов.
 # sensor.garage_temperature
 #   Внешняя температура; используется только для выбора времени прогрева.
+#   Необязательна: при unknown/unavailable применяется консервативный прогрев.
 # switch.grid_power
 #   Подключение и отключение Grid path.
 # switch.use_generator_as_power_source
 #   Подключение и отключение генераторной шины.
+#
+# Диагностическая сущность, которую публикует сам App:
+# sensor.energy_ats_status
+#   Состояние ES и атрибуты source/phase/generator/generator_model/
+#   primary_generator/remaining_seconds и др. В управляющей логике не участвует.
 #
 # Необязательные службы уведомлений, используемые ATS при их наличии:
 # script.notify_warning
