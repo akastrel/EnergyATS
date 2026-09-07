@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.3.13
+
+- Имя и модель генераторов перенесены из Python-профилей Energy ATS в
+  Generator Controller / Home Assistant. Energy ATS обязательно читает
+  `sensor.generator_a_name`, `sensor.generator_b_name`,
+  `sensor.generator_a_model` и `sensor.generator_b_model`.
+- Выбор основного генератора перенесён из Configuration App в
+  `select.primary_generator`. Значение select сопоставляется с именем
+  генератора и преобразуется во внутренний стабильный слот A/B.
+- A/B окончательно закреплены как машинные аппаратные слоты. Смена имени,
+  модели или primary не требует изменения entity_id, FSM или persistent
+  journal.
+- `generator_a_enabled` и `generator_b_enabled` намеренно оставлены в Energy
+  ATS как policy-флаги Supervisor: установленный генератор можно временно
+  запретить без изменения физической конфигурации Generator Controller.
+- Новые metadata и primary входят в обязательный HA-контракт. До их успешного
+  чтения App не разрешает аппаратные команды.
+- `sensor.energy_ats_status` переведён на schema version 2 и дополнен
+  атрибутами `generator_model`, `primary_generator` и
+  `primary_generator_slot`.
+- Корневой `ats.yaml`, README, встроенная Documentation, INSTALL, ENTITIES и
+  ARCHITECTURE актуализированы под контракт 0.3.13.
+
 ## 0.3.12
 
 - При запуске App проверяет согласованность `primary_generator` и флагов
@@ -145,6 +168,7 @@
   `choke_to_cold_start`; `choke_to_run` означает рабочее положение двигателя.
 - Recovery reset разрешён только после ручного возврата силовой схемы в
   подтверждённый Grid path и остановки обоих генераторов.
+
 ## 0.3.0
 
 - Монолитный ATS разделён на `EnergySupervisor`, `PowerTransferController`,
