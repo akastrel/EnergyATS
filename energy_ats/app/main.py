@@ -34,7 +34,7 @@ from generator_controller import (
 )
 from ha_adapter import ENTITIES, HardwareSnapshot, HomeAssistantAdapter
 from ha_client import HomeAssistantClient, HomeAssistantConnectionError
-from power_transfer import PowerTransferController, TransferAction
+from power_transfer import PowerTransferController, TransferAction, TransferPhase
 from state_store import StateStore
 
 
@@ -59,6 +59,23 @@ DEFAULT_OPTIONS: dict[str, Any] = {
 
     # Внутренний файл App. Путь вынесен в options только ради тестов.
     "state_file": "/data/energy-supervisor-state.json",
+}
+
+
+_GENERATOR_PHASE_TEXT = {
+    GeneratorPhase.WAITING_FOR_DATA: "ожидание данных",
+    GeneratorPhase.IDLE: "остановлен",
+    GeneratorPhase.PREPARING: "подготовка к запуску",
+    GeneratorPhase.WAITING_FOR_RUNNING: "запуск",
+    GeneratorPhase.HOLDING_COLD_START_CHOKE: "запущен, заслонка",
+    GeneratorPhase.WARMING_UP: "прогрев",
+    GeneratorPhase.READY_FOR_LOAD: "готов",
+    GeneratorPhase.WAITING_FOR_LOAD_RELEASE: "ожидание снятия нагрузки",
+    GeneratorPhase.COOLING_DOWN: "охлаждение",
+    GeneratorPhase.WAITING_FOR_STOP: "остановка",
+    GeneratorPhase.EXTERNAL_RUNNING: "внешний запуск",
+    GeneratorPhase.FAULT: "АВАРИЯ",
+    GeneratorPhase.RECOVERY_REQUIRED: "требуется восстановление",
 }
 
 
@@ -865,36 +882,110 @@ class EnergySupervisorApp:
 
         return None
 
+    def _format_power(self, observation: SupervisorObservation) -> str:
+        source = observation.power.actual_source
+        if source == PowerSource.GRID:
+            return "Grid"
+        if source == PowerSource.BATTERY:
+            return "Battery"
+        slot = source.generator
+        if slot is not None:
+            return f"Generator {self.profiles[slot].display_name}"
+        return "Unknown"
+
+    def _format_transfer(self, observation: SupervisorObservation) -> str | None:
+        phase = observation.power.phase
+        if phase == TransferPhase.DISCONNECTING_GRID:
+            return "disconnecting Grid"
+        if phase == TransferPhase.CONNECTING_GRID:
+            return "connecting Grid"
+        if phase == TransferPhase.RECOVERY_REQUIRED:
+            return "recovery required"
+
+        if phase not in {
+            TransferPhase.SELECTING_GENERATOR,
+            TransferPhase.DISCONNECTING_GENERATOR,
+        }:
+            return None
+
+        slot = observation.power.target_source.generator
+        if slot is None:
+            slot = observation.power.actual_source.generator
+        if slot is None and self.supervisor.session is not None:
+            slot = self.supervisor.session.generator
+
+        name = self.profiles[slot].display_name if slot is not None else "generator"
+        action = (
+            "connecting"
+            if phase == TransferPhase.SELECTING_GENERATOR
+            else "disconnecting"
+        )
+        return f"{action} {name}"
+
+    def _format_generator_state(
+        self,
+        slot: GeneratorSlot,
+        observation: SupervisorObservation,
+    ) -> str:
+        phase = observation.generators[slot].phase
+        if (
+            phase == GeneratorPhase.READY_FOR_LOAD
+            and observation.power.actual_source == PowerSource.for_generator(slot)
+        ):
+            return "под нагрузкой"
+        return _GENERATOR_PHASE_TEXT[phase]
+
     def _log_runtime_if_changed(self, observation: SupervisorObservation) -> None:
+        status = (
+            self.supervisor.status_text(observation)
+            if self.armed
+            else "DISARMED — только наблюдение"
+        )
+        grid = (
+            "ON"
+            if observation.grid_ready is True
+            else "OFF"
+            if observation.grid_ready is False
+            else "UNKNOWN"
+        )
+        avr = "ON" if observation.automatic_transfer_enabled else "OFF"
+        power = self._format_power(observation)
+        transfer = self._format_transfer(observation)
+        generator_a = self._format_generator_state(GeneratorSlot.A, observation)
+        generator_b = self._format_generator_state(GeneratorSlot.B, observation)
+        primary = self.profiles[self.supervisor.config.primary_generator].display_name
+
         signature = (
-            self.supervisor.phase,
-            observation.automatic_transfer_enabled,
-            observation.power.phase,
-            observation.power.actual_source,
-            observation.power.actual_path,
-            observation.generators[GeneratorSlot.A].phase,
-            observation.generators[GeneratorSlot.B].phase,
-            self.supervisor.config.primary_generator,
+            status,
+            grid,
+            avr,
+            power,
+            transfer,
+            generator_a,
+            generator_b,
+            primary,
         )
         if signature == self._last_runtime_signature:
             return
         self._last_runtime_signature = signature
-        primary = self.profiles[self.supervisor.config.primary_generator].display_name
-        self.log.info(
-            "Состояние: %s; AVR=%s; transfer=%s/%s/%s; A=%s; B=%s; primary=%s.",
-            (
-                self.supervisor.status_text(observation)
-                if self.armed
-                else "DISARMED — только наблюдение"
-            ),
-            "ON" if observation.automatic_transfer_enabled else "OFF",
-            observation.power.phase.value,
-            observation.power.actual_source.value,
-            observation.power.actual_path.value,
-            observation.generators[GeneratorSlot.A].phase.value,
-            observation.generators[GeneratorSlot.B].phase.value,
-            primary,
+
+        parts = [
+            f"Состояние: {status}",
+            f"Grid={grid}",
+            f"AVR={avr}",
+            f"power={power}",
+        ]
+        if transfer is not None:
+            parts.append(f"transfer={transfer}")
+
+        parts.extend(
+            [
+                f"{self.profiles[GeneratorSlot.A].display_name}: {generator_a}",
+                f"{self.profiles[GeneratorSlot.B].display_name}: {generator_b}",
+                f"primary={primary}",
+            ]
         )
+        self.log.info("%s.", "; ".join(parts))
 
     def _log_events(self, events: tuple[SupervisorEvent, ...]) -> None:
         log_methods = {
