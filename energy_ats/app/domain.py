@@ -65,11 +65,8 @@ class PowerPath(str, Enum):
 
 
 class SessionReason(str, Enum):
-    NONE = "none"
     MANUAL_GENERATOR_START = "manual_generator_start"
     GRID_OUTAGE = "grid_outage"
-    BATTERY_CHARGE = "battery_charge"
-    TEST_RUN = "test_run"
 
 
 class TransactionStatus(str, Enum):

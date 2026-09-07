@@ -35,7 +35,6 @@ class SupervisorPhase(str, Enum):
     TRANSFERRING_TO_GENERATOR = "transferring_to_generator"
     ON_GENERATOR = "on_generator"
     RETURNING_TO_GRID_OR_BATTERY = "returning_to_grid_or_battery"
-    MANUAL_GENERATOR_IDLE = "manual_generator_idle"
     STOPPING_GENERATOR = "stopping_generator"
     ISOLATING_FAILED_SOURCE = "isolating_failed_source"
     EXTERNAL_RUNNING = "external_running"
@@ -46,7 +45,6 @@ class SupervisorPhase(str, Enum):
 class SupervisorConfig:
     grid_failure_delay: float = 5.0
     grid_restore_stable_time: float = 60.0
-    manual_idle_warning_seconds: float = 600.0
     primary_generator: GeneratorSlot = GeneratorSlot.A
     generator_a_enabled: bool = True
     generator_b_enabled: bool = True
@@ -158,8 +156,6 @@ class EnergySupervisor:
         }
         self.grid_failed_since: float | None = None
         self.grid_ready_since: float | None = None
-        self.generator_idle_since: float | None = None
-        self.idle_warning_sent = False
         self.automatic_start_suppressed_until_grid = False
         self.recovery_reason: str | None = None
         self.initialized = False
@@ -274,11 +270,7 @@ class EnergySupervisor:
         return (
             self.session is not None
             and self.session.generator == slot
-            and self.phase
-            in {
-                SupervisorPhase.ON_GENERATOR,
-                SupervisorPhase.MANUAL_GENERATOR_IDLE,
-            }
+            and self.phase == SupervisorPhase.ON_GENERATOR
         )
 
     def step(self, now: float, observation: SupervisorObservation) -> SupervisorDecision:
@@ -511,19 +503,6 @@ class EnergySupervisor:
             return
 
         if (
-            self.phase == SupervisorPhase.MANUAL_GENERATOR_IDLE
-            and generator.running is False
-            and generator.remote_on is False
-        ):
-            self._event(
-                "info",
-                f"{generator.display_name} остановлен локально; "
-                "ручная сессия завершена.",
-            )
-            self._finish_session(observation)
-            return
-
-        if (
             other_generator.running is True
             or other_generator.remote_on is True
         ):
@@ -650,55 +629,14 @@ class EnergySupervisor:
                 now,
                 "Целевой Grid path или Battery path подтверждён.",
             )
-            if (
-                self.session.stop_requested
-                or self.session.reason != SessionReason.MANUAL_GENERATOR_START
-                or self.session.grid_was_unavailable
-            ):
-                self.desired_generators[slot] = False
-                self.phase = SupervisorPhase.STOPPING_GENERATOR
-                self.transaction = Transaction.begin(
-                    "stop_generator", slot.value, now, "cooldown"
-                )
-            else:
-                # Ручное намерение RUN сохраняется отдельно от источника дома.
-                self.phase = SupervisorPhase.MANUAL_GENERATOR_IDLE
-                self.generator_idle_since = now
-                self.idle_warning_sent = False
-                self._event(
-                    "warning",
-                    f"Дом возвращён на Grid, но {generator.display_name} оставлен "
-                    "работать по ручной команде.",
-                )
-            return
-
-        if self.phase == SupervisorPhase.MANUAL_GENERATOR_IDLE:
-            if (
-                not observation.power.transition_in_progress
-                and observation.power.actual_source
-                not in {PowerSource.GRID, PowerSource.BATTERY}
-            ):
-                self._require_recovery(
-                    "Положение силовой схемы изменилось вне транзакции "
-                    "ручной сессии."
-                )
-                return
-            self.desired_source = self._safe_source_for_grid_state(
-                observation.grid_ready
+            # Любой штатный возврат завершает сессию: явная остановка либо
+            # восстановление Grid после outage. Отдельного режима холостого
+            # хода нет; выдержкой охлаждения владеет GC.
+            self.desired_generators[slot] = False
+            self.phase = SupervisorPhase.STOPPING_GENERATOR
+            self.transaction = Transaction.begin(
+                "stop_generator", slot.value, now, "cooldown"
             )
-            if observation.grid_ready is False and generator.ready_for_load:
-                self.desired_source = PowerSource.for_generator(slot)
-                self.phase = SupervisorPhase.TRANSFERRING_TO_GENERATOR
-                self.transaction = Transaction.begin(
-                    "restore_manual_generator_start",
-                    self.desired_source.value,
-                    now,
-                    "transfer_to_generator",
-                )
-                self.generator_idle_since = None
-                self.idle_warning_sent = False
-                return
-            self._maybe_warn_about_idle_generator(now, generator)
             return
 
         if self.phase == SupervisorPhase.STOPPING_GENERATOR:
@@ -728,7 +666,7 @@ class EnergySupervisor:
                 return
             if generator.running is False and generator.phase == GeneratorPhase.IDLE:
                 self._complete_transaction(now, "Генератор остановлен.")
-                self._finish_session(observation)
+                self._finish_session()
 
     def _handle_manual_start(
         self, now: float, observation: SupervisorObservation
@@ -864,22 +802,6 @@ class EnergySupervisor:
             "автоматический запуск второго генератора отключён.",
         )
 
-    def _maybe_warn_about_idle_generator(
-        self, now: float, generator: GeneratorStatus
-    ) -> None:
-        if self.generator_idle_since is None:
-            self.generator_idle_since = now
-        if self.idle_warning_sent:
-            return
-        if now - self.generator_idle_since < self.config.manual_idle_warning_seconds:
-            return
-        self.idle_warning_sent = True
-        self._event(
-            "warning",
-            f"{generator.display_name} продолжительное время работает без нагрузки. "
-            "Выполните stop_generator, если генератор больше не нужен.",
-        )
-
     def _cancel_automatic_return(
         self,
         now: float,
@@ -928,7 +850,7 @@ class EnergySupervisor:
             "Grid снова пропала во время возврата; повторно вводим генератор.",
         )
 
-    def _finish_session(self, observation: SupervisorObservation) -> None:
+    def _finish_session(self) -> None:
         self.session = None
         self.desired_generators = {
             GeneratorSlot.A: False,
@@ -936,8 +858,6 @@ class EnergySupervisor:
         }
         self.desired_source = None
         self.phase = SupervisorPhase.NORMAL
-        self.generator_idle_since = None
-        self.idle_warning_sent = False
         self.grid_failed_since = None
 
     def _should_return_after_grid_restore(
@@ -954,19 +874,14 @@ class EnergySupervisor:
     def _safe_power_path_confirmed(
         self, observation: SupervisorObservation
     ) -> bool:
-        if self.session is not None and self.session.stop_requested:
-            expected_source = (
-                PowerSource.GRID
-                if observation.grid_ready is True
-                else PowerSource.BATTERY
-            )
-            return (
-                observation.power.actual_source == expected_source
-                and observation.power.actual_path == PowerPath.GRID
-                and not observation.power.transition_in_progress
-            )
         expected = self._safe_source_for_grid_state(observation.grid_ready)
-        expected_path = PowerPath.for_source(expected)
+        # Явная остановка возвращает реле Grid в ON даже без напряжения.
+        # При этом фактическим источником по-прежнему будет BATTERY.
+        expected_path = (
+            PowerPath.GRID
+            if self.session is not None and self.session.stop_requested
+            else PowerPath.for_source(expected)
+        )
         return (
             observation.power.actual_source == expected
             and observation.power.actual_path == expected_path
@@ -985,13 +900,6 @@ class EnergySupervisor:
             return (
                 observation.power.actual_source == expected
                 and observation.power.actual_path == PowerPath.GENERATOR
-            )
-        if self.phase == SupervisorPhase.MANUAL_GENERATOR_IDLE:
-            expected_path = PowerPath.for_source(observation.power.actual_source)
-            return (
-                observation.power.actual_source
-                in {PowerSource.GRID, PowerSource.BATTERY}
-                and observation.power.actual_path == expected_path
             )
         return False
 
@@ -1115,10 +1023,9 @@ class EnergySupervisor:
         events = tuple(self._events)
         self._events.clear()
         stable_managed = None
-        if self.session is not None and self.phase in {
-            SupervisorPhase.ON_GENERATOR,
-            SupervisorPhase.MANUAL_GENERATOR_IDLE,
-        }:
+        if self.session is not None and self.manages_stable_generator(
+            self.session.generator
+        ):
             stable_managed = self.session.generator
         return SupervisorDecision(
             desired_source=self.desired_source,
@@ -1198,7 +1105,6 @@ class EnergySupervisor:
             SupervisorPhase.RETURNING_TO_GRID_OR_BATTERY: (
                 "Возврат на Grid path / Battery path"
             ),
-            SupervisorPhase.MANUAL_GENERATOR_IDLE: f"{generator} работает без нагрузки",
             SupervisorPhase.STOPPING_GENERATOR: f"Охлаждение / остановка: {generator}",
             SupervisorPhase.ISOLATING_FAILED_SOURCE: "Изоляция отказавшего генератора",
         }
@@ -1219,8 +1125,6 @@ class EnergySupervisor:
             },
             "grid_failed_since": self.grid_failed_since,
             "grid_ready_since": self.grid_ready_since,
-            "generator_idle_since": self.generator_idle_since,
-            "idle_warning_sent": self.idle_warning_sent,
             "automatic_start_suppressed_until_grid": (
                 self.automatic_start_suppressed_until_grid
             ),
@@ -1239,14 +1143,7 @@ class EnergySupervisor:
         if schema_version != 1:
             raise ValueError("Неподдерживаемая версия журнала Energy Supervisor")
         supervisor = cls(config)
-        saved_phase = str(data["phase"])
-        # 0.3.0 называла этот же переход "returning_to_normal". Это известное
-        # старое имя, поэтому журнал можно безопасно прочитать без угадывания
-        # физического состояния; окончательная проверка всё равно выполняется
-        # по обратным связям после запуска.
-        if saved_phase == "returning_to_normal":
-            saved_phase = SupervisorPhase.RETURNING_TO_GRID_OR_BATTERY.value
-        supervisor.phase = SupervisorPhase(saved_phase)
+        supervisor.phase = SupervisorPhase(str(data["phase"]))
         session = data.get("session")
         supervisor.session = (
             GeneratorSession.from_dict(session) if isinstance(session, Mapping) else None
@@ -1276,13 +1173,6 @@ class EnergySupervisor:
         }
         supervisor.grid_failed_since = _optional_float(data.get("grid_failed_since"))
         supervisor.grid_ready_since = _optional_float(data.get("grid_ready_since"))
-        supervisor.generator_idle_since = _optional_float(
-            data.get("generator_idle_since")
-        )
-        supervisor.idle_warning_sent = _strict_bool(
-            data.get("idle_warning_sent", False),
-            "idle_warning_sent",
-        )
         supervisor.automatic_start_suppressed_until_grid = _strict_bool(
             data.get("automatic_start_suppressed_until_grid", False),
             "automatic_start_suppressed_until_grid",
