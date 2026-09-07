@@ -1,41 +1,56 @@
 # Energy ATS
 
-Home Assistant App для управления источниками энергии дома с подтверждаемой
-силовой коммутацией и отдельными автоматами Elemax и Вепря.
+Home Assistant App для управления источниками энергии частного дома с
+подтверждаемой силовой коммутацией и отдельными автоматами двух генераторов.
 
-Версия **0.3.12** реализует проверенные сценарии из
-`docs/REQUIREMENTS_RU.md`. Ручные команды поступают прямо в App, а настоящее
-состояние разрешения АВР хранится и отображается в Home Assistant. Приложение
-остаётся одним процессом:
+Текущая версия: **0.3.13** (`experimental`).
+
+Приложение остаётся одним процессом, но внутри разделено по ответственности:
 
 ```text
-energy_supervisor.py      энергетическая политика и сессии
-power_transfer.py        безопасный break-before-make
+energy_supervisor.py      энергетическая политика и управляемые сессии
+power_transfer.py         безопасный break-before-make
 generator_controller.py  запуск, заслонка, прогрев и cooldown
-ha_adapter.py             Home Assistant entities и service calls
-main.py                   lifecycle и журнал транзакций
+ha_adapter.py             контракт Home Assistant и service calls
+main.py                   lifecycle, синхронизация конфигурации и journal
 ```
 
-## Основные свойства
+## Основные принципы
 
 - физическая обратная связь является источником истины;
-- Generator Controller не знает о Grid, МАП и контакторах дома;
-- Power Transfer не знает, зачем выбран источник, и не запускает двигатели;
-- внешний/локальный запуск только распознаётся — App его не захватывает;
-- ручная остановка при отсутствующей Grid штатно возвращает дом на аккумуляторы
-  МАП;
-- после такой ручной остановки АВР подавлен до возврата Grid или новой
-  ручной команды запуска;
-- при возврате Grid после ручного outage-запуска дом возвращается на сеть,
-  затем генератор проходит cooldown и останавливается;
-- автоматический fallback после фактического отказа генератора отключён;
-- АВР по умолчанию выключен и управляется
-  `input_boolean.automatic_generator_transfer`;
-- ручные `start_generator`, `stop_generator` и `reset` не требуют HA-helper-ов;
+- A/B — стабильные аппаратные слоты, а не пользовательские имена генераторов;
+- имя и модель каждого генератора читаются из Home Assistant;
+- основной генератор выбирается в `select.primary_generator`;
+- смена primary влияет на следующую новую сессию и не меняет генератор уже
+  начатой сессии;
+- `generator_a_enabled` / `generator_b_enabled` остаются политикой Energy ATS
+  и позволяют временно запретить использование физического слота;
+- Power Transfer всегда выполняет break-before-make;
+- внешний/локальный запуск распознаётся, но App его не захватывает;
+- автоматический fallback после фактического отказа генератора пока отключён;
 - перед аппаратными действиями записывается persistent transaction journal;
-- потеря HA во время транзакции требует ручного recovery, устойчивое состояние
-  не меняется;
+- потеря HA во время незавершённой транзакции приводит к
+  `RECOVERY_REQUIRED`;
 - `armed: false` полностью запрещает аппаратные команды.
+
+## Контракт Generator Controller → Home Assistant → Energy ATS
+
+Energy ATS 0.3.13 требует следующие сущности идентичности генераторов:
+
+```text
+sensor.generator_a_name
+sensor.generator_b_name
+sensor.generator_a_model
+sensor.generator_b_model
+select.primary_generator
+```
+
+Значение `select.primary_generator` должно совпадать с состоянием одного из
+`sensor.generator_*_name`. Внутри Python эти значения преобразуются обратно в
+стабильный слот `A` или `B`.
+
+Имена и модели больше не хранятся в Configuration Energy ATS и не зашиты в
+`generator_controller.py`.
 
 ## Установка
 
@@ -45,22 +60,62 @@ main.py                   lifecycle и журнал транзакций
 https://github.com/akastrel/EnergyATS
 ```
 
-Для 0.3.12 требуется Generator Controller 0.3.1 с однозначными кнопками
-`choke_to_cold_start/choke_to_run`. Обновляться следует при
-работающей Grid, остановленных генераторах и `armed: false`.
+Добавьте корневой `ats.yaml` как Home Assistant package. Он создаёт helper:
 
-Добавьте корневой `ats.yaml` как Home Assistant package. В нём находится
-helper АВР и перечислен полный внешний контракт entities.
+```text
+input_boolean.automatic_generator_transfer
+```
 
-Подробности: [установка и миграция](docs/INSTALL_RU.md).
+и документирует полный внешний HA-контракт Energy ATS 0.3.13.
+
+Перед первым запуском или обновлением:
+
+1. Grid доступна;
+2. оба генератора остановлены;
+3. генераторная шина отключена;
+4. `armed: false`;
+5. все обязательные HA entities имеют известные состояния.
+
+## Ручные команды
+
+Через `hassio.app_stdin` поддерживаются ровно три команды:
+
+```text
+start_generator
+stop_generator
+reset
+```
+
+Положение автоматического АВР хранится в
+`input_boolean.automatic_generator_transfer`.
+
+## Диагностика
+
+App публикует `sensor.energy_ats_status`. Его state содержит
+человеко-читаемый статус, а атрибуты включают:
+
+```text
+source
+phase
+generator
+generator_model
+generator_slot
+primary_generator
+primary_generator_slot
+remaining_seconds
+session_reason
+armed
+```
+
+Этот sensor диагностический и не участвует в управляющих решениях.
 
 ## Документация
 
-- [архитектура и поведение](docs/ARCHITECTURE_RU.md)
-- [утверждённые сценарии и требования](docs/REQUIREMENTS_RU.md)
+- [Архитектура](docs/ARCHITECTURE_RU.md)
+- [Требования и сценарии](docs/REQUIREMENTS_RU.md)
 - [Home Assistant entities](docs/ENTITIES_RU.md)
-- [установка и первый запуск](docs/INSTALL_RU.md)
-- [проверки релиза](docs/TEST_RESULTS.md)
+- [Установка и обновление](docs/INSTALL_RU.md)
+- [Changelog](energy_ats/CHANGELOG.md)
 
 ## Разработка
 
@@ -71,7 +126,5 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-Чистые автоматы не импортируют Home Assistant и тестируются обычными
-детерминированными снимками состояния.
-
-Текущий статус: **0.3.12**, experimental.
+Чистые автоматы не импортируют Home Assistant и тестируются
+детерминированными снимками физических состояний.

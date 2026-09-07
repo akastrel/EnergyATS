@@ -1,42 +1,65 @@
-# Energy ATS 0.3.12
+# Energy ATS 0.3.13
 
-Energy ATS теперь содержит Energy Supervisor, безопасный Power Transfer и два
-независимых Generator Controller в одном Python-процессе.
+Energy ATS — Home Assistant App с Energy Supervisor, безопасным Power Transfer
+и двумя независимыми Generator Controller в одном Python-процессе.
 
 ## Перед обновлением
 
 1. Обеспечьте питание от Grid.
-2. Остановите оба генератора и снимите оба REMOTE.
+2. Остановите оба генератора и снимите REMOTE.
 3. Установите `armed: false`.
-4. Прошейте `generator-controller.yaml` 0.3.1: App ожидает новые entities
-   `button.generator_*_choke_to_cold_start` и `choke_to_run`.
-5. Затем обновите и запустите этот App.
+4. Обновите Generator Controller и убедитесь, что в HA доступны metadata:
+   `sensor.generator_a_name`, `sensor.generator_b_name`,
+   `sensor.generator_a_model`, `sensor.generator_b_model` и
+   `select.primary_generator`.
+5. Обновите корневой `ats.yaml`.
+6. Затем обновите и запустите Energy ATS 0.3.13.
+
+## Конфигурация генераторов
+
+A/B остаются стабильными аппаратными слотами. Человеко-читаемые имя и модель
+больше не хранятся в Energy ATS и читаются из Home Assistant.
+
+`select.primary_generator` также находится в HA и должен совпадать с именем A
+или B. Его изменение применяется к следующей новой сессии и не переключает уже
+работающий генератор.
+
+В Configuration Energy ATS остаются:
+
+- `generator_a_enabled`;
+- `generator_b_enabled`.
+
+Это policy-флаги Supervisor: физически установленный генератор можно временно
+запретить для управляемых сессий без изменения конфигурации Generator
+Controller.
 
 ## ARMED и автоматический АВР
 
 `armed` — нижний предохранитель всего App:
 
-- `false`: аппаратные switch/button calls запрещены;
-- `true`: контроллерам разрешено исполнять подтверждаемые операции.
+- `false` — аппаратные switch/button calls запрещены;
+- `true` — контроллерам разрешено выполнять подтверждаемые операции.
 
-Положение АВР задаёт `input_boolean.automatic_generator_transfer` из корневого
-`ats.yaml`. Это настоящее отображаемое состояние Home Assistant, а не кнопка
-для передачи команды. При первом создании оно равно `OFF`, затем HA
-восстанавливает последнее состояние.
+Разрешение автоматического АВР хранится в:
 
-Автоматический fallback после фактического отказа генератора отключён.
+```text
+input_boolean.automatic_generator_transfer
+```
+
+из корневого `ats.yaml`.
+
+Автоматический fallback после фактического отказа выбранного генератора в
+0.3.13 по-прежнему отключён.
 
 ## Ручные команды
 
-- `start_generator` — создать управляемую сессию, запустить
-  выбранный генератор, прогреть и безопасно ввести его.
-- `stop_generator` — сначала вернуть дом на Grid либо аккумуляторы МАП,
-  затем выполнить cooldown и снять REMOTE.
-- `reset` — после ручного осмотра безопасно вернуть Grid path и выйти из
-  `RECOVERY_REQUIRED`. App сначала снимает генераторную шину и останавливает
-  только разгруженный генератор прерванной управляемой сессии.
+Поддерживаются ровно:
 
-Пример вызова:
+- `start_generator`;
+- `stop_generator`;
+- `reset`.
+
+Пример:
 
 ```yaml
 action: hassio.app_stdin
@@ -46,18 +69,48 @@ data:
     command: start_generator
 ```
 
-Кнопка dashboard может вызывать это действие напрямую и не требует entity.
-Текущее состояние контроллеров записывается в журнал App.
+Фактический App ID рекомендуется выбирать через визуальный редактор Home
+Assistant.
 
-Фактический `app` ID лучше выбрать в визуальном редакторе действия Home
-Assistant, выбрав **Energy ATS** из списка.
+## Диагностический статус
 
-Внешне/локально запущенный двигатель App только отображает и не останавливает.
+App публикует:
 
-## Потеря связи
+```text
+sensor.energy_ats_status
+```
 
-Устойчивая работа сохраняется как есть. Если WebSocket или процесс потерян во
-время незавершённой физической транзакции, автоматическое продолжение
-блокируется. Точный список pending-команд хранится в persistent журнале App.
+В 0.3.13 используется `schema_version: 2`. Основные атрибуты:
 
-Подробная спецификация находится в `docs/ARCHITECTURE_RU.md` repository.
+```text
+source
+phase
+generator
+generator_model
+generator_slot
+primary_generator
+primary_generator_slot
+remaining_seconds
+session_reason
+armed
+```
+
+Sensor предназначен только для UI/диагностики и не участвует в управляющих
+решениях.
+
+## Потеря связи и recovery
+
+Если WebSocket или процесс потерян во время незавершённой физической
+транзакции, автоматическое продолжение блокируется и App переходит в
+`RECOVERY_REQUIRED`. Точный список pending-команд хранится в persistent journal
+`/data/energy-supervisor-state.json`.
+
+После осмотра команда `reset` выполняет ограниченное безопасное восстановление.
+Внешний генератор App не захватывает и автоматически не останавливает.
+
+Подробности:
+
+- `docs/ARCHITECTURE_RU.md`;
+- `docs/ENTITIES_RU.md`;
+- `docs/INSTALL_RU.md`;
+- `docs/REQUIREMENTS_RU.md`.
