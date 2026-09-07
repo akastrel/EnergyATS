@@ -88,11 +88,14 @@ def test_status_payload_uses_confirmed_source_and_public_contract(tmp_path):
         "source": "grid",
         "phase": "normal",
         "generator": None,
+        "generator_model": None,
         "generator_slot": None,
+        "primary_generator": "Elemax",
+        "primary_generator_slot": "A",
         "remaining_seconds": None,
         "session_reason": None,
         "armed": True,
-        "schema_version": 1,
+        "schema_version": 2,
     }
 
 
