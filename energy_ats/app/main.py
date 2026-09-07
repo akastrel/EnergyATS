@@ -44,7 +44,6 @@ DEFAULT_OPTIONS: dict[str, Any] = {
     # Главный deployment-предохранитель. При false аппаратные service calls
     # запрещены, но физические состояния продолжают читаться и логироваться.
     "armed": False,
-    "startup_delay": 30,
     "tick_seconds": 1.0,
     "log_level": "info",
 
@@ -69,7 +68,6 @@ class EnergySupervisorApp:
     def __init__(self, options: dict[str, Any], token: str) -> None:
         self.options = {**DEFAULT_OPTIONS, **options}
         self.armed = _boolean_option(self.options, "armed")
-        self.startup_delay = float(self.options["startup_delay"])
         self.tick_seconds = max(0.2, float(self.options["tick_seconds"]))
 
         self.log = logging.getLogger("energy_supervisor")
@@ -194,14 +192,6 @@ class EnergySupervisorApp:
                 profile.choke_strategy.value,
             )
 
-        if self.startup_delay > 0:
-            self.log.info(
-                "Стартовая выдержка %.0f с для восстановления HA и ESPHome.",
-                self.startup_delay,
-            )
-            if await self._stop_requested_within(self.startup_delay):
-                return
-
         reconnect_delay = 5.0
         while not self.stop_event.is_set():
             try:
@@ -209,6 +199,7 @@ class EnergySupervisorApp:
                 # Динамический sensor живёт в HA state machine, а не Entity
                 # Registry. После reconnect/рестарта HA публикуем его заново.
                 self._last_status_payload = None
+                # Готовность определяют данные HA, а не время после запуска.
                 await self._wait_until_required_entities_ready()
                 if self.stop_event.is_set():
                     break

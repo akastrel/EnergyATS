@@ -51,7 +51,6 @@ def _app_with_fake(tmp_path):
         {
             **DEFAULT_OPTIONS,
             "armed": True,
-            "startup_delay": 0,
             "state_file": str(tmp_path / "state.json"),
         },
         token="test",

@@ -624,3 +624,65 @@ async def test_manual_stop_without_grid_restores_grid_relay_before_engine_stop(
     await app._tick(113.0)
     await app._tick(114.0)
     assert app.supervisor.session is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initial_grid", ["on", None, "unknown", "unavailable"])
+async def test_app_starts_when_ha_data_is_ready_without_fixed_delay(
+    tmp_path, monkeypatch, initial_grid
+):
+    import asyncio
+
+    app = EnergySupervisorApp(
+        {**DEFAULT_OPTIONS, "armed": True,
+         "state_file": str(tmp_path / "state.json")},
+        token="test",
+    )
+    fake = PhysicalFakeClient()
+    fake.states = populated_states()
+    if initial_grid is None:
+        fake.states.pop(ENTITIES["grid_ready"])
+    else:
+        fake.states[ENTITIES["grid_ready"]] = initial_grid
+    fake.connected = asyncio.Event()
+    attach_fake_client(app, fake)
+    readiness_waits = []
+    ticks = []
+
+    async def connect():
+        fake.connected.set()
+
+    async def close():
+        fake.connected.clear()
+
+    async def wait(seconds):
+        if app.stop_event.is_set():
+            return True
+        # Любая пауза до connect — регрессия удалённой startup_delay.
+        assert fake.connected.is_set()
+        assert not app.commands_ready
+        assert seconds == 1.0
+        assert not fake.calls
+        readiness_waits.append(seconds)
+        fake.states[ENTITIES["grid_ready"]] = "on"
+        return False
+
+    original_tick = app._tick
+
+    async def tick(now):
+        assert app.commands_ready
+        assert fake.states[ENTITIES["grid_ready"]] == "on"
+        await original_tick(now)
+        ticks.append(app.supervisor.phase)
+        app.request_stop()
+
+    monkeypatch.setattr(fake, "connect", connect, raising=False)
+    monkeypatch.setattr(fake, "close", close, raising=False)
+    monkeypatch.setattr(app, "_stop_requested_within", wait)
+    monkeypatch.setattr(app, "_tick", tick)
+
+    await app.run()
+
+    assert readiness_waits == ([] if initial_grid == "on" else [1.0])
+    assert ticks == [SupervisorPhase.NORMAL]
+    assert not [call for call in fake.calls if call[0] in {"switch", "button"}]
