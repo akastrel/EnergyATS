@@ -15,6 +15,7 @@ import os
 import signal
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -37,7 +38,7 @@ from power_transfer import PowerTransferController, TransferAction
 from state_store import StateStore
 
 
-APP_VERSION = "0.3.12"
+APP_VERSION = "0.3.13"
 
 
 DEFAULT_OPTIONS: dict[str, Any] = {
@@ -50,7 +51,6 @@ DEFAULT_OPTIONS: dict[str, Any] = {
     # Энергетическая политика.
     "grid_failure_delay": 5,
     "grid_restore_stable_time": 60,
-    "primary_generator": "Elemax",
     "generator_a_enabled": True,
     "generator_b_enabled": True,
 
@@ -78,6 +78,9 @@ class EnergySupervisorApp:
             logger=self.log,
         )
 
+        # До первого снимка HA используются только нейтральные идентификаторы
+        # слотов. Реальные name/model подставляются из Generator Controller в HA
+        # до разрешения любых команд.
         self.profiles = default_generator_profiles()
         self.generator_controllers = {
             slot: GeneratorController(profile)
@@ -97,6 +100,7 @@ class EnergySupervisorApp:
         self.stop_event = asyncio.Event()
         self.commands_ready = False
         self._last_runtime_signature: tuple[Any, ...] | None = None
+        self._last_generator_config_signature: tuple[Any, ...] | None = None
 
         # Последний успешно опубликованный HA status. Нужен только для
         # подавления одинаковых REST-записей. После каждого reconnect cache
@@ -183,14 +187,6 @@ class EnergySupervisorApp:
             if self.armed
             else "DISARMED — только наблюдение",
         )
-        for profile in self.profiles.values():
-            self.log.info(
-                "Generator %s: %s; модель: %s; choke: %s.",
-                profile.slot.value,
-                profile.display_name,
-                profile.model,
-                profile.choke_strategy.value,
-            )
 
         reconnect_delay = 5.0
         while not self.stop_event.is_set():
@@ -200,6 +196,7 @@ class EnergySupervisorApp:
                 await self._wait_until_required_entities_ready()
                 if self.stop_event.is_set():
                     break
+                self._sync_generator_configuration(self.adapter.snapshot())
                 self.commands_ready = True
                 await self._connected_loop()
             except asyncio.CancelledError:
@@ -230,6 +227,7 @@ class EnergySupervisorApp:
 
     async def _tick(self, now: float) -> None:
         hardware = self.adapter.snapshot()
+        self._sync_generator_configuration(hardware)
         self._refresh_component_views(now, hardware)
 
         if self.supervisor.consume_recovery_reset_request():
@@ -288,6 +286,78 @@ class EnergySupervisorApp:
         await self.adapter.publish_events(decision.events)
         self._log_runtime_if_changed(updated_observation)
         await self._publish_status(now, updated_observation)
+
+    def _sync_generator_configuration(self, hardware: HardwareSnapshot) -> None:
+        """Синхронизировать идентичность генераторов и primary из HA.
+
+        A/B остаются стабильными аппаратными слотами. Человеко-читаемые имя,
+        модель и политика выбора primary принадлежат Generator Controller и
+        поступают через Home Assistant. Изменение primary влияет только на
+        выбор следующей сессии; уже начатая сессия хранит свой слот отдельно.
+        """
+        metadata_a = hardware.generator_metadata[GeneratorSlot.A]
+        metadata_b = hardware.generator_metadata[GeneratorSlot.B]
+        if metadata_a is None or metadata_b is None:
+            raise ValueError(
+                "Не удалось прочитать имя или модель генераторов из Home Assistant."
+            )
+        if not metadata_a.name or not metadata_b.name:
+            raise ValueError("Имена генераторов в Home Assistant не могут быть пустыми.")
+        if metadata_a.name == metadata_b.name:
+            raise ValueError(
+                "generator_a_name и generator_b_name должны быть различными."
+            )
+        if hardware.primary_generator is None:
+            raise ValueError(
+                "select.primary_generator должен совпадать с sensor.generator_a_name "
+                "или sensor.generator_b_name."
+            )
+
+        for slot, metadata in (
+            (GeneratorSlot.A, metadata_a),
+            (GeneratorSlot.B, metadata_b),
+        ):
+            profile = replace(
+                self.generator_controllers[slot].profile,
+                display_name=metadata.name,
+                model=metadata.model,
+            )
+            self.generator_controllers[slot].profile = profile
+            self.profiles[slot] = profile
+
+        config = self._supervisor_config(hardware.primary_generator)
+        if not config.generator_enabled(hardware.primary_generator):
+            primary_name = self.profiles[hardware.primary_generator].display_name
+            raise ValueError(
+                f"Некорректная конфигурация: основной генератор {primary_name} "
+                "отключён. Включите его или выберите другой основной генератор."
+            )
+        self.supervisor.config = config
+
+        signature = (
+            metadata_a.name,
+            metadata_a.model,
+            metadata_b.name,
+            metadata_b.model,
+            hardware.primary_generator,
+        )
+        if signature != self._last_generator_config_signature:
+            self._last_generator_config_signature = signature
+            for slot in (GeneratorSlot.A, GeneratorSlot.B):
+                profile = self.profiles[slot]
+                marker = (
+                    "PRIMARY"
+                    if slot == hardware.primary_generator
+                    else "SECONDARY"
+                )
+                self.log.info(
+                    "Generator %s: %s; модель: %s; %s; choke: %s.",
+                    slot.value,
+                    profile.display_name,
+                    profile.model,
+                    marker,
+                    profile.choke_strategy.value,
+                )
 
     def _refresh_component_views(
         self, now: float, hardware: HardwareSnapshot
@@ -595,7 +665,10 @@ class EnergySupervisorApp:
             )
 
     def _restore_supervisor(self) -> EnergySupervisor:
-        config = self._supervisor_config()
+        # Реальный primary ещё недоступен до подключения к HA. Для чтения
+        # журнала достаточно нейтрального bootstrap-конфига; перед первой
+        # командой он обязательно заменяется конфигурацией из HA.
+        config = self._supervisor_config(GeneratorSlot.A)
         try:
             saved = self.state_store.load()
             if saved is None:
@@ -622,46 +695,24 @@ class EnergySupervisorApp:
             )
             return supervisor
 
-    def _supervisor_config(self) -> SupervisorConfig:
-        primary_generator = self._configured_primary_generator()
-        generator_a_enabled = _boolean_option(
-            self.options,
-            "generator_a_enabled",
-        )
-        generator_b_enabled = _boolean_option(
-            self.options,
-            "generator_b_enabled",
-        )
-        primary_enabled = (
-            generator_a_enabled
-            if primary_generator == GeneratorSlot.A
-            else generator_b_enabled
-        )
-        if not primary_enabled:
-            primary_name = self.profiles[primary_generator].display_name
-            raise ValueError(
-                f"Некорректная конфигурация: основной генератор {primary_name} "
-                "отключён. Включите его или выберите другой основной генератор."
-            )
-
+    def _supervisor_config(
+        self,
+        primary_generator: GeneratorSlot,
+    ) -> SupervisorConfig:
         return SupervisorConfig(
             grid_failure_delay=float(self.options["grid_failure_delay"]),
             grid_restore_stable_time=float(
                 self.options["grid_restore_stable_time"]
             ),
             primary_generator=primary_generator,
-            generator_a_enabled=generator_a_enabled,
-            generator_b_enabled=generator_b_enabled,
-        )
-
-    def _configured_primary_generator(self) -> GeneratorSlot:
-        configured_name = str(self.options["primary_generator"])
-        for slot, profile in self.profiles.items():
-            if profile.display_name == configured_name:
-                return slot
-        raise ValueError(
-            "Параметр primary_generator должен содержать имя генератора: "
-            + ", ".join(profile.display_name for profile in self.profiles.values())
+            generator_a_enabled=_boolean_option(
+                self.options,
+                "generator_a_enabled",
+            ),
+            generator_b_enabled=_boolean_option(
+                self.options,
+                "generator_b_enabled",
+            ),
         )
 
     def _save_state(self, *, force: bool = False) -> None:
@@ -744,6 +795,9 @@ class EnergySupervisorApp:
         generator_name = (
             self.profiles[slot].display_name if slot is not None else None
         )
+        generator_model = self.profiles[slot].model if slot is not None else None
+        primary_slot = self.supervisor.config.primary_generator
+        primary_name = self.profiles[primary_slot].display_name
         state = (
             self.supervisor.status_text(observation)
             if self.armed
@@ -758,13 +812,16 @@ class EnergySupervisorApp:
                 "source": observation.power.actual_source.value,
                 "phase": self.supervisor.phase.value,
                 "generator": generator_name,
+                "generator_model": generator_model,
                 "generator_slot": slot.value if slot is not None else None,
+                "primary_generator": primary_name,
+                "primary_generator_slot": primary_slot.value,
                 "remaining_seconds": self._remaining_seconds(now, observation),
                 "session_reason": (
                     session.reason.value if session is not None else None
                 ),
                 "armed": self.armed,
-                "schema_version": 1,
+                "schema_version": 2,
             },
         }
 
@@ -817,12 +874,14 @@ class EnergySupervisorApp:
             observation.power.actual_path,
             observation.generators[GeneratorSlot.A].phase,
             observation.generators[GeneratorSlot.B].phase,
+            self.supervisor.config.primary_generator,
         )
         if signature == self._last_runtime_signature:
             return
         self._last_runtime_signature = signature
+        primary = self.profiles[self.supervisor.config.primary_generator].display_name
         self.log.info(
-            "Состояние: %s; AVR=%s; transfer=%s/%s/%s; A=%s; B=%s.",
+            "Состояние: %s; AVR=%s; transfer=%s/%s/%s; A=%s; B=%s; primary=%s.",
             (
                 self.supervisor.status_text(observation)
                 if self.armed
@@ -834,6 +893,7 @@ class EnergySupervisorApp:
             observation.power.actual_path.value,
             observation.generators[GeneratorSlot.A].phase.value,
             observation.generators[GeneratorSlot.B].phase.value,
+            primary,
         )
 
     def _log_events(self, events: tuple[SupervisorEvent, ...]) -> None:
