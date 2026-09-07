@@ -90,25 +90,26 @@ class GeneratorProfile:
 
 
 def default_generator_profiles() -> dict[GeneratorSlot, GeneratorProfile]:
-    """Текущие пользовательские профили Elemax и Вепря.
+    """Bootstrap-профили физических слотов A/B без идентичности генераторов.
 
-    Это единственное место в Python, где универсальная логика связывается с
-    конкретными двигателями. Точные модели можно вписать сюда, когда они будут
-    уточнены; на алгоритм ATS эти строки не влияют.
+    Имена и модели не являются конфигурацией Energy ATS. До первого полного
+    снимка Home Assistant здесь используются нейтральные значения, после чего
+    ``main.py`` заменяет их данными ``sensor.generator_*_name/model``. Никакая
+    аппаратная команда до этой синхронизации не разрешается.
     """
 
     return {
         GeneratorSlot.A: GeneratorProfile(
             slot=GeneratorSlot.A,
-            display_name="Elemax",
-            model="SH7600EX 6.5 / 5.6 кВт",
+            display_name="Generator A",
+            model="",
             choke_strategy=ChokeStrategy.ALWAYS,
         ),
         GeneratorSlot.B: GeneratorProfile(
             slot=GeneratorSlot.B,
-            display_name="Вепрь",
-            model="АПБ 6-230 ВХ-БСГ 6.0 / 5.5 кВт",
-            # Для обоих реальных двигателей положение холодного запуска
+            display_name="Generator B",
+            model="",
+            # Для обоих физических слотов положение холодного запуска
             # используется всегда. Внешняя температура влияет только на
             # длительность последующего прогрева.
             choke_strategy=ChokeStrategy.ALWAYS,

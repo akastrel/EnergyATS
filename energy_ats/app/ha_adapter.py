@@ -37,6 +37,11 @@ ENTITIES = {
     "generator_a_choke_run": "button.generator_a_choke_to_run",
     "generator_b_choke_cold_start": "button.generator_b_choke_to_cold_start",
     "generator_b_choke_run": "button.generator_b_choke_to_run",
+    "generator_a_name": "sensor.generator_a_name",
+    "generator_b_name": "sensor.generator_b_name",
+    "generator_a_model": "sensor.generator_a_model",
+    "generator_b_model": "sensor.generator_b_model",
+    "primary_generator": "select.primary_generator",
     "emergency_stop": "switch.generators_emergency_stop",
     "ambient_temperature_external": "sensor.garage_temperature",
     "grid_power": "switch.grid_power",
@@ -53,11 +58,21 @@ ENERGY_ATS_STATUS_ENTITY = "sensor.energy_ats_status"
 
 
 @dataclass(frozen=True)
+class GeneratorMetadata:
+    """Человеко-читаемая идентичность физического слота генератора из HA."""
+
+    name: str
+    model: str
+
+
+@dataclass(frozen=True)
 class HardwareSnapshot:
     grid_ready: bool | None
     automatic_transfer_enabled: bool
     emergency_stop: bool | None
     generators: dict[GeneratorSlot, GeneratorObservation]
+    generator_metadata: dict[GeneratorSlot, GeneratorMetadata | None]
+    primary_generator: GeneratorSlot | None
     power_transfer: PowerTransferObservation
 
 
@@ -86,6 +101,36 @@ class HomeAssistantAdapter:
         emergency_stop = self.bool_state(ENTITIES["emergency_stop"])
         ambient_temperature = self.float_state(
             ENTITIES["ambient_temperature_external"]
+        )
+
+        generator_names = {
+            GeneratorSlot.A: self.text_state(ENTITIES["generator_a_name"]),
+            GeneratorSlot.B: self.text_state(ENTITIES["generator_b_name"]),
+        }
+        generator_models = {
+            GeneratorSlot.A: self.text_state(ENTITIES["generator_a_model"]),
+            GeneratorSlot.B: self.text_state(ENTITIES["generator_b_model"]),
+        }
+        generator_metadata = {
+            slot: (
+                GeneratorMetadata(name=generator_names[slot], model=generator_models[slot])
+                if generator_names[slot] is not None
+                and generator_models[slot] is not None
+                else None
+            )
+            for slot in (GeneratorSlot.A, GeneratorSlot.B)
+        }
+
+        primary_name = self.text_state(ENTITIES["primary_generator"])
+        matching_primary_slots = [
+            slot
+            for slot, name in generator_names.items()
+            if primary_name is not None and name == primary_name
+        ]
+        primary_generator = (
+            matching_primary_slots[0]
+            if len(matching_primary_slots) == 1
+            else None
         )
 
         active_generator = None
@@ -126,6 +171,8 @@ class HomeAssistantAdapter:
             ),
             emergency_stop=emergency_stop,
             generators=generators,
+            generator_metadata=generator_metadata,
+            primary_generator=primary_generator,
             power_transfer=PowerTransferObservation(
                 grid_ready=grid_ready,
                 house_on_grid=house_grid,
@@ -149,6 +196,11 @@ class HomeAssistantAdapter:
             ENTITIES["generator_b_running"],
             ENTITIES["generator_a_remote"],
             ENTITIES["generator_b_remote"],
+            ENTITIES["generator_a_name"],
+            ENTITIES["generator_b_name"],
+            ENTITIES["generator_a_model"],
+            ENTITIES["generator_b_model"],
+            ENTITIES["primary_generator"],
             ENTITIES["emergency_stop"],
             ENTITIES["grid_power"],
             ENTITIES["source_generator"],
@@ -280,6 +332,12 @@ class HomeAssistantAdapter:
             return float(state) if state is not None else None
         except (TypeError, ValueError):
             return None
+
+    def text_state(self, entity_id: str) -> str | None:
+        state = self.client.get_state(entity_id)
+        if state in (None, "unknown", "unavailable"):
+            return None
+        return str(state)
 
     @staticmethod
     def _generator_load(
