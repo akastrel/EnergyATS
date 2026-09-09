@@ -18,62 +18,37 @@ class GeneratorSlot(str, Enum):
 
 
 class PowerSource(str, Enum):
-    """Наблюдаемый источник/режим питания основной части дома.
+    """Наблюдаемый источник/режим питания дома.
 
-    ``UPS_ONLY`` — не отдельный физический ввод и не Battery contactor. Это
-    наблюдаемое состояние: основная часть дома не питается от Grid/Generator,
-    а UPS-линия может продолжать работу от МАП/АКБ.
+    Конкретный Generator A/B здесь намеренно не кодируется: физический владелец
+    общей генераторной шины ведётся отдельно в ``GeneratorBusTracker``.
+    ``UPS_ONLY`` — не отдельный ввод и не Battery contactor, а наблюдаемое
+    состояние, когда обычная часть дома не питается от Grid/Generator.
     """
 
     GRID = "grid"
     GENERATOR = "generator"
-    GENERATOR_A = "generator_a"
-    GENERATOR_B = "generator_b"
     UPS_ONLY = "ups_only"
     NO_POWER = "no_power"
     UNKNOWN = "unknown"
 
-    @classmethod
-    def for_generator(cls, slot: GeneratorSlot) -> "PowerSource":
-        return cls.GENERATOR_A if slot == GeneratorSlot.A else cls.GENERATOR_B
-
-    @property
-    def generator(self) -> GeneratorSlot | None:
-        if self == PowerSource.GENERATOR_A:
-            return GeneratorSlot.A
-        if self == PowerSource.GENERATOR_B:
-            return GeneratorSlot.B
-        return None
-
-    @property
-    def is_generator(self) -> bool:
-        return self in {
-            PowerSource.GENERATOR,
-            PowerSource.GENERATOR_A,
-            PowerSource.GENERATOR_B,
-        }
-
 
 class PowerPath(str, Enum):
-    """Подтверждённое положение основных контакторов дома.
+    """Подтверждённое положение основных контакторов дома."""
 
-    ``ISOLATED`` означает: генераторная ветвь не выбрана, а Grid запрещена
-    ``switch.grid_power``. Никакого отдельного Battery path физически нет.
-    """
-
-    GRID = "grid_path"
+    GRID = "grid"
     ISOLATED = "isolated"
-    GENERATOR = "generator_path"
+    GENERATOR = "generator"
     UNKNOWN = "unknown"
 
     @classmethod
     def for_source(cls, source: PowerSource) -> "PowerPath":
         if source == PowerSource.GRID:
             return cls.GRID
+        if source == PowerSource.GENERATOR:
+            return cls.GENERATOR
         if source in {PowerSource.UPS_ONLY, PowerSource.NO_POWER}:
             return cls.ISOLATED
-        if source.is_generator:
-            return cls.GENERATOR
         return cls.UNKNOWN
 
 
@@ -92,11 +67,7 @@ class TransactionStatus(str, Enum):
 
 @dataclass
 class Transaction:
-    """Сохраняемая запись о незавершённой физической операции.
-
-    Это не database transaction с rollback. ``last_confirmed_step`` нужен,
-    чтобы после restart не повторять физические команды вслепую.
-    """
+    """Сохраняемая запись о незавершённой физической операции."""
 
     transaction_id: str
     kind: str
@@ -127,18 +98,9 @@ class Transaction:
         self.step = step
         self.updated_at = now
 
-    def note(self, now: float, message: str) -> None:
-        self.updated_at = now
-        self.message = message
-
     def complete(self, now: float, message: str = "") -> None:
         self.status = TransactionStatus.COMPLETED
         self.last_confirmed_step = self.step
-        self.updated_at = now
-        self.message = message
-
-    def fail(self, now: float, message: str) -> None:
-        self.status = TransactionStatus.FAILED
         self.updated_at = now
         self.message = message
 
@@ -176,6 +138,6 @@ class Transaction:
 class SupervisorEvent:
     """Сообщение человеку; силовой команды здесь быть не может."""
 
-    level: str  # info / warning / critical
+    level: str
     message: str
     entity_id: str | None = None
