@@ -14,10 +14,10 @@ configuration:
     description: "How long Grid Input Ready must stay OFF before a generator start is initiated."
   grid_restore_stable_time:
     name: "Grid restore stability time, s"
-    description: "How long Grid Input Ready must stay ON before returning the house to Grid."
+    description: "How long Grid Input Ready must stay ON before returning the house to Grid and completing outage-related runs."
   transfer_confirmation_timeout:
     name: "Transfer confirmation timeout, s"
-    description: "Maximum wait for physical house_powered_by_* feedback after a power transfer step."
+    description: "Maximum wait for house_powered_by_* control-circuit feedback after a main contactor transfer step."
 
   generator_a_enabled:
     name: "Enable generator A"

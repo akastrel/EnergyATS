@@ -1,43 +1,67 @@
 # Energy ATS
 
-Home Assistant App для управления источниками энергии частного дома с
-подтверждаемой силовой коммутацией и отдельными автоматами двух генераторов.
+Home Assistant App для управления резервным электроснабжением дома с двумя генераторами и подтверждаемой коммутацией основных контакторов.
 
-Текущая версия: **0.3.13** (`experimental`).
+Текущая версия: **0.4.0** (`experimental`).
 
-Приложение остаётся одним процессом, но внутри разделено по ответственности:
+## Источники истины
+
+Документация разделена по смыслу:
+
+1. [`docs/PHYSICAL_POWER_TOPOLOGY_RU.md`](docs/PHYSICAL_POWER_TOPOLOGY_RU.md) — как физически устроена электроустановка;
+2. [`docs/REQUIREMENTS_RU.md`](docs/REQUIREMENTS_RU.md) — как EnergyATS обязан вести себя на этой физической схеме;
+3. код и тесты — реализация этих требований.
+
+Если код противоречит физической схеме или требованиям, исправляется код.
+
+## Архитектура 0.4
+
+Приложение остаётся одним процессом, но разделено по ответственности:
 
 ```text
-energy_supervisor.py      энергетическая политика и управляемые сессии
-power_transfer.py         безопасный break-before-make
-generator_controller.py  запуск, заслонка, прогрев и cooldown
-ha_adapter.py             контракт Home Assistant и service calls
-main.py                   lifecycle, синхронизация конфигурации и journal
+energy_supervisor.py      policy и управляемые сессии
+power_transfer.py         основные контакторы Grid / Generator
+generator_controller.py  жизненный цикл одного двигателя
+generator_bus.py          наблюдаемый owner общей генераторной шины
+ha_adapter.py             Home Assistant entities и service calls
+main.py                   composition, tick, journal, status/log
 ```
 
-## Основные принципы
+Ключевые положения 0.4:
 
-- физическая обратная связь является источником истины;
-- A/B — стабильные аппаратные слоты, а не пользовательские имена генераторов;
-- имя и модель каждого генератора читаются из Home Assistant;
-- основной генератор выбирается в `select.primary_generator`;
-- смена primary влияет на следующую новую сессию и не меняет генератор уже
-  начатой сессии;
-- `generator_a_enabled` / `generator_b_enabled` остаются политикой Energy ATS
-  и позволяют временно запретить использование физического слота;
-- Power Transfer всегда выполняет break-before-make;
-- внешний/локальный запуск распознаётся, но App его не захватывает;
-- автоматический fallback после фактического отказа генератора пока отключён;
-- перед аппаратными действиями записывается persistent transaction journal;
-- потеря HA во время незавершённой транзакции приводит к
-  `RECOVERY_REQUIRED`;
-- `armed: false` полностью запрещает аппаратные команды.
+- отдельного физического `Battery path` нет; при отсутствии основного источника используется состояние `UPS_ONLY`;
+- Generator A и Generator B могут штатно работать одновременно;
+- аппаратная взаимная блокировка не позволяет им одновременно владеть общей генераторной шиной;
+- owner шины определяется аппаратным FIFO: кто первым создал напряжение и втянул контактор, тот удерживает шину до остановки;
+- `GeneratorBusTracker` хранит известного owner и run-context между restart;
+- автоматический fallback ограничен одним переходом `PRIMARY -> SECONDARY`, без ping-pong;
+- уже работающий внешний SECONDARY не захватывается в managed ownership;
+- после стабильного восстановления Grid останавливаются все известные `outage-related` генераторы, в том числе внешне запущенные;
+- `TEST_RUN` является явным исключением и по одному лишь возврату Grid не останавливается;
+- `armed: false` запрещает все аппаратные switch/button service calls.
 
-## Контракт Generator Controller → Home Assistant → Energy ATS
+A/B остаются стабильными машинными слотами. Пользовательские имя и модель читаются из Home Assistant.
 
-Energy ATS 0.3.13 требует следующие сущности идентичности генераторов:
+## Home Assistant contract
+
+Основные сущности:
 
 ```text
+input_boolean.automatic_generator_transfer
+input_boolean.generator_test_mode
+
+binary_sensor.grid_input_ready
+binary_sensor.house_powered_by_grid
+binary_sensor.house_powered_by_generator
+binary_sensor.generator_a_is_running
+binary_sensor.generator_b_is_running
+
+switch.grid_power
+switch.use_generator_as_power_source
+switch.generator_a_remote_start
+switch.generator_b_remote_start
+switch.generators_emergency_stop
+
 sensor.generator_a_name
 sensor.generator_b_name
 sensor.generator_a_model
@@ -45,40 +69,32 @@ sensor.generator_b_model
 select.primary_generator
 ```
 
-Значение `select.primary_generator` должно совпадать с состоянием одного из
-`sensor.generator_*_name`. Внутри Python эти значения преобразуются обратно в
-стабильный слот `A` или `B`.
+`house_powered_by_grid` и `house_powered_by_generator` подключены к **цепям управления основных контакторов**, а не к независимым силовым выходам после них. Это важное ограничение текущей схемы контроля.
 
-Имена и модели больше не хранятся в Configuration Energy ATS и не зашиты в
-`generator_controller.py`.
+Полный контракт: [`docs/ENTITIES_RU.md`](docs/ENTITIES_RU.md).
 
 ## Установка
 
-Добавьте repository в Home Assistant Apps store:
+Repository для Home Assistant Apps:
 
 ```text
 https://github.com/akastrel/EnergyATS
 ```
 
-Добавьте корневой `ats.yaml` как Home Assistant package. Он создаёт helper:
+Корневой `ats.yaml` устанавливается как Home Assistant package и создаёт:
 
 ```text
 input_boolean.automatic_generator_transfer
+input_boolean.generator_test_mode
 ```
 
-и документирует полный внешний HA-контракт Energy ATS 0.3.13.
+При обновлении с 0.3.x старый persistent journal **не мигрируется**: модель 0.4 принципиально другая. Обновление выполнять при доступной Grid, остановленных генераторах и `armed: false`.
 
-Перед первым запуском или обновлением:
-
-1. Grid доступна;
-2. оба генератора остановлены;
-3. генераторная шина отключена;
-4. `armed: false`;
-5. все обязательные HA entities имеют известные состояния.
+Подробно: [`docs/INSTALL_RU.md`](docs/INSTALL_RU.md).
 
 ## Ручные команды
 
-Через `hassio.app_stdin` поддерживаются ровно три команды:
+Через `hassio.app_stdin` поддерживаются:
 
 ```text
 start_generator
@@ -86,13 +102,19 @@ stop_generator
 reset
 ```
 
-Положение автоматического АВР хранится в
-`input_boolean.automatic_generator_transfer`.
+- `start_generator` — новая managed-сессия текущего PRIMARY;
+- `stop_generator` — безопасно вернуть основные контакторы в сторону Grid и завершить managed-сессию;
+- `reset` — ограниченное восстановление после `RECOVERY_REQUIRED`.
 
 ## Диагностика
 
-App публикует `sensor.energy_ats_status`. Его state содержит
-человеко-читаемый статус, а атрибуты включают:
+App публикует read-only:
+
+```text
+sensor.energy_ats_status
+```
+
+В 0.4 используется `schema_version: 3`. Основные атрибуты:
 
 ```text
 source
@@ -102,17 +124,24 @@ generator_model
 generator_slot
 primary_generator
 primary_generator_slot
+bus_owner
+bus_owner_slot
+generator_a_run_context
+generator_b_run_context
+fallback_used
 remaining_seconds
 session_reason
 armed
+schema_version
 ```
 
-Этот sensor диагностический и не участвует в управляющих решениях.
+Sensor предназначен для UI и диагностики и не используется как управляющий вход.
 
 ## Документация
 
+- [Физическая схема](docs/PHYSICAL_POWER_TOPOLOGY_RU.md)
+- [Требования](docs/REQUIREMENTS_RU.md)
 - [Архитектура](docs/ARCHITECTURE_RU.md)
-- [Требования и сценарии](docs/REQUIREMENTS_RU.md)
 - [Home Assistant entities](docs/ENTITIES_RU.md)
 - [Установка и обновление](docs/INSTALL_RU.md)
 - [Changelog](energy_ats/CHANGELOG.md)
@@ -126,5 +155,4 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-Чистые автоматы не импортируют Home Assistant и тестируются
-детерминированными снимками физических состояний.
+Сквозные тесты в `tests/test_end_to_end_scenarios.py` моделируют HA states, работу ES/TPC/GC, аппаратный owner генераторной шины и фактические service calls к fake Home Assistant.

@@ -1,16 +1,15 @@
-# Обновление до Energy ATS 0.3.13
+# Установка и обновление Energy ATS 0.4.0
 
-Версия 0.3.13 сохраняет силовую логику предыдущего релиза, но меняет источник
-конфигурации генераторов. Имя, модель и выбор основного генератора теперь
-приходят из Generator Controller через Home Assistant. Energy ATS больше не
-хранит эти значения в собственной Configuration.
+0.4 — принципиальная переработка доменной модели под фактическую электрическую схему. Это не совместимый внутренний апгрейд 0.3.x.
 
-Обновление выполнять при доступной основной сети, остановленных генераторах и
-`armed: false`.
+Перед обновлением прочитать:
 
-## 1. Исходное безопасное состояние
+- `PHYSICAL_POWER_TOPOLOGY_RU.md`;
+- `REQUIREMENTS_RU.md`.
 
-Перед обновлением проверить:
+## 1. Безопасное исходное состояние
+
+Для обновления рекомендуется:
 
 ```text
 Grid Input Ready                 ON
@@ -21,38 +20,14 @@ Generator A/B Remote Start      OFF
 Use Generator as Power Source   OFF
 Grid Power                      ON
 Generators Emergency Stop       OFF
+armed                           false
 ```
 
-Не обновлять приложение посередине запуска, силового переключения, cooldown или
-recovery.
+Не обновлять App во время запуска, силового переключения, cooldown или recovery.
 
-## 2. Подготовить Generator Controller и Home Assistant
+## 2. Подготовить Generator Controller
 
-До запуска Energy ATS 0.3.13 в Home Assistant должны существовать следующие
-сущности Generator Controller:
-
-```text
-sensor.generator_a_name
-sensor.generator_b_name
-sensor.generator_a_model
-sensor.generator_b_model
-select.primary_generator
-```
-
-Для текущей установки ожидается, например:
-
-```text
-sensor.generator_a_name   = Elemax
-sensor.generator_b_name   = Вепрь
-sensor.generator_a_model  = SH7600EX 6.5 / 5.6 кВт
-sensor.generator_b_model  = АПБ 6-230 ВХ-БСГ 6.0 / 5.5 кВт
-select.primary_generator  = Elemax
-```
-
-Значение `select.primary_generator` должно в точности совпадать с состоянием
-одного из `sensor.generator_*_name`.
-
-Также должны существовать стабильные аппаратные команды и обратные связи:
+В Home Assistant должны существовать:
 
 ```text
 binary_sensor.generator_a_is_running
@@ -63,27 +38,48 @@ button.generator_a_choke_to_cold_start
 button.generator_a_choke_to_run
 button.generator_b_choke_to_cold_start
 button.generator_b_choke_to_run
+sensor.generator_a_name
+sensor.generator_b_name
+sensor.generator_a_model
+sensor.generator_b_model
+select.primary_generator
 ```
 
-A/B здесь являются стабильными аппаратными слотами. Переименование физического
-генератора не должно менять эти `entity_id`.
+A/B — стабильные аппаратные слоты.
+
+`select.primary_generator` должен совпадать с именем одного из генераторов.
 
 ## 3. Обновить `ats.yaml`
 
-Скопировать актуальный корневой `ats.yaml` в каталог packages Home Assistant.
-Он создаёт только собственный state-helper ATS:
+Скопировать актуальный корневой `ats.yaml` в Home Assistant packages.
+
+Он создаёт два helper-а:
 
 ```text
 input_boolean.automatic_generator_transfer
+input_boolean.generator_test_mode
 ```
 
-Остальные сущности в файле перечислены как внешний контракт и должны уже
-существовать в Home Assistant.
+Первый разрешает автоматический АВР. Второй классифицирует **новый внешний запуск** как `TEST_RUN`.
 
-После изменения package перечитать конфигурацию Home Assistant обычным штатным
-способом.
+После изменения package перечитать/перезапустить конфигурацию HA штатным способом.
 
-## 4. Обновить Home Assistant App
+## 4. Проверить основные entities
+
+Обязательный силовой контракт:
+
+```text
+binary_sensor.grid_input_ready
+binary_sensor.house_powered_by_grid
+binary_sensor.house_powered_by_generator
+switch.grid_power
+switch.use_generator_as_power_source
+switch.generators_emergency_stop
+```
+
+`house_powered_by_grid` и `house_powered_by_generator` должны пониматься как датчики **управляющих цепей основных контакторов**, не как независимое измерение напряжения после силовых контактов.
+
+## 5. Установить/обновить App
 
 Repository:
 
@@ -91,11 +87,13 @@ Repository:
 https://github.com/akastrel/EnergyATS
 ```
 
-После обновления списка Apps установить Energy ATS **0.3.13**.
+Версия App:
 
-В Configuration App больше нет `primary_generator`, `generator_a_name`,
-`generator_b_name`, моделей и параметров конкретного двигателя. Компактная
-конфигурация выглядит так:
+```text
+0.4.0
+```
+
+Configuration:
 
 ```yaml
 armed: false
@@ -108,16 +106,31 @@ generator_a_enabled: true
 generator_b_enabled: true
 ```
 
-`generator_a_enabled` и `generator_b_enabled` остаются политикой Energy ATS:
-они разрешают или запрещают Supervisor использовать соответствующий физический
-слот. Они не описывают физическую идентичность генератора и поэтому не
-переносятся в Generator Controller.
+Имя, модель и primary не дублируются в Configuration App.
 
-Если Home Assistant сохранил старые значения Configuration, открыть страницу
-Configuration Energy ATS и сохранить предложенную текущую схему без
-`primary_generator`.
+## 6. Важно при обновлении с 0.3.x
 
-## 5. Первый запуск только DISARMED
+Persistent journal 0.3 **не мигрируется** в модель 0.4.
+
+Файл App:
+
+```text
+/data/energy-supervisor-state.json
+```
+
+0.4 использует новый envelope journal и сохраняет не только Supervisor, но и owner/run-context генераторной шины.
+
+Если после обновления старый journal приводит к `RECOVERY_REQUIRED`, это ожидаемая защитная реакция. Не пытаться обходить её изменением файла вслепую.
+
+Правильная процедура:
+
+1. убедиться физически, что Grid и контакторы находятся в безопасном устойчивом состоянии;
+2. первый запуск выполнить с `armed: false` и проверить входные states/status;
+3. затем разрешить `armed: true`;
+4. выполнить `reset` через `hassio.app_stdin`;
+5. убедиться, что `RECOVERY_REQUIRED` снят и силовая схема подтверждена.
+
+## 7. Первый запуск 0.4 только DISARMED
 
 Оставить:
 
@@ -125,96 +138,112 @@ Configuration Energy ATS и сохранить предложенную теку
 armed: false
 ```
 
-Запустить App. В этом режиме switch/button service calls запрещены, но App
-подключается к Home Assistant и проверяет обязательные данные.
+Проверить в журнале:
 
-В логах должны появиться строки вида:
+- Generator A/B имеют правильные имя и модель;
+- текущий PRIMARY определён правильно;
+- отсутствуют unknown/unavailable у обязательных силовых states;
+- `sensor.energy_ats_status` публикуется;
+- Grid/Generator status соответствует фактической схеме.
 
-```text
-Generator A: Elemax; модель: SH7600EX ...; PRIMARY; ...
-Generator B: Вепрь; модель: АПБ ...; SECONDARY; ...
-```
+DISARMED разрешает наблюдение и диагностику, но блокирует switch/button service calls.
 
-Также проверить отсутствие сообщения `Ожидаем обязательные сущности Home
-Assistant`.
+## 8. Проверить status schema 3
 
-Если имя, модель или `select.primary_generator` имеют `unknown/unavailable`,
-Energy ATS не переходит в состояние готовности к аппаратным командам.
-
-## 6. Проверить `sensor.energy_ats_status`
-
-Energy ATS публикует диагностический:
+`sensor.energy_ats_status` должен содержать, в частности:
 
 ```text
-sensor.energy_ats_status
-```
-
-В версии 0.3.13 его `schema_version = 2`. Помимо прежних полей он публикует:
-
-```text
-generator_model
+source
+phase
 primary_generator
 primary_generator_slot
+bus_owner
+bus_owner_slot
+generator_a_run_context
+generator_b_run_context
+fallback_used
+schema_version = 3
 ```
 
-Например при основном Elemax:
+При нормальной Grid ожидается пользовательский state:
 
 ```text
-primary_generator      = Elemax
-primary_generator_slot = A
+Питание от основной сети
 ```
 
-Sensor предназначен только для диагностики/UI и не используется как вход
-управляющей логики.
+При намеренно отключённой основной части дома и работающем МАП:
 
-## 7. Переход в ARMED
+```text
+В доме работает только UPS линия
+```
 
-`armed: true` включать только после проверки DISARMED-режима.
+## 9. Переход в ARMED
 
-Минимальный ручной тест:
+После проверки DISARMED установить:
 
-1. Grid доступна, оба генератора остановлены.
-2. Выполнить `start_generator` через `hassio.app_stdin`.
-3. Проверить выбор именно текущего `select.primary_generator`.
-4. Проверить заслонку, REMOTE, RUNNING и прогрев.
-5. Убедиться, что Grid отключается до выбора генераторной шины.
-6. Выполнить `stop_generator`.
-7. Убедиться, что нагрузка снята до cooldown и снятия REMOTE.
+```yaml
+armed: true
+```
 
-Автоматический АВР на первом тесте рекомендуется оставить выключенным:
+Автоматический АВР для первых физических испытаний лучше оставить:
 
 ```text
 input_boolean.automatic_generator_transfer = OFF
 ```
 
-Ручные команды от состояния этого helper не зависят.
+## 10. Базовый ручной тест
 
-## 8. Изменение primary во время эксплуатации
+1. Grid доступна, оба генератора остановлены.
+2. `start_generator`.
+3. Проверить запуск текущего PRIMARY.
+4. Проверить RUNNING, choke и прогрев.
+5. Проверить break-before-make: Grid снимается до выбора генераторной ветви.
+6. Проверить `bus_owner`.
+7. `stop_generator`.
+8. Проверить снятие генераторной ветви до cooldown/REMOTE OFF.
 
-`select.primary_generator` можно менять в Home Assistant без изменения
-Configuration Energy ATS.
+## 11. Ключевые физические испытания 0.4
 
-Новое значение влияет на **следующую новую управляемую сессию**. Уже начатая
-сессия хранит свой аппаратный слот A/B и не должна переключать работающий
-генератор только из-за изменения select.
+После базового теста отдельно проверить:
 
-Если выбранный primary запрещён соответствующим `generator_*_enabled`, Energy
-ATS считает конфигурацию некорректной и не начинает новую аппаратную операцию.
+1. A запускается первым, затем B запускается внешне: оба RUNNING, `bus_owner` остаётся A.
+2. При A+B RUNNING остановить A: аппаратный owner автоматически переходит B, EnergyATS B не захватывает.
+3. При outage дать PRIMARY не запуститься: EnergyATS делает ровно один fallback на SECONDARY.
+4. При outage запустить второй генератор внешне; после стабильного возврата Grid дом возвращается на Grid, затем останавливаются все outage-related runs.
+5. Повторить внешний запуск с `input_boolean.generator_test_mode = ON`: после возврата Grid TEST_RUN продолжает работать.
 
-## 9. Recovery Required
+Только после этих проверок включать автоматический АВР для постоянной эксплуатации.
 
-При потере связи или restart посередине физической транзакции App не продолжает
-старую последовательность вслепую. После восстановления связи:
+## 12. TEST_RUN
 
-1. осмотреть фактическое состояние оборудования;
-2. снять Emergency Stop, если он активен;
-3. выполнить команду `reset`.
+`generator_test_mode` читается в момент нового OFF->ON фронта внешнего генератора.
 
-При однозначной физической обратной связи recovery снимает генераторную шину,
-возвращает Grid path и останавливает только разгруженный генератор прерванной
-управляемой сессии. Внешний генератор App не захватывает и не останавливает.
+Правильная последовательность тестового запуска:
 
-## 10. Ручные команды Home Assistant
+```text
+generator_test_mode = ON
+-> запустить генератор внешним способом
+-> убедиться, что run_context = test_run
+-> generator_test_mode можно вернуть OFF
+```
+
+Классификация текущего запуска сохраняется до его остановки и переживает restart через persistent journal.
+
+## 13. PRIMARY и fallback
+
+`select.primary_generator` влияет на следующую новую managed-сессию.
+
+При отказе PRIMARY EnergyATS может один раз перейти на SECONDARY. Если fallback SECONDARY также отказал, автоматического возврата к PRIMARY нет: требуется recovery/решение пользователя.
+
+Если SECONDARY уже работает внешне, EnergyATS не переводит его в managed ownership; физический takeover общей шины отслеживается отдельно.
+
+## 14. Ручные команды
+
+```text
+start_generator
+stop_generator
+reset
+```
 
 Пример:
 
@@ -226,26 +255,4 @@ data:
     command: start_generator
 ```
 
-Поддерживаются ровно:
-
-```text
-start_generator
-stop_generator
-reset
-```
-
-Фактический `app` ID лучше выбирать через визуальный редактор Home Assistant.
-Для этих команд отдельные `input_button` не нужны.
-
-## 11. Persistent journal
-
-Energy ATS использует:
-
-```text
-/data/energy-supervisor-state.json
-```
-
-Файл принадлежит App и не копируется в HA packages. Он хранит управляемую
-сессию, транзакцию и pending hardware actions. Имена и модели генераторов в
-нём не являются источником конфигурации: после подключения текущая идентичность
-повторно читается из Home Assistant.
+Фактический App ID рекомендуется выбирать через визуальный редактор Home Assistant.
