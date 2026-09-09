@@ -8,11 +8,11 @@ Energy ATS — Home Assistant App для безопасного управлен
 - удалён виртуальный `Battery path`, используется `UPS_ONLY`;
 - два генератора могут штатно быть RUNNING одновременно;
 - добавлен persistent `GeneratorBusTracker` с аппаратным FIFO owner;
+- run-context упрощён до `OUTAGE_RELATED`, `TEST_RUN`, `OTHER`, `UNKNOWN`;
 - реализован один fallback `PRIMARY -> SECONDARY` без ping-pong;
 - внешний SECONDARY не захватывается в managed ownership;
-- outage-related генераторы останавливаются после стабильного возврата Grid;
-- `TEST_RUN` является исключением;
-- status schema обновлена до version 3.
+- outage-related генераторы останавливаются только после безопасного возврата дома на стабильную Grid;
+- `TEST_RUN` этим правилом не останавливается.
 
 ## Перед обновлением
 
@@ -23,7 +23,7 @@ Energy ATS — Home Assistant App для безопасного управлен
 5. Обновить корневой `ats.yaml`.
 6. Обновить App до 0.4.0.
 
-Persistent journal 0.3 не мигрируется. Если после обновления получен `RECOVERY_REQUIRED`, сначала проверить физическую схему, затем выполнить безопасный `reset` по инструкции `docs/INSTALL_RU.md`.
+Persistent journal 0.3 не мигрируется. Если после обновления получен `RECOVERY_REQUIRED`, сначала проверить физическую схему, затем выполнить безопасный `reset` по `docs/INSTALL_RU.md`.
 
 ## Helper-ы
 
@@ -32,11 +32,11 @@ input_boolean.automatic_generator_transfer
 input_boolean.generator_test_mode
 ```
 
-`generator_test_mode` применяется к новому внешнему запуску. Такой `TEST_RUN` не останавливается автоматически только из-за возврата Grid.
+`generator_test_mode` классифицирует новый фронт RUNNING как `TEST_RUN`. Helper сам не запускает и не останавливает двигатель.
 
 ## Конфигурация
 
-В App остаются только policy/тайминги:
+В App остаются policy/тайминги:
 
 - `armed`;
 - `tick_seconds`;
@@ -65,7 +65,9 @@ App публикует:
 sensor.energy_ats_status
 ```
 
-Schema version 3 включает `bus_owner`, run-context A/B и `fallback_used`.
+Ключевые attributes: фактический `source`, Supervisor `phase`, текущий generator/bus owner, managed generator, run-context A/B, PRIMARY, `fallback_used`, `remaining_seconds` и `armed`.
+
+Status sensor не имеет отдельного version/schema attribute и не используется как управляющий вход.
 
 ## Документация
 
