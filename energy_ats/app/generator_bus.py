@@ -99,7 +99,7 @@ class GeneratorBusTracker:
         running: Mapping[GeneratorSlot, bool | None],
         *,
         grid_ready: bool | None,
-        test_mode: bool,
+        test_mode: bool | None,
         managed_slot: GeneratorSlot | None,
         managed_outage: bool,
     ) -> GeneratorBusStatus:
@@ -107,7 +107,9 @@ class GeneratorBusTracker:
 
         ``test_mode`` применяется только к новому фронту OFF->ON. Уже
         классифицированный запуск не меняет происхождение из-за последующего
-        переключения helper-а.
+        переключения helper-а. Если helper недоступен, внешний новый запуск
+        получает UNKNOWN_EXTERNAL: безопаснее не остановить его автоматически,
+        чем ошибочно принять неизвестный запуск за outage-related.
         """
         if any(running.get(slot) is None for slot in (GeneratorSlot.A, GeneratorSlot.B)):
             return self.status()
@@ -145,25 +147,6 @@ class GeneratorBusTracker:
         self._update_owner(current)
         self.previous_running = dict(current)
         return self.status()
-
-    def adopt_managed_run(
-        self,
-        slot: GeneratorSlot,
-        *,
-        outage: bool,
-    ) -> None:
-        """Явно отметить запуск, принадлежащий новой managed-сессии.
-
-        Вызывается после создания сессии до появления RUNNING. Если двигатель
-        уже внешне работает, метод не должен использоваться для его захвата.
-        """
-        if self.previous_running.get(slot) is True:
-            return
-        self.run_contexts[slot] = (
-            GeneratorRunContext.MANAGED_OUTAGE
-            if outage
-            else GeneratorRunContext.MANAGED_OTHER
-        )
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -243,12 +226,9 @@ class GeneratorBusTracker:
             self.owner = GeneratorBusOwner.for_slot(active[0])
             return
 
-        # Оба работают. Ранее известный работающий владелец сохраняет шину.
         if self.owner.slot in active:
             return
 
-        # Если до этого работал ровно один генератор, именно он уже держал
-        # контактор и второй не мог отобрать шину после своего запуска.
         previously_active = [
             slot
             for slot in (GeneratorSlot.A, GeneratorSlot.B)
@@ -258,8 +238,6 @@ class GeneratorBusTracker:
             self.owner = GeneratorBusOwner.for_slot(previously_active[0])
             return
 
-        # Два фронта появились между двумя снимками — физический победитель
-        # существует, но по имеющимся данным его определить нельзя.
         self.owner = GeneratorBusOwner.UNKNOWN
 
     def _new_run_context(
@@ -267,7 +245,7 @@ class GeneratorBusTracker:
         slot: GeneratorSlot,
         *,
         grid_ready: bool | None,
-        test_mode: bool,
+        test_mode: bool | None,
         managed_slot: GeneratorSlot | None,
         managed_outage: bool,
     ) -> GeneratorRunContext:
@@ -277,8 +255,10 @@ class GeneratorBusTracker:
                 if managed_outage
                 else GeneratorRunContext.MANAGED_OTHER
             )
-        if test_mode:
+        if test_mode is True:
             return GeneratorRunContext.TEST_RUN
+        if test_mode is None:
+            return GeneratorRunContext.UNKNOWN_EXTERNAL
         if grid_ready is False:
             return GeneratorRunContext.EXTERNAL_OUTAGE
         if grid_ready is True:
