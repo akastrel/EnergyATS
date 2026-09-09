@@ -1,8 +1,9 @@
-"""Композиция Energy Supervisor и его связь с Home Assistant.
+"""Композиция EnergyATS и связь с Home Assistant.
 
-Здесь нет решений вида «когда запускать двигатель» или «в каком порядке
-переключать контакторы». ``main.py`` только собирает независимые контроллеры,
-передаёт им снимок физических состояний и исполняет уже сформированные команды.
+Решения о политике находятся в EnergySupervisor, физическая коммутация — в
+PowerTransferController, жизненный цикл двигателя — в GeneratorController.
+main.py только собирает эти уровни, обновляет наблюдаемую модель общей
+генераторной шины и исполняет сформированные команды.
 """
 
 from __future__ import annotations
@@ -26,38 +27,33 @@ from energy_supervisor import (
     SupervisorObservation,
     SupervisorPhase,
 )
+from generator_bus import GeneratorBusOwner, GeneratorBusTracker
 from generator_controller import (
     GeneratorAction,
     GeneratorController,
     GeneratorPhase,
     default_generator_profiles,
 )
-from ha_adapter import ENTITIES, HardwareSnapshot, HomeAssistantAdapter
+from ha_adapter import HardwareSnapshot, HomeAssistantAdapter
 from ha_client import HomeAssistantClient, HomeAssistantConnectionError
 from power_transfer import PowerTransferController, TransferAction, TransferPhase
 from state_store import StateStore
 
 
-APP_VERSION = "0.3.13"
+APP_VERSION = "0.4.0"
+JOURNAL_SCHEMA_VERSION = 2
+GENERATOR_TEST_MODE_ENTITY = "input_boolean.generator_test_mode"
 
 
 DEFAULT_OPTIONS: dict[str, Any] = {
-    # Главный deployment-предохранитель. При false аппаратные service calls
-    # запрещены, но физические состояния продолжают читаться и логироваться.
     "armed": False,
     "tick_seconds": 1.0,
     "log_level": "info",
-
-    # Энергетическая политика.
     "grid_failure_delay": 5,
     "grid_restore_stable_time": 60,
     "generator_a_enabled": True,
     "generator_b_enabled": True,
-
-    # Безопасная силовая коммутация.
     "transfer_confirmation_timeout": 60,
-
-    # Внутренний файл App. Путь вынесен в options только ради тестов.
     "state_file": "/data/energy-supervisor-state.json",
 }
 
@@ -80,7 +76,7 @@ _GENERATOR_PHASE_TEXT = {
 
 
 class EnergySupervisorApp:
-    """Один процесс, четыре явно разделённых слоя управления."""
+    """Один процесс с независимыми ES/TPC/GC и HA adapter."""
 
     def __init__(self, options: dict[str, Any], token: str) -> None:
         self.options = {**DEFAULT_OPTIONS, **options}
@@ -95,9 +91,6 @@ class EnergySupervisorApp:
             logger=self.log,
         )
 
-        # До первого снимка HA используются только нейтральные идентификаторы
-        # слотов. Реальные name/model подставляются из Generator Controller в HA
-        # до разрешения любых команд.
         self.profiles = default_generator_profiles()
         self.generator_controllers = {
             slot: GeneratorController(profile)
@@ -110,7 +103,11 @@ class EnergySupervisorApp:
         )
 
         self.state_store = StateStore(str(self.options["state_file"]))
+        self._restore_error: str | None = None
+        self._restored_journal = self._load_journal_for_restore()
+        self.generator_bus = self._restore_generator_bus()
         self.supervisor = self._restore_supervisor()
+
         self._saved_state_signature: str | None = None
         self._pending_action_records: list[dict[str, str]] = []
 
@@ -118,22 +115,16 @@ class EnergySupervisorApp:
         self.commands_ready = False
         self._last_runtime_signature: tuple[Any, ...] | None = None
         self._last_generator_config_signature: tuple[Any, ...] | None = None
-
-        # Последний успешно опубликованный HA status. Нужен только для
-        # подавления одинаковых REST-записей. После каждого reconnect cache
-        # сбрасывается, чтобы HA гарантированно получил sensor заново.
         self._last_status_payload: dict[str, Any] | None = None
+
+    # ------------------------------------------------------------------
+    # Process / commands.
+    # ------------------------------------------------------------------
 
     def request_stop(self) -> None:
         self.stop_event.set()
 
     async def read_stdin_commands(self) -> None:
-        """Принимать однократные команды от ``hassio.app_stdin``.
-
-        Supervisor передаёт поле ``input`` как одну JSON-строку. Неизвестная
-        или повреждённая команда только записывается в журнал и не может
-        остановить основной цикл автоматики.
-        """
         reader = asyncio.StreamReader()
         protocol = asyncio.StreamReaderProtocol(reader)
         transport = None
@@ -149,50 +140,41 @@ class EnergySupervisorApp:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self.log.error("Обработчик команд STDIN остановлен: %s", exc)
+            self.log.error("Обработчик STDIN остановлен: %s", exc)
         finally:
             if transport is not None:
                 transport.close()
 
     def handle_stdin_line(self, line: str) -> None:
-        """Проверить JSON из HA и передать известную команду Supervisor."""
         try:
             message = json.loads(line)
         except json.JSONDecodeError as exc:
             self.log.warning("Отклонена некорректная JSON-команда: %s", exc)
             return
 
-        if not isinstance(message, dict) or not isinstance(
-            message.get("command"), str
-        ):
-            self.log.warning(
-                "Отклонена команда без строкового поля 'command': %r", message
-            )
+        if not isinstance(message, dict) or not isinstance(message.get("command"), str):
+            self.log.warning("Отклонена команда без строкового поля command: %r", message)
             return
 
         command = message["command"]
-        manual_commands = {
+        handlers = {
             "start_generator": self.supervisor.request_manual_start,
             "stop_generator": self.supervisor.request_manual_stop,
             "reset": self.supervisor.request_recovery_reset,
         }
-        handler = manual_commands.get(command)
+        handler = handlers.get(command)
         if handler is None:
             self.log.warning("Неизвестная команда Energy ATS: %s", command)
             return
-
         if not self.armed:
             self.log.info("DISARMED: команда %s проигнорирована.", command)
             return
-
         if not self.commands_ready:
             self.log.warning(
-                "Команда %s отклонена: App ещё не получил обязательные "
-                "физические состояния от Home Assistant.",
+                "Команда %s отклонена: App ещё не получил обязательные состояния.",
                 command,
             )
             return
-
         handler()
         self.log.info("Принята команда Energy ATS: %s", command)
 
@@ -213,7 +195,8 @@ class EnergySupervisorApp:
                 await self._wait_until_required_entities_ready()
                 if self.stop_event.is_set():
                     break
-                self._sync_generator_configuration(self.adapter.snapshot())
+                hardware = self.adapter.snapshot()
+                self._sync_generator_configuration(hardware)
                 self.commands_ready = True
                 await self._connected_loop()
             except asyncio.CancelledError:
@@ -238,13 +221,19 @@ class EnergySupervisorApp:
         while not self.stop_event.is_set():
             if not self.client.connected.is_set():
                 raise HomeAssistantConnectionError("WebSocket HA потерян")
-
             await self._tick(time.time())
             await self._stop_requested_within(self.tick_seconds)
+
+    # ------------------------------------------------------------------
+    # One tick.
+    # ------------------------------------------------------------------
 
     async def _tick(self, now: float) -> None:
         hardware = self.adapter.snapshot()
         self._sync_generator_configuration(hardware)
+
+        test_mode = self.adapter.bool_state(GENERATOR_TEST_MODE_ENTITY)
+        hardware = self._apply_generator_bus_model(hardware, test_mode=test_mode)
         self._refresh_component_views(now, hardware)
 
         if self.supervisor.consume_recovery_reset_request():
@@ -254,12 +243,26 @@ class EnergySupervisorApp:
             await self._tick_recovery_reset(now, hardware)
             return
 
-        observation = self._supervisor_observation(hardware)
+        observation = self._supervisor_observation(hardware, test_mode=test_mode)
         decision = self.supervisor.step(now, observation)
         actions_allowed = self.armed and decision.actions_allowed
 
         generator_actions: list[GeneratorAction] = []
+        outage_stop_errors: list[str] = []
         for slot, controller in self.generator_controllers.items():
+            if slot in decision.stop_outage_generators:
+                # Явное ограниченное исключение REQ-OUTRUN-03: после стабильной
+                # Grid разрешено штатно остановить и внешний outage-related run.
+                actions, error = controller.step_recovery_shutdown(
+                    now,
+                    hardware.generators[slot],
+                    owned_by_interrupted_session=True,
+                )
+                if error is not None:
+                    outage_stop_errors.append(error)
+                generator_actions.extend(actions)
+                continue
+
             generator_actions.extend(
                 controller.step(
                     now,
@@ -272,18 +275,17 @@ class EnergySupervisorApp:
                 )
             )
 
+        if outage_stop_errors:
+            self.supervisor.require_recovery("; ".join(outage_stop_errors))
+
         generator_statuses = {
             slot: controller.status(hardware.generators[slot])
             for slot, controller in self.generator_controllers.items()
         }
-        desired_generator = (
-            decision.desired_source.generator
-            if decision.desired_source is not None
-            else None
-        )
-        desired_generator_ready = (
-            desired_generator is not None
-            and generator_statuses[desired_generator].ready_for_load
+        desired_generator_ready = self._desired_generator_ready(
+            decision.desired_source,
+            hardware,
+            generator_statuses,
         )
         transfer_actions = self.power_transfer.step(
             now,
@@ -293,41 +295,101 @@ class EnergySupervisorApp:
             actions_allowed=actions_allowed,
         )
 
-        await self._execute_controller_actions(
-            transfer_actions,
-            generator_actions,
-        )
+        await self._execute_controller_actions(transfer_actions, generator_actions)
 
-        updated_observation = self._supervisor_observation(hardware)
+        updated_observation = self._supervisor_observation(
+            hardware,
+            test_mode=test_mode,
+        )
         self._log_events(decision.events)
         await self.adapter.publish_events(decision.events)
         self._log_runtime_if_changed(updated_observation)
         await self._publish_status(now, updated_observation)
 
-    def _sync_generator_configuration(self, hardware: HardwareSnapshot) -> None:
-        """Синхронизировать идентичность генераторов и primary из HA.
+    def _apply_generator_bus_model(
+        self,
+        hardware: HardwareSnapshot,
+        *,
+        test_mode: bool | None,
+    ) -> HardwareSnapshot:
+        session = self.supervisor.session
+        managed_slot = session.generator if session is not None else None
+        managed_outage = bool(session is not None and session.grid_was_unavailable)
+        bus = self.generator_bus.update(
+            {
+                slot: hardware.generators[slot].running
+                for slot in (GeneratorSlot.A, GeneratorSlot.B)
+            },
+            grid_ready=hardware.grid_ready,
+            test_mode=test_mode,
+            managed_slot=managed_slot,
+            managed_outage=managed_outage,
+        )
 
-        A/B остаются стабильными аппаратными слотами. Человеко-читаемые имя,
-        модель и политика выбора primary принадлежат Generator Controller и
-        поступают через Home Assistant. Изменение primary влияет только на
-        выбор следующей сессии; уже начатая сессия хранит свой слот отдельно.
-        """
+        owner = bus.owner_slot
+        house_on_generator = hardware.power_transfer.house_on_generator
+        generators = {}
+        for slot, observation in hardware.generators.items():
+            if house_on_generator is False:
+                load_connected: bool | None = False
+            elif house_on_generator is True and owner is not None:
+                load_connected = owner == slot
+            else:
+                load_connected = None
+            generators[slot] = replace(
+                observation,
+                load_connected=load_connected,
+            )
+
+        power_transfer = replace(
+            hardware.power_transfer,
+            active_generator=owner,
+        )
+        return replace(
+            hardware,
+            generators=generators,
+            power_transfer=power_transfer,
+        )
+
+    def _desired_generator_ready(
+        self,
+        desired_source: PowerSource | None,
+        hardware: HardwareSnapshot,
+        statuses: dict[GeneratorSlot, Any],
+    ) -> bool:
+        if desired_source is None or not desired_source.is_generator:
+            return False
+        slot = desired_source.generator
+        if slot is None:
+            slot = self.generator_bus.status().owner_slot
+        if slot is None:
+            return False
+        if statuses[slot].ready_for_load:
+            return True
+        # Внешний bus owner не становится managed, но сам факт owner + RUNNING
+        # является достаточным физическим условием для уже существующей
+        # генераторной шины.
+        return (
+            self.generator_bus.status().owner_slot == slot
+            and hardware.generators[slot].running is True
+        )
+
+    # ------------------------------------------------------------------
+    # Generator metadata/config.
+    # ------------------------------------------------------------------
+
+    def _sync_generator_configuration(self, hardware: HardwareSnapshot) -> None:
         metadata_a = hardware.generator_metadata[GeneratorSlot.A]
         metadata_b = hardware.generator_metadata[GeneratorSlot.B]
         if metadata_a is None or metadata_b is None:
-            raise ValueError(
-                "Не удалось прочитать имя или модель генераторов из Home Assistant."
-            )
+            raise ValueError("Не удалось прочитать имя или модель генераторов из HA.")
         if not metadata_a.name or not metadata_b.name:
-            raise ValueError("Имена генераторов в Home Assistant не могут быть пустыми.")
+            raise ValueError("Имена генераторов не могут быть пустыми.")
         if metadata_a.name == metadata_b.name:
-            raise ValueError(
-                "generator_a_name и generator_b_name должны быть различными."
-            )
+            raise ValueError("generator_a_name и generator_b_name должны различаться.")
         if hardware.primary_generator is None:
             raise ValueError(
-                "select.primary_generator должен совпадать с sensor.generator_a_name "
-                "или sensor.generator_b_name."
+                "select.primary_generator должен совпадать с именем Generator A или B."
             )
 
         for slot, metadata in (
@@ -344,11 +406,8 @@ class EnergySupervisorApp:
 
         config = self._supervisor_config(hardware.primary_generator)
         if not config.generator_enabled(hardware.primary_generator):
-            primary_name = self.profiles[hardware.primary_generator].display_name
-            raise ValueError(
-                f"Некорректная конфигурация: основной генератор {primary_name} "
-                "отключён. Включите его или выберите другой основной генератор."
-            )
+            name = self.profiles[hardware.primary_generator].display_name
+            raise ValueError(f"Основной генератор {name} запрещён политикой EnergyATS.")
         self.supervisor.config = config
 
         signature = (
@@ -362,11 +421,7 @@ class EnergySupervisorApp:
             self._last_generator_config_signature = signature
             for slot in (GeneratorSlot.A, GeneratorSlot.B):
                 profile = self.profiles[slot]
-                marker = (
-                    "PRIMARY"
-                    if slot == hardware.primary_generator
-                    else "SECONDARY"
-                )
+                marker = "PRIMARY" if slot == hardware.primary_generator else "SECONDARY"
                 self.log.info(
                     "Generator %s: %s; модель: %s; %s; choke: %s.",
                     slot.value,
@@ -376,8 +431,14 @@ class EnergySupervisorApp:
                     profile.choke_strategy.value,
                 )
 
+    # ------------------------------------------------------------------
+    # Component observation refresh.
+    # ------------------------------------------------------------------
+
     def _refresh_component_views(
-        self, now: float, hardware: HardwareSnapshot
+        self,
+        now: float,
+        hardware: HardwareSnapshot,
     ) -> None:
         for slot, controller in self.generator_controllers.items():
             controller.step(
@@ -388,16 +449,14 @@ class EnergySupervisorApp:
                 stable_managed_session=self.supervisor.manages_stable_generator(slot),
             )
 
-        desired_generator = (
-            self.supervisor.desired_source.generator
-            if self.supervisor.desired_source is not None
-            else None
-        )
-        ready = (
-            desired_generator is not None
-            and self.generator_controllers[desired_generator]
-            .status(hardware.generators[desired_generator])
-            .ready_for_load
+        statuses = {
+            slot: controller.status(hardware.generators[slot])
+            for slot, controller in self.generator_controllers.items()
+        }
+        ready = self._desired_generator_ready(
+            self.supervisor.desired_source,
+            hardware,
+            statuses,
         )
         self.power_transfer.step(
             now,
@@ -408,7 +467,10 @@ class EnergySupervisorApp:
         )
 
     def _supervisor_observation(
-        self, hardware: HardwareSnapshot
+        self,
+        hardware: HardwareSnapshot,
+        *,
+        test_mode: bool | None = None,
     ) -> SupervisorObservation:
         return SupervisorObservation(
             grid_ready=hardware.grid_ready,
@@ -422,10 +484,18 @@ class EnergySupervisorApp:
                 for slot, controller in self.generator_controllers.items()
             },
             power_inputs_known=hardware.power_transfer.required_states_known,
+            bus=self.generator_bus.status(),
+            test_mode=test_mode is True,
         )
 
+    # ------------------------------------------------------------------
+    # Recovery.
+    # ------------------------------------------------------------------
+
     def _start_recovery_reset(
-        self, now: float, hardware: HardwareSnapshot
+        self,
+        now: float,
+        hardware: HardwareSnapshot,
     ) -> None:
         if self.supervisor.recovery_reset_in_progress:
             self.supervisor.begin_recovery_reset(now)
@@ -463,11 +533,9 @@ class EnergySupervisorApp:
             await self._finish_recovery_tick(now, hardware)
             return
 
-        transfer_actions, transfer_error = (
-            self.power_transfer.step_recovery_to_grid_path(
-                now,
-                hardware.power_transfer,
-            )
+        transfer_actions, transfer_error = self.power_transfer.step_recovery_to_grid_path(
+            now,
+            hardware.power_transfer,
         )
         if transfer_error is not None:
             self.supervisor.fail_recovery_reset(now, transfer_error)
@@ -529,15 +597,10 @@ class EnergySupervisorApp:
             await self._finish_recovery_tick(now, hardware)
             return
 
-        self.supervisor.advance_recovery_reset(
-            now,
-            "reset_controllers",
-            confirmed="generators_stopped",
-        )
         if not self.power_transfer.request_recovery_reset(hardware.power_transfer):
             self.supervisor.fail_recovery_reset(
                 now,
-                "Grid path не получил окончательного физического подтверждения.",
+                "Grid path не получил окончательного подтверждения.",
             )
             await self._finish_recovery_tick(now, hardware)
             return
@@ -550,9 +613,7 @@ class EnergySupervisorApp:
         if hardware.emergency_stop is not False:
             return "сначала снимите Generators Emergency Stop."
 
-        power_blocker = self.power_transfer.recovery_blocker(
-            hardware.power_transfer
-        )
+        power_blocker = self.power_transfer.recovery_blocker(hardware.power_transfer)
         if power_blocker is not None:
             return power_blocker
 
@@ -576,38 +637,21 @@ class EnergySupervisorApp:
                 self.profiles[slot].display_name
                 for slot in sorted(external_slots, key=lambda item: item.value)
             )
-            return (
-                f"обнаружен внешний запуск ({names}); остановите его вручную."
-            )
-
-        if (
-            hardware.power_transfer.house_on_generator is True
-            and hardware.power_transfer.active_generator != managed_slot
-        ):
-            return (
-                "невозможно однозначно связать питание дома с управляемым "
-                "генератором."
-            )
+            return f"обнаружен внешний запуск ({names}); recovery им не управляет."
         return None
 
-    @staticmethod
-    def _grid_path_confirmed(hardware: HardwareSnapshot) -> bool:
-        power = hardware.power_transfer
+    def _grid_path_confirmed(self, hardware: HardwareSnapshot) -> bool:
+        status = self.power_transfer.status()
         return (
-            power.generator_selected is False
-            and power.house_on_generator is False
-            and power.grid_connected is True
-            and (
-                (
-                    power.grid_ready is True
-                    and power.house_on_grid is True
-                )
-                or (
-                    power.grid_ready is False
-                    and power.house_on_grid is False
-                )
-            )
+            status.actual_path == PowerPath.GRID
+            and not status.transition_in_progress
+            and hardware.power_transfer.generator_selected is False
+            and hardware.power_transfer.house_on_generator is False
         )
+
+    # ------------------------------------------------------------------
+    # Actions and journal.
+    # ------------------------------------------------------------------
 
     async def _execute_controller_actions(
         self,
@@ -646,7 +690,6 @@ class EnergySupervisorApp:
             )
             if not missing:
                 return
-
             now = time.monotonic()
             if now - last_log_at >= 30.0:
                 self.log.warning(
@@ -681,26 +724,50 @@ class EnergySupervisorApp:
                 exc,
             )
 
-    def _restore_supervisor(self) -> EnergySupervisor:
-        # Реальный primary ещё недоступен до подключения к HA. Для чтения
-        # журнала достаточно нейтрального bootstrap-конфига; перед первой
-        # командой он обязательно заменяется конфигурацией из HA.
-        config = self._supervisor_config(GeneratorSlot.A)
+    def _load_journal_for_restore(self) -> dict[str, Any] | None:
         try:
             saved = self.state_store.load()
             if saved is None:
-                return EnergySupervisor(config)
+                return None
+            if saved.get("journal_schema_version") != JOURNAL_SCHEMA_VERSION:
+                raise ValueError(
+                    "Неподдерживаемая версия журнала. Миграция v0.3 -> v0.4 "
+                    "намеренно не выполняется."
+                )
+            return saved
+        except Exception as exc:
+            self._restore_error = str(exc)
+            return None
 
-            journal_version = saved.get("journal_schema_version")
-            if type(journal_version) is not int or journal_version != 1:
-                raise ValueError("Неподдерживаемая версия общего журнала")
-            payload = saved.get("supervisor")
+    def _restore_generator_bus(self) -> GeneratorBusTracker:
+        if self._restored_journal is None:
+            return GeneratorBusTracker()
+        payload = self._restored_journal.get("generator_bus")
+        if not isinstance(payload, dict):
+            self._restore_error = "В журнале отсутствует generator_bus"
+            return GeneratorBusTracker()
+        try:
+            return GeneratorBusTracker.from_dict(payload)
+        except Exception as exc:
+            self._restore_error = f"generator_bus: {exc}"
+            return GeneratorBusTracker()
+
+    def _restore_supervisor(self) -> EnergySupervisor:
+        config = self._supervisor_config(GeneratorSlot.A)
+        if self._restore_error is not None:
+            supervisor = EnergySupervisor(config)
+            supervisor.require_recovery(
+                f"Не удалось прочитать сохранённый журнал: {self._restore_error}"
+            )
+            return supervisor
+        if self._restored_journal is None:
+            return EnergySupervisor(config)
+        try:
+            payload = self._restored_journal.get("supervisor")
             if not isinstance(payload, dict):
-                raise ValueError("В журнале отсутствует объект supervisor")
+                raise ValueError("В журнале отсутствует supervisor")
             supervisor = EnergySupervisor.from_dict(payload, config)
-
-            pending = saved.get("pending_actions", [])
-            if pending:
+            if self._restored_journal.get("pending_actions"):
                 supervisor.require_recovery(
                     "После restart обнаружены команды без подтверждения исполнения."
                 )
@@ -708,44 +775,31 @@ class EnergySupervisorApp:
         except Exception as exc:
             supervisor = EnergySupervisor(config)
             supervisor.require_recovery(
-                f"Не удалось прочитать сохранённый журнал: {exc}"
+                f"Не удалось прочитать состояние Supervisor: {exc}"
             )
             return supervisor
 
-    def _supervisor_config(
-        self,
-        primary_generator: GeneratorSlot,
-    ) -> SupervisorConfig:
+    def _supervisor_config(self, primary_generator: GeneratorSlot) -> SupervisorConfig:
         return SupervisorConfig(
             grid_failure_delay=float(self.options["grid_failure_delay"]),
-            grid_restore_stable_time=float(
-                self.options["grid_restore_stable_time"]
-            ),
+            grid_restore_stable_time=float(self.options["grid_restore_stable_time"]),
             primary_generator=primary_generator,
-            generator_a_enabled=_boolean_option(
-                self.options,
-                "generator_a_enabled",
-            ),
-            generator_b_enabled=_boolean_option(
-                self.options,
-                "generator_b_enabled",
-            ),
+            generator_a_enabled=_boolean_option(self.options, "generator_a_enabled"),
+            generator_b_enabled=_boolean_option(self.options, "generator_b_enabled"),
         )
 
     def _save_state(self, *, force: bool = False) -> None:
         payload = {
-            "journal_schema_version": 1,
+            "journal_schema_version": JOURNAL_SCHEMA_VERSION,
             "app_version": APP_VERSION,
             "supervisor": self.supervisor.to_dict(),
+            "generator_bus": self.generator_bus.to_dict(),
             "pending_actions": list(self._pending_action_records),
             "runtime_snapshot": {
-                "generator_a_phase": self.generator_controllers[
-                    GeneratorSlot.A
-                ].phase.value,
-                "generator_b_phase": self.generator_controllers[
-                    GeneratorSlot.B
-                ].phase.value,
+                "generator_a_phase": self.generator_controllers[GeneratorSlot.A].phase.value,
+                "generator_b_phase": self.generator_controllers[GeneratorSlot.B].phase.value,
                 "power_transfer_phase": self.power_transfer.phase.value,
+                "bus_owner": self.generator_bus.status().owner.value,
             },
         }
         signature = json.dumps(payload, ensure_ascii=False, sort_keys=True)
@@ -773,6 +827,10 @@ class EnergySupervisorApp:
         )
         return described
 
+    # ------------------------------------------------------------------
+    # Status sensor and human log.
+    # ------------------------------------------------------------------
+
     async def _publish_status(
         self,
         now: float,
@@ -781,7 +839,6 @@ class EnergySupervisorApp:
         payload = self._status_payload(now, observation)
         if payload == self._last_status_payload:
             return
-
         published = await self.adapter.publish_status(
             payload["state"],
             payload["attributes"],
@@ -795,23 +852,12 @@ class EnergySupervisorApp:
         observation: SupervisorObservation,
     ) -> dict[str, Any]:
         session = self.supervisor.session
-        slot = observation.power.actual_source.generator
-
+        bus = self.generator_bus.status()
+        slot = bus.owner_slot if observation.power.actual_source.is_generator else None
         if slot is None and session is not None:
             slot = session.generator
 
-        if slot is None:
-            external_slots = [
-                candidate
-                for candidate, status in observation.generators.items()
-                if status.externally_started
-            ]
-            if len(external_slots) == 1:
-                slot = external_slots[0]
-
-        generator_name = (
-            self.profiles[slot].display_name if slot is not None else None
-        )
+        generator_name = self.profiles[slot].display_name if slot is not None else None
         generator_model = self.profiles[slot].model if slot is not None else None
         primary_slot = self.supervisor.config.primary_generator
         primary_name = self.profiles[primary_slot].display_name
@@ -821,6 +867,11 @@ class EnergySupervisorApp:
             else "DISARMED — только наблюдение"
         )
 
+        owner_name = (
+            self.profiles[bus.owner_slot].display_name
+            if bus.owner_slot is not None
+            else bus.owner.value
+        )
         return {
             "state": state,
             "attributes": {
@@ -831,14 +882,19 @@ class EnergySupervisorApp:
                 "generator": generator_name,
                 "generator_model": generator_model,
                 "generator_slot": slot.value if slot is not None else None,
+                "bus_owner": owner_name,
+                "bus_owner_slot": (
+                    bus.owner_slot.value if bus.owner_slot is not None else None
+                ),
+                "generator_a_run_context": bus.run_contexts[GeneratorSlot.A].value,
+                "generator_b_run_context": bus.run_contexts[GeneratorSlot.B].value,
                 "primary_generator": primary_name,
                 "primary_generator_slot": primary_slot.value,
                 "remaining_seconds": self._remaining_seconds(now, observation),
-                "session_reason": (
-                    session.reason.value if session is not None else None
-                ),
+                "session_reason": session.reason.value if session is not None else None,
+                "fallback_used": session.fallback_used if session is not None else False,
                 "armed": self.armed,
-                "schema_version": 2,
+                "schema_version": 3,
             },
         }
 
@@ -847,10 +903,7 @@ class EnergySupervisorApp:
         now: float,
         observation: SupervisorObservation,
     ) -> int | None:
-        if (
-            observation.power.transition_in_progress
-            and self.power_transfer.deadline is not None
-        ):
+        if observation.power.transition_in_progress and self.power_transfer.deadline is not None:
             return _seconds_left(self.power_transfer.deadline - now)
 
         session = self.supervisor.session
@@ -864,32 +917,34 @@ class EnergySupervisorApp:
             and self.supervisor.grid_failed_since is not None
         ):
             elapsed = now - self.supervisor.grid_failed_since
-            return _seconds_left(
-                self.supervisor.config.grid_failure_delay - elapsed
-            )
+            return _seconds_left(self.supervisor.config.grid_failure_delay - elapsed)
 
         if (
-            self.supervisor.phase == SupervisorPhase.ON_GENERATOR
-            and session is not None
+            session is not None
             and session.grid_was_unavailable
             and observation.grid_ready is True
             and self.supervisor.grid_ready_since is not None
+            and self.supervisor.phase
+            in {SupervisorPhase.ON_GENERATOR, SupervisorPhase.ON_EXTERNAL_GENERATOR}
         ):
             elapsed = now - self.supervisor.grid_ready_since
             return _seconds_left(
                 self.supervisor.config.grid_restore_stable_time - elapsed
             )
-
         return None
 
     def _format_power(self, observation: SupervisorObservation) -> str:
         source = observation.power.actual_source
         if source == PowerSource.GRID:
             return "Grid"
-        if source == PowerSource.BATTERY:
-            return "Battery"
-        slot = source.generator
-        if slot is not None:
+        if source == PowerSource.UPS_ONLY:
+            return "UPS only"
+        if source == PowerSource.NO_POWER:
+            return "NO POWER"
+        if source.is_generator:
+            slot = self.generator_bus.status().owner_slot
+            if slot is None:
+                return "Generator Unknown"
             return f"Generator {self.profiles[slot].display_name}"
         return "Unknown"
 
@@ -901,25 +956,19 @@ class EnergySupervisorApp:
             return "connecting Grid"
         if phase == TransferPhase.RECOVERY_REQUIRED:
             return "recovery required"
-
         if phase not in {
             TransferPhase.SELECTING_GENERATOR,
             TransferPhase.DISCONNECTING_GENERATOR,
         }:
             return None
 
-        slot = observation.power.target_source.generator
+        slot = observation.power.target_source.generator if observation.power.target_source else None
         if slot is None:
-            slot = observation.power.actual_source.generator
+            slot = self.generator_bus.status().owner_slot
         if slot is None and self.supervisor.session is not None:
             slot = self.supervisor.session.generator
-
         name = self.profiles[slot].display_name if slot is not None else "generator"
-        action = (
-            "connecting"
-            if phase == TransferPhase.SELECTING_GENERATOR
-            else "disconnecting"
-        )
+        action = "connecting" if phase == TransferPhase.SELECTING_GENERATOR else "disconnecting"
         return f"{action} {name}"
 
     def _format_generator_state(
@@ -927,13 +976,20 @@ class EnergySupervisorApp:
         slot: GeneratorSlot,
         observation: SupervisorObservation,
     ) -> str:
-        phase = observation.generators[slot].phase
         if (
-            phase == GeneratorPhase.READY_FOR_LOAD
-            and observation.power.actual_source == PowerSource.for_generator(slot)
+            observation.power.actual_path == PowerPath.GENERATOR
+            and self.generator_bus.status().owner_slot == slot
         ):
             return "под нагрузкой"
-        return _GENERATOR_PHASE_TEXT[phase]
+        return _GENERATOR_PHASE_TEXT[observation.generators[slot].phase]
+
+    def _format_bus_owner(self) -> str:
+        owner = self.generator_bus.status().owner
+        if owner.slot is not None:
+            return self.profiles[owner.slot].display_name
+        if owner == GeneratorBusOwner.NONE:
+            return "none"
+        return "unknown"
 
     def _log_runtime_if_changed(self, observation: SupervisorObservation) -> None:
         status = (
@@ -942,10 +998,8 @@ class EnergySupervisorApp:
             else "DISARMED — только наблюдение"
         )
         grid = (
-            "ON"
-            if observation.grid_ready is True
-            else "OFF"
-            if observation.grid_ready is False
+            "ON" if observation.grid_ready is True
+            else "OFF" if observation.grid_ready is False
             else "UNKNOWN"
         )
         avr = "ON" if observation.automatic_transfer_enabled else "OFF"
@@ -954,16 +1008,11 @@ class EnergySupervisorApp:
         generator_a = self._format_generator_state(GeneratorSlot.A, observation)
         generator_b = self._format_generator_state(GeneratorSlot.B, observation)
         primary = self.profiles[self.supervisor.config.primary_generator].display_name
+        bus_owner = self._format_bus_owner()
 
         signature = (
-            status,
-            grid,
-            avr,
-            power,
-            transfer,
-            generator_a,
-            generator_b,
-            primary,
+            status, grid, avr, power, transfer,
+            generator_a, generator_b, primary, bus_owner,
         )
         if signature == self._last_runtime_signature:
             return
@@ -974,10 +1023,10 @@ class EnergySupervisorApp:
             f"Grid={grid}",
             f"AVR={avr}",
             f"power={power}",
+            f"bus={bus_owner}",
         ]
         if transfer is not None:
             parts.append(f"transfer={transfer}")
-
         parts.extend(
             [
                 f"{self.profiles[GeneratorSlot.A].display_name}: {generator_a}",
@@ -988,14 +1037,13 @@ class EnergySupervisorApp:
         self.log.info("%s.", "; ".join(parts))
 
     def _log_events(self, events: tuple[SupervisorEvent, ...]) -> None:
-        log_methods = {
+        methods = {
             "info": self.log.info,
             "warning": self.log.warning,
             "critical": self.log.critical,
         }
         for event in events:
-            log = log_methods.get(event.level, self.log.info)
-            log("%s", event.message)
+            methods.get(event.level, self.log.info)("%s", event.message)
 
     async def _stop_requested_within(self, seconds: float) -> bool:
         try:
