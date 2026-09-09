@@ -6,197 +6,78 @@ from generator_bus import (
 )
 
 
-def _running(a: bool, b: bool):
+def running(a: bool, b: bool):
     return {GeneratorSlot.A: a, GeneratorSlot.B: b}
 
 
-def test_one_running_generator_is_bus_owner():
+def test_fifo_owner_and_automatic_handoff():
     tracker = GeneratorBusTracker()
 
-    status = tracker.update(
-        _running(True, False),
-        grid_ready=True,
-        test_mode=False,
-        managed_slot=None,
-        managed_outage=False,
-    )
-
-    assert status.owner == GeneratorBusOwner.A
-
-
-def test_second_running_generator_does_not_take_bus():
-    tracker = GeneratorBusTracker()
-    tracker.update(
-        _running(True, False),
-        grid_ready=False,
-        test_mode=False,
-        managed_slot=GeneratorSlot.A,
-        managed_outage=True,
-    )
-
-    status = tracker.update(
-        _running(True, True),
-        grid_ready=False,
-        test_mode=False,
-        managed_slot=GeneratorSlot.A,
-        managed_outage=True,
-    )
-
-    assert status.owner == GeneratorBusOwner.A
-    assert status.run_contexts[GeneratorSlot.B] == GeneratorRunContext.EXTERNAL_OUTAGE
+    assert tracker.update(
+        running(True, False), grid_ready=False, test_mode=False
+    ).owner == GeneratorBusOwner.A
+    assert tracker.update(
+        running(True, True), grid_ready=False, test_mode=False
+    ).owner == GeneratorBusOwner.A
+    assert tracker.update(
+        running(False, True), grid_ready=False, test_mode=False
+    ).owner == GeneratorBusOwner.B
 
 
-def test_bus_moves_to_second_generator_after_first_stops():
-    tracker = GeneratorBusTracker()
-    tracker.update(
-        _running(True, False),
-        grid_ready=False,
-        test_mode=False,
-        managed_slot=GeneratorSlot.A,
-        managed_outage=True,
-    )
-    tracker.update(
-        _running(True, True),
-        grid_ready=False,
-        test_mode=False,
-        managed_slot=GeneratorSlot.A,
-        managed_outage=True,
-    )
-
-    status = tracker.update(
-        _running(False, True),
-        grid_ready=False,
-        test_mode=False,
-        managed_slot=GeneratorSlot.A,
-        managed_outage=True,
-    )
-
-    assert status.owner == GeneratorBusOwner.B
-
-
-def test_two_simultaneous_unknown_runs_do_not_guess_owner():
-    tracker = GeneratorBusTracker()
-
-    status = tracker.update(
-        _running(True, True),
-        grid_ready=False,
-        test_mode=False,
-        managed_slot=None,
-        managed_outage=False,
+def test_two_unknown_running_after_cold_start_do_not_guess_owner():
+    status = GeneratorBusTracker().update(
+        running(True, True), grid_ready=False, test_mode=False
     )
 
     assert status.owner == GeneratorBusOwner.UNKNOWN
-    assert status.run_contexts[GeneratorSlot.A] == GeneratorRunContext.UNKNOWN_EXTERNAL
-    assert status.run_contexts[GeneratorSlot.B] == GeneratorRunContext.UNKNOWN_EXTERNAL
+    assert status.run_contexts == {
+        GeneratorSlot.A: GeneratorRunContext.UNKNOWN,
+        GeneratorSlot.B: GeneratorRunContext.UNKNOWN,
+    }
 
 
-def test_test_mode_marks_only_new_run_as_test():
+def test_new_run_context_is_classified_once():
     tracker = GeneratorBusTracker()
-    tracker.update(
-        _running(False, False),
-        grid_ready=False,
-        test_mode=False,
-        managed_slot=None,
-        managed_outage=False,
-    )
+    tracker.update(running(False, False), grid_ready=False, test_mode=False)
 
-    status = tracker.update(
-        _running(True, False),
-        grid_ready=False,
-        test_mode=True,
-        managed_slot=None,
-        managed_outage=False,
-    )
+    status = tracker.update(running(True, False), grid_ready=False, test_mode=True)
     assert status.run_contexts[GeneratorSlot.A] == GeneratorRunContext.TEST_RUN
 
-    status = tracker.update(
-        _running(True, False),
-        grid_ready=False,
-        test_mode=False,
-        managed_slot=None,
-        managed_outage=False,
-    )
+    status = tracker.update(running(True, False), grid_ready=False, test_mode=False)
     assert status.run_contexts[GeneratorSlot.A] == GeneratorRunContext.TEST_RUN
 
 
-def test_external_run_started_during_outage_is_outage_related():
+def test_outage_run_is_marked_for_later_shutdown():
     tracker = GeneratorBusTracker()
-    tracker.update(
-        _running(False, False),
-        grid_ready=False,
-        test_mode=False,
-        managed_slot=None,
-        managed_outage=False,
-    )
+    tracker.update(running(False, False), grid_ready=False, test_mode=False)
+    status = tracker.update(running(False, True), grid_ready=False, test_mode=False)
 
-    status = tracker.update(
-        _running(False, True),
-        grid_ready=False,
-        test_mode=False,
-        managed_slot=None,
-        managed_outage=False,
-    )
-
-    assert status.run_contexts[GeneratorSlot.B] == GeneratorRunContext.EXTERNAL_OUTAGE
+    assert status.run_contexts[GeneratorSlot.B] == GeneratorRunContext.OUTAGE_RELATED
     assert status.outage_related_slots == frozenset({GeneratorSlot.B})
 
 
-def test_state_round_trip_preserves_owner_and_context():
+def test_restored_managed_outage_run_has_known_context():
     tracker = GeneratorBusTracker()
-    tracker.update(
-        _running(False, False),
-        grid_ready=False,
-        test_mode=False,
-        managed_slot=None,
-        managed_outage=False,
-    )
-    tracker.update(
-        _running(True, False),
+    status = tracker.update(
+        running(True, False),
         grid_ready=False,
         test_mode=False,
         managed_slot=GeneratorSlot.A,
         managed_outage=True,
     )
-    tracker.update(
-        _running(True, True),
-        grid_ready=False,
-        test_mode=False,
-        managed_slot=GeneratorSlot.A,
-        managed_outage=True,
-    )
+
+    assert status.run_contexts[GeneratorSlot.A] == GeneratorRunContext.OUTAGE_RELATED
+
+
+def test_state_round_trip_preserves_fifo_owner_and_contexts():
+    tracker = GeneratorBusTracker()
+    tracker.update(running(False, False), grid_ready=False, test_mode=False)
+    tracker.update(running(True, False), grid_ready=False, test_mode=False)
+    tracker.update(running(True, True), grid_ready=False, test_mode=False)
 
     restored = GeneratorBusTracker.from_dict(tracker.to_dict())
-    status = restored.status()
+    status = restored.update(running(True, True), grid_ready=False, test_mode=False)
 
     assert status.owner == GeneratorBusOwner.A
-    assert status.run_contexts[GeneratorSlot.A] == GeneratorRunContext.MANAGED_OUTAGE
-    assert status.run_contexts[GeneratorSlot.B] == GeneratorRunContext.EXTERNAL_OUTAGE
-
-
-def test_owner_persisted_through_restart_when_both_still_running():
-    tracker = GeneratorBusTracker()
-    tracker.update(
-        _running(True, False),
-        grid_ready=False,
-        test_mode=False,
-        managed_slot=GeneratorSlot.A,
-        managed_outage=True,
-    )
-    tracker.update(
-        _running(True, True),
-        grid_ready=False,
-        test_mode=False,
-        managed_slot=GeneratorSlot.A,
-        managed_outage=True,
-    )
-
-    restored = GeneratorBusTracker.from_dict(tracker.to_dict())
-    status = restored.update(
-        _running(True, True),
-        grid_ready=False,
-        test_mode=False,
-        managed_slot=GeneratorSlot.A,
-        managed_outage=True,
-    )
-
-    assert status.owner == GeneratorBusOwner.A
+    assert status.run_contexts[GeneratorSlot.A] == GeneratorRunContext.OUTAGE_RELATED
+    assert status.run_contexts[GeneratorSlot.B] == GeneratorRunContext.OUTAGE_RELATED
