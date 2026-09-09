@@ -1,7 +1,7 @@
-"""Общие контракты между уровнями Energy Supervisor.
+"""Общие доменные контракты EnergyATS.
 
-В этом файле нет алгоритмов и нет Home Assistant. Здесь собраны только
-небольшие перечисления и структуры данных, которыми обмениваются контроллеры.
+Здесь нет Home Assistant и нет алгоритмов управления оборудованием. Модуль
+описывает только термины, которыми обмениваются ES, TPC и GC.
 """
 
 from __future__ import annotations
@@ -18,12 +18,19 @@ class GeneratorSlot(str, Enum):
 
 
 class PowerSource(str, Enum):
-    """Фактический или желаемый источник питания дома."""
+    """Наблюдаемый источник/режим питания основной части дома.
+
+    ``UPS_ONLY`` — не отдельный физический ввод и не Battery contactor. Это
+    наблюдаемое состояние: основная часть дома не питается от Grid/Generator,
+    а UPS-линия может продолжать работу от МАП/АКБ.
+    """
 
     GRID = "grid"
-    BATTERY = "battery"
+    GENERATOR = "generator"
     GENERATOR_A = "generator_a"
     GENERATOR_B = "generator_b"
+    UPS_ONLY = "ups_only"
+    NO_POWER = "no_power"
     UNKNOWN = "unknown"
 
     @classmethod
@@ -38,18 +45,24 @@ class PowerSource(str, Enum):
             return GeneratorSlot.B
         return None
 
+    @property
+    def is_generator(self) -> bool:
+        return self in {
+            PowerSource.GENERATOR,
+            PowerSource.GENERATOR_A,
+            PowerSource.GENERATOR_B,
+        }
+
 
 class PowerPath(str, Enum):
-    """Подтверждённое физическое положение силового переключателя.
+    """Подтверждённое положение основных контакторов дома.
 
-    Источник и путь намеренно разделены. При пропавшей Grid дом питается от
-    аккумуляторов МАП, хотя ввод Grid может оставаться подключённым. И наоборот,
-    Battery path означает намеренно отключённый ввод Grid независимо от того,
-    присутствует ли напряжение перед контактором.
+    ``ISOLATED`` означает: генераторная ветвь не выбрана, а Grid запрещена
+    ``switch.grid_power``. Никакого отдельного Battery path физически нет.
     """
 
     GRID = "grid_path"
-    BATTERY = "battery_path"
+    ISOLATED = "isolated"
     GENERATOR = "generator_path"
     UNKNOWN = "unknown"
 
@@ -57,9 +70,9 @@ class PowerPath(str, Enum):
     def for_source(cls, source: PowerSource) -> "PowerPath":
         if source == PowerSource.GRID:
             return cls.GRID
-        if source == PowerSource.BATTERY:
-            return cls.BATTERY
-        if source.generator is not None:
+        if source in {PowerSource.UPS_ONLY, PowerSource.NO_POWER}:
+            return cls.ISOLATED
+        if source.is_generator:
             return cls.GENERATOR
         return cls.UNKNOWN
 
@@ -81,9 +94,8 @@ class TransactionStatus(str, Enum):
 class Transaction:
     """Сохраняемая запись о незавершённой физической операции.
 
-    Это не database transaction с rollback. Поле ``last_confirmed_step``
-    позволяет после restart понять, какое физическое действие уже было
-    подтверждено обратной связью, и не повторять команды вслепую.
+    Это не database transaction с rollback. ``last_confirmed_step`` нужен,
+    чтобы после restart не повторять физические команды вслепую.
     """
 
     transaction_id: str
@@ -116,7 +128,6 @@ class Transaction:
         self.updated_at = now
 
     def note(self, now: float, message: str) -> None:
-        """Добавить пояснение, не меняя состояние незавершённой операции."""
         self.updated_at = now
         self.message = message
 
