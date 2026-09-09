@@ -9,7 +9,12 @@ from types import SimpleNamespace
 from domain import GeneratorSlot, PowerPath, PowerSource
 from energy_supervisor import SupervisorObservation
 from generator_bus import GeneratorBusTracker
-from generator_controller import GeneratorPhase, GeneratorStatus, default_generator_profiles
+from generator_controller import (
+    GeneratorController,
+    GeneratorPhase,
+    GeneratorStatus,
+    default_generator_profiles,
+)
 from main import EnergySupervisorApp
 from power_transfer import PowerTransferStatus, TransferPhase
 
@@ -23,10 +28,7 @@ def generator_status(slot: GeneratorSlot, phase: GeneratorPhase) -> GeneratorSta
         running=running,
         remote_on=running,
         ready_for_load=phase == GeneratorPhase.READY_FOR_LOAD,
-        externally_started=phase == GeneratorPhase.EXTERNAL_RUNNING,
         fault=None,
-        start_temperature=None,
-        start_temperature_source=None,
     )
 
 
@@ -35,7 +37,7 @@ def observation(
     grid_ready=True,
     source=PowerSource.GRID,
     path=PowerPath.GRID,
-    phase=TransferPhase.STABLE_GRID_PATH,
+    phase=TransferPhase.STABLE_GRID,
     target=PowerSource.GRID,
     a_phase=GeneratorPhase.IDLE,
     b_phase=GeneratorPhase.IDLE,
@@ -68,9 +70,16 @@ def observation(
 def app_for_log() -> EnergySupervisorApp:
     app = object.__new__(EnergySupervisorApp)
     profiles = default_generator_profiles()
-    profiles[GeneratorSlot.A] = replace(profiles[GeneratorSlot.A], display_name="Elemax")
-    profiles[GeneratorSlot.B] = replace(profiles[GeneratorSlot.B], display_name="Вепрь")
-    app.profiles = profiles
+    profiles[GeneratorSlot.A] = replace(
+        profiles[GeneratorSlot.A], display_name="Elemax"
+    )
+    profiles[GeneratorSlot.B] = replace(
+        profiles[GeneratorSlot.B], display_name="Вепрь"
+    )
+    app.generator_controllers = {
+        slot: GeneratorController(profile)
+        for slot, profile in profiles.items()
+    }
     app.armed = True
     app._last_runtime_signature = None
     app.log = logging.getLogger("test_runtime_log")
@@ -122,10 +131,10 @@ def test_generator_owner_is_named_and_reported_under_load(caplog):
     app.supervisor.status_text = lambda _observation: "Питание от генератора"
     obs = observation(
         grid_ready=False,
-        source=PowerSource.GENERATOR_A,
+        source=PowerSource.GENERATOR,
         path=PowerPath.GENERATOR,
         phase=TransferPhase.STABLE_GENERATOR,
-        target=PowerSource.GENERATOR_A,
+        target=PowerSource.GENERATOR,
         a_phase=GeneratorPhase.READY_FOR_LOAD,
     )
     with caplog.at_level(logging.INFO, logger="test_runtime_log"):
