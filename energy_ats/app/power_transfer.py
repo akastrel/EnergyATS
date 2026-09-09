@@ -1,16 +1,13 @@
 """Подтверждаемое управление основными контакторами Сеть / Генератор.
 
-TPC моделирует только реально существующую силовую схему:
+TPC знает только реально существующую силовую схему:
 
 * ``switch.grid_power`` — разрешение сетевой ветви;
 * ``switch.use_generator_as_power_source`` — выбор Сеть / генераторная шина.
 
-Отдельного Battery contactor и Battery path нет. Когда основная часть дома
-изолирована от Grid/Generator, UPS-линия может продолжать работу от МАП/АКБ;
-это наблюдаемое состояние ``PowerSource.UPS_ONLY``.
-
-Выбор конкретного Generator A/B на общей генераторной шине TPC не выполняет —
-его делает аппаратная схема генераторных контакторов.
+Какой именно Generator A/B владеет общей генераторной шиной, TPC не знает и
+не должен знать. Это отдельная наблюдаемая модель ``GeneratorBusTracker``.
+Отдельного Battery contactor или Battery path в системе нет.
 """
 
 from __future__ import annotations
@@ -18,15 +15,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
-from domain import GeneratorSlot, PowerPath, PowerSource, Transaction
+from domain import PowerPath, PowerSource
 
 
 class TransferPhase(str, Enum):
     WAITING_FOR_DATA = "waiting_for_data"
-    STABLE_GRID_PATH = "stable_grid_path"
+    STABLE_GRID = "stable_grid"
     STABLE_ISOLATED = "stable_isolated"
-    # Временный enum-alias облегчает переход старых диагностических клиентов.
-    STABLE_BATTERY_PATH = "stable_isolated"
     STABLE_GENERATOR = "stable_generator"
     DISCONNECTING_GRID = "disconnecting_grid"
     SELECTING_GENERATOR = "selecting_generator"
@@ -55,13 +50,10 @@ class PowerTransferObservation:
     house_on_generator: bool | None
     grid_connected: bool | None
     generator_selected: bool | None
-    active_generator: GeneratorSlot | None
     emergency_stop: bool | None
 
     @property
     def required_states_known(self) -> bool:
-        # active_generator может быть None в полностью валидной ситуации:
-        # генераторы остановлены либо оба RUNNING, но owner логически неизвестен.
         return all(
             value is not None
             for value in (
@@ -91,8 +83,6 @@ class PowerTransferStatus:
     recovery_required: bool
     fault: str | None
     failed_phase: TransferPhase | None = None
-    last_confirmed_source: PowerSource = PowerSource.UNKNOWN
-    last_confirmed_path: PowerPath = PowerPath.UNKNOWN
 
 
 class PowerTransferController:
@@ -114,12 +104,8 @@ class PowerTransferController:
         self.deadline: float | None = None
         self.feedback_lost_since: float | None = None
         self.fault: str | None = None
-        self.transaction: Transaction | None = None
-        self.commanded_generator: GeneratorSlot | None = None
-        self.initialized = False
         self.failed_phase: TransferPhase | None = None
-        self.last_confirmed_source = PowerSource.UNKNOWN
-        self.last_confirmed_path = PowerPath.UNKNOWN
+        self.initialized = False
 
     @property
     def transition_in_progress(self) -> bool:
@@ -135,18 +121,14 @@ class PowerTransferController:
             recovery_required=self.phase == TransferPhase.RECOVERY_REQUIRED,
             fault=self.fault,
             failed_phase=self.failed_phase,
-            last_confirmed_source=self.last_confirmed_source,
-            last_confirmed_path=self.last_confirmed_path,
         )
 
-    def mark_interrupted(self, now: float, reason: str) -> None:
-        if self.transaction is not None and self.transition_in_progress:
-            self.transaction.interrupt(now, reason)
-            self.transaction.require_recovery(now, reason)
+    def mark_interrupted(self, _now: float, reason: str) -> None:
+        if self.transition_in_progress:
             self._require_recovery(reason)
 
     # ------------------------------------------------------------------
-    # Recovery: единственное разрешённое направление — к сетевой стороне.
+    # Recovery: только к безопасной сетевой стороне.
     # ------------------------------------------------------------------
 
     def begin_recovery_to_grid_path(self) -> None:
@@ -158,8 +140,6 @@ class PowerTransferController:
         self.feedback_lost_since = None
         self.fault = None
         self.failed_phase = None
-        self.commanded_generator = None
-        self.transaction = None
         self.initialized = True
 
     def recovery_blocker(self, observation: PowerTransferObservation) -> str | None:
@@ -195,8 +175,7 @@ class PowerTransferController:
             ):
                 return [], None
             if observation.grid_connected is True:
-                self.phase = TransferPhase.CONNECTING_GRID
-                self.deadline = now + self.confirmation_timeout
+                self._begin_wait_for_grid_confirmation(now)
                 return [], None
             return self._begin_connect_grid(now), None
 
@@ -211,7 +190,6 @@ class PowerTransferController:
             topology = self._infer_stable_topology(observation)
             if topology is not None and topology.path == PowerPath.GRID:
                 self._set_stable(topology)
-                return [], None
             return [], None
 
         topology = self._infer_stable_topology(observation)
@@ -226,8 +204,7 @@ class PowerTransferController:
             return self._begin_deselect_generator(now, PowerSource.GRID), None
 
         if observation.grid_connected is True:
-            self.phase = TransferPhase.CONNECTING_GRID
-            self.deadline = now + self.confirmation_timeout
+            self._begin_wait_for_grid_confirmation(now)
             return [], None
 
         return self._begin_connect_grid(now), None
@@ -240,7 +217,6 @@ class PowerTransferController:
         self.target_source = topology.source
         self.fault = None
         self.failed_phase = None
-        self.transaction = None
         self.initialized = True
         return True
 
@@ -319,13 +295,8 @@ class PowerTransferController:
         self.feedback_lost_since = None
         self._set_stable(topology)
 
-        # HOLD: внешнее безопасное положение принимается как физический факт.
-        if desired_source is None:
+        if desired_source is None or not actions_allowed:
             return []
-
-        if not actions_allowed:
-            return []
-
         return self._start_towards_target(
             now,
             observation,
@@ -343,25 +314,20 @@ class PowerTransferController:
         if desired_source == PowerSource.UNKNOWN:
             return []
 
-        if desired_source.is_generator:
+        if desired_source == PowerSource.GENERATOR:
             if observation.emergency_stop is True or not desired_generator_ready:
                 return []
-            if self.actual_path == PowerPath.GENERATOR:
-                # TPC не решает, A или B сейчас владеет общей шиной.
-                self.actual_source = self._generator_source(observation)
-                if observation.grid_connected is True:
-                    return self._begin_disconnect_grid(now, desired_source)
-                return []
             if self.actual_path == PowerPath.GRID:
-                return self._begin_disconnect_grid(now, desired_source)
+                return self._begin_disconnect_grid(now, PowerSource.GENERATOR)
             if self.actual_path == PowerPath.ISOLATED:
-                return self._begin_select_generator(now, desired_source)
+                return self._begin_select_generator(now)
+            if self.actual_path == PowerPath.GENERATOR:
+                if observation.grid_connected is True:
+                    return self._begin_disconnect_grid(now, PowerSource.GENERATOR)
+                return []
             return []
 
         if desired_source in {PowerSource.UPS_ONLY, PowerSource.NO_POWER}:
-            if self.actual_path == PowerPath.ISOLATED:
-                self.actual_source = PowerSource.UPS_ONLY
-                return []
             if self.actual_path == PowerPath.GRID:
                 return self._begin_disconnect_grid(now, PowerSource.UPS_ONLY)
             if self.actual_path == PowerPath.GENERATOR:
@@ -369,13 +335,10 @@ class PowerTransferController:
             return []
 
         if desired_source == PowerSource.GRID:
-            if self.actual_path == PowerPath.GRID:
-                return []
-            if self.actual_path == PowerPath.ISOLATED:
-                return self._begin_connect_grid(now)
             if self.actual_path == PowerPath.GENERATOR:
                 return self._begin_deselect_generator(now, PowerSource.GRID)
-
+            if self.actual_path == PowerPath.ISOLATED:
+                return self._begin_connect_grid(now)
         return []
 
     def _continue_transition(
@@ -396,14 +359,13 @@ class PowerTransferController:
                 or observation.house_on_grid is not False
             ):
                 return []
-            if target.is_generator:
+            if target == PowerSource.GENERATOR:
                 if not desired_generator_ready:
                     return []
-                return self._begin_select_generator(now, target)
+                return self._begin_select_generator(now)
             if target in {PowerSource.UPS_ONLY, PowerSource.NO_POWER}:
-                self._complete_transition(
-                    now,
-                    PowerTopology(PowerPath.ISOLATED, PowerSource.UPS_ONLY),
+                self._set_stable(
+                    PowerTopology(PowerPath.ISOLATED, PowerSource.UPS_ONLY)
                 )
                 return []
             if target == PowerSource.GRID:
@@ -411,19 +373,20 @@ class PowerTransferController:
             return []
 
         if self.phase == TransferPhase.SELECTING_GENERATOR:
-            if observation.grid_connected is not False or observation.house_on_grid is not False:
-                self._require_recovery("Grid появилась во время подключения генераторной ветви.")
+            if (
+                observation.grid_connected is not False
+                or observation.house_on_grid is not False
+            ):
+                self._require_recovery(
+                    "Grid появилась во время подключения генераторной ветви."
+                )
                 return []
             if (
                 observation.generator_selected is True
                 and observation.house_on_generator is True
             ):
-                self._complete_transition(
-                    now,
-                    PowerTopology(
-                        PowerPath.GENERATOR,
-                        self._generator_source(observation),
-                    ),
+                self._set_stable(
+                    PowerTopology(PowerPath.GENERATOR, PowerSource.GENERATOR)
                 )
             return []
 
@@ -435,18 +398,15 @@ class PowerTransferController:
                 return []
             if target == PowerSource.GRID:
                 if observation.grid_connected is True:
-                    self.phase = TransferPhase.CONNECTING_GRID
-                    self.deadline = now + self.confirmation_timeout
+                    self._begin_wait_for_grid_confirmation(now)
                     return []
                 return self._begin_connect_grid(now)
             if target in {PowerSource.UPS_ONLY, PowerSource.NO_POWER}:
                 if observation.grid_connected is True:
                     return self._begin_disconnect_grid(now, PowerSource.UPS_ONLY)
-                self._complete_transition(
-                    now,
-                    PowerTopology(PowerPath.ISOLATED, PowerSource.UPS_ONLY),
+                self._set_stable(
+                    PowerTopology(PowerPath.ISOLATED, PowerSource.UPS_ONLY)
                 )
-                return []
             return []
 
         if self.phase == TransferPhase.CONNECTING_GRID:
@@ -454,11 +414,13 @@ class PowerTransferController:
                 observation.generator_selected is not False
                 or observation.house_on_generator is not False
             ):
-                self._require_recovery("Генераторная ветвь появилась при подключении Grid.")
+                self._require_recovery(
+                    "Генераторная ветвь появилась при подключении Grid."
+                )
                 return []
             topology = self._infer_stable_topology(observation)
             if topology is not None and topology.path == PowerPath.GRID:
-                self._complete_transition(now, topology)
+                self._set_stable(topology)
             return []
 
         return []
@@ -475,9 +437,6 @@ class PowerTransferController:
         self.phase = TransferPhase.DISCONNECTING_GRID
         self.target_source = target
         self.deadline = now + self.confirmation_timeout
-        self.transaction = Transaction.begin(
-            "power_transfer", target.value, now, "disconnect_grid"
-        )
         return [
             TransferAction(
                 TransferActionKind.DISCONNECT_GRID,
@@ -485,21 +444,10 @@ class PowerTransferController:
             )
         ]
 
-    def _begin_select_generator(
-        self,
-        now: float,
-        target: PowerSource,
-    ) -> list[TransferAction]:
+    def _begin_select_generator(self, now: float) -> list[TransferAction]:
         self.phase = TransferPhase.SELECTING_GENERATOR
-        self.target_source = target
-        self.commanded_generator = target.generator
+        self.target_source = PowerSource.GENERATOR
         self.deadline = now + self.confirmation_timeout
-        if self.transaction is None:
-            self.transaction = Transaction.begin(
-                "power_transfer", target.value, now, "select_generator"
-            )
-        else:
-            self.transaction.advance("select_generator", now, confirmed="grid_isolated")
         return [
             TransferAction(
                 TransferActionKind.SELECT_GENERATOR,
@@ -515,9 +463,6 @@ class PowerTransferController:
         self.phase = TransferPhase.DISCONNECTING_GENERATOR
         self.target_source = target
         self.deadline = now + self.confirmation_timeout
-        self.transaction = Transaction.begin(
-            "power_transfer", target.value, now, "deselect_generator"
-        )
         return [
             TransferAction(
                 TransferActionKind.DESELECT_GENERATOR,
@@ -526,17 +471,7 @@ class PowerTransferController:
         ]
 
     def _begin_connect_grid(self, now: float) -> list[TransferAction]:
-        self.phase = TransferPhase.CONNECTING_GRID
-        self.target_source = PowerSource.GRID
-        self.deadline = now + self.confirmation_timeout
-        if self.transaction is None:
-            self.transaction = Transaction.begin(
-                "power_transfer", PowerSource.GRID.value, now, "connect_grid"
-            )
-        else:
-            self.transaction.advance(
-                "connect_grid", now, confirmed="generator_disconnected"
-            )
+        self._begin_wait_for_grid_confirmation(now)
         return [
             TransferAction(
                 TransferActionKind.CONNECT_GRID,
@@ -544,8 +479,13 @@ class PowerTransferController:
             )
         ]
 
+    def _begin_wait_for_grid_confirmation(self, now: float) -> None:
+        self.phase = TransferPhase.CONNECTING_GRID
+        self.target_source = PowerSource.GRID
+        self.deadline = now + self.confirmation_timeout
+
     # ------------------------------------------------------------------
-    # Физическая интерпретация обратных связей.
+    # Интерпретация физических обратных связей.
     # ------------------------------------------------------------------
 
     def _infer_stable_topology(
@@ -560,12 +500,8 @@ class PowerTransferController:
                 return None
             if observation.house_on_generator is not True:
                 return None
-            return PowerTopology(
-                PowerPath.GENERATOR,
-                self._generator_source(observation),
-            )
+            return PowerTopology(PowerPath.GENERATOR, PowerSource.GENERATOR)
 
-        # Основной selector в сторону Сети.
         if observation.house_on_generator is True:
             return None
 
@@ -573,27 +509,15 @@ class PowerTransferController:
             if observation.grid_ready is True and observation.house_on_grid is True:
                 return PowerTopology(PowerPath.GRID, PowerSource.GRID)
             if observation.grid_ready is False and observation.house_on_grid is False:
-                # Grid path разрешён, но физической сети нет; обычная часть дома
-                # без питания, UPS-линия автоматически работает от МАП/АКБ.
                 return PowerTopology(PowerPath.GRID, PowerSource.UPS_ONLY)
             return None
 
-        # Grid намеренно запрещена.
         if observation.house_on_grid is not False:
             return None
         return PowerTopology(PowerPath.ISOLATED, PowerSource.UPS_ONLY)
 
     @staticmethod
-    def _generator_source(observation: PowerTransferObservation) -> PowerSource:
-        if observation.active_generator is None:
-            return PowerSource.GENERATOR
-        return PowerSource.for_generator(observation.active_generator)
-
-    @staticmethod
     def _unsafe_overlap(observation: PowerTransferObservation) -> bool:
-        # Подтверждающие датчики стоят в управляющих цепях. Аппаратный interlock
-        # должен исключать overlap; одновременное подтверждение считается
-        # противоречием схемы/датчиков.
         return (
             observation.house_on_grid is True
             and observation.house_on_generator is True
@@ -602,25 +526,16 @@ class PowerTransferController:
     def _set_stable(self, topology: PowerTopology) -> None:
         self.actual_path = topology.path
         self.actual_source = topology.source
-        self.last_confirmed_path = topology.path
-        self.last_confirmed_source = topology.source
         self.deadline = None
         self.feedback_lost_since = None
-        self.transaction = None
-        self.commanded_generator = topology.source.generator
         if topology.path == PowerPath.GRID:
-            self.phase = TransferPhase.STABLE_GRID_PATH
+            self.phase = TransferPhase.STABLE_GRID
         elif topology.path == PowerPath.ISOLATED:
             self.phase = TransferPhase.STABLE_ISOLATED
         elif topology.path == PowerPath.GENERATOR:
             self.phase = TransferPhase.STABLE_GENERATOR
         else:
             self.phase = TransferPhase.WAITING_FOR_DATA
-
-    def _complete_transition(self, now: float, topology: PowerTopology) -> None:
-        if self.transaction is not None:
-            self.transaction.complete(now, "Физический переход подтверждён.")
-        self._set_stable(topology)
 
     def _require_recovery(self, reason: str) -> None:
         if self.phase != TransferPhase.RECOVERY_REQUIRED:
@@ -631,11 +546,6 @@ class PowerTransferController:
         self.deadline = None
         self.feedback_lost_since = None
         self.fault = reason
-        if self.transaction is not None:
-            self.transaction.require_recovery(
-                self.transaction.updated_at,
-                reason,
-            )
 
     def _deadline_reached(self, now: float) -> bool:
         return self.deadline is not None and now >= self.deadline
