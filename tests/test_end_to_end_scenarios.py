@@ -265,7 +265,7 @@ async def test_managed_a_dies_external_b_takes_bus_without_becoming_managed(tmp_
     assert app.generator_bus.status().owner_slot == GeneratorSlot.A
     assert (
         app.generator_bus.status().run_contexts[GeneratorSlot.B]
-        == GeneratorRunContext.EXTERNAL_OUTAGE
+        == GeneratorRunContext.OUTAGE_RELATED
     )
 
     fake.calls.clear()
@@ -305,11 +305,11 @@ async def test_stable_grid_returns_house_and_stops_all_outage_related_generators
 
     assert (
         app.generator_bus.status().run_contexts[GeneratorSlot.A]
-        == GeneratorRunContext.MANAGED_OUTAGE
+        == GeneratorRunContext.OUTAGE_RELATED
     )
     assert (
         app.generator_bus.status().run_contexts[GeneratorSlot.B]
-        == GeneratorRunContext.EXTERNAL_OUTAGE
+        == GeneratorRunContext.OUTAGE_RELATED
     )
 
     fake.calls.clear()
