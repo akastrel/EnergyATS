@@ -398,6 +398,13 @@ class EnergySupervisor:
         other_status = o.generators[other]
         self.desired_generators[failed] = False
 
+        # Fallback в одной managed-сессии разрешён только один раз. После отказа
+        # SECONDARY автоматика не возвращается к PRIMARY, даже если его REMOTE
+        # остался включён после предыдущей неудачной попытки.
+        if self.session.fallback_used:
+            self._require_recovery(f"Отказ SECONDARY после fallback: {reason}")
+            return
+
         if other_status.running is True or other_status.remote_on is True:
             self.desired_source = PowerSource.GENERATOR
             self.phase = SupervisorPhase.ON_GENERATOR
@@ -408,9 +415,6 @@ class EnergySupervisor:
             )
             return
 
-        if self.session.fallback_used:
-            self._require_recovery(f"Отказ SECONDARY после fallback: {reason}")
-            return
         if not self.config.generator_enabled(other) or _generator_failed(other_status):
             self._require_recovery(
                 f"Отказ {o.generators[failed].display_name}; SECONDARY недоступен."
@@ -516,28 +520,31 @@ class EnergySupervisor:
 
         slot = self.config.primary_generator
         status = o.generators[slot]
-        fallback_used = False
-        if not self.config.generator_enabled(slot) or _generator_failed(status):
-            other = _other_slot(slot)
-            other_status = o.generators[other]
-            if (
-                self.config.generator_enabled(other)
-                and not _generator_failed(other_status)
-                and other_status.running is not True
-                and other_status.remote_on is not True
-            ):
-                slot = other
-                fallback_used = True
-            else:
-                self._event("warning", "Нет доступного генератора для новой сессии.")
-                return
+
+        # Новая сессия всегда начинается с выбранного PRIMARY. Автоматически
+        # подменять запрещённый/уже неисправный PRIMARY на SECONDARY до попытки
+        # запуска требования 0.4 не разрешают; fallback существует только внутри
+        # уже начатой managed-сессии после фактического отказа PRIMARY.
+        if not self.config.generator_enabled(slot):
+            self._event(
+                "warning",
+                f"PRIMARY {status.display_name} запрещён политикой EnergyATS; "
+                "managed-сессия не создана.",
+            )
+            return
+        if _generator_failed(status):
+            self._event(
+                "warning",
+                f"PRIMARY {status.display_name} находится в fault; "
+                "managed-сессия не создана.",
+            )
+            return
 
         self.session = GeneratorSession.begin(
             reason,
             slot,
             grid_was_unavailable=o.grid_ready is False,
         )
-        self.session.fallback_used = fallback_used
         self.desired_generators = {
             GeneratorSlot.A: slot == GeneratorSlot.A,
             GeneratorSlot.B: slot == GeneratorSlot.B,
