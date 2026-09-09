@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import pytest
 
+from domain import GeneratorSlot, SessionReason
+from energy_supervisor import GeneratorSession, SupervisorPhase
 from ha_adapter import ENTITIES, ENERGY_ATS_STATUS_ENTITY
 from main import DEFAULT_OPTIONS, EnergySupervisorApp, _seconds_left
 
@@ -113,6 +115,20 @@ async def test_status_publication_is_deduplicated(tmp_path):
     assert entity_id == ENERGY_ATS_STATUS_ENTITY
     assert state == "Питание от основной сети"
     assert attributes["source"] == "grid"
+
+
+def test_grid_restore_remaining_time_uses_only_current_supervisor_phase(tmp_path):
+    app, _ = app_with_fake(tmp_path)
+    observation = normal_observation(app, 100.0)
+    app.supervisor.session = GeneratorSession.begin(
+        SessionReason.GRID_OUTAGE,
+        GeneratorSlot.A,
+        grid_was_unavailable=True,
+    )
+    app.supervisor.phase = SupervisorPhase.ON_GENERATOR
+    app.supervisor.grid_ready_since = 90.0
+
+    assert app._remaining_seconds(100.0, observation) == 50
 
 
 def test_seconds_left_rounds_up_and_never_negative():
