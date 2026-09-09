@@ -6,6 +6,7 @@ from domain import GeneratorSlot, SessionReason
 from energy_supervisor import GeneratorSession, SupervisorPhase
 from ha_adapter import ENTITIES, ENERGY_ATS_STATUS_ENTITY
 from main import DEFAULT_OPTIONS, EnergySupervisorApp, _seconds_left
+from state_store import StateStore
 
 
 class StatusFakeClient:
@@ -129,6 +130,24 @@ def test_grid_restore_remaining_time_uses_only_current_supervisor_phase(tmp_path
     app.supervisor.grid_ready_since = 90.0
 
     assert app._remaining_seconds(100.0, observation) == 50
+
+
+def test_corrupted_generator_bus_journal_requires_recovery(tmp_path):
+    state_file = tmp_path / "state.json"
+    app = EnergySupervisorApp(
+        {**DEFAULT_OPTIONS, "state_file": str(state_file)},
+        token="test",
+    )
+    app._save_state(force=True)
+    payload = StateStore(state_file).load()
+    payload["generator_bus"] = {"owner": "impossible"}
+    StateStore(state_file).save(payload)
+
+    restored = EnergySupervisorApp(
+        {**DEFAULT_OPTIONS, "state_file": str(state_file)},
+        token="test",
+    )
+    assert restored.supervisor.phase == SupervisorPhase.RECOVERY_REQUIRED
 
 
 def test_seconds_left_rounds_up_and_never_negative():
