@@ -1,314 +1,285 @@
 # Energy ATS 0.4.0 — архитектура
 
-## 1. Граница документа
+## 1. Источники истины
 
-Архитектура реализует два более фундаментальных документа:
+Архитектура реализует два документа более высокого уровня:
 
-- `PHYSICAL_POWER_TOPOLOGY_RU.md` — реальная электрическая схема;
-- `REQUIREMENTS_RU.md` — требуемое поведение EnergyATS.
+1. `PHYSICAL_POWER_TOPOLOGY_RU.md` — что физически существует и как ведёт себя железо;
+2. `REQUIREMENTS_RU.md` — как при этой физической схеме должен вести себя EnergyATS.
 
-Архитектура не должна придумывать отсутствующие физические устройства и не является источником требований.
+Этот документ описывает только способ реализации требований. Он не вводит новые физические устройства и не расширяет разрешённые сценарии.
 
-## 2. Один процесс, несколько независимых обязанностей
+## 2. Разделение ответственности
 
-EnergyATS — один Home Assistant App и один Python-процесс.
+EnergyATS — один Home Assistant App и один Python-процесс, но управляющая логика разделена на небольшие независимые части.
 
 | Модуль | Ответственность |
 |---|---|
-| `energy_supervisor.py` | Policy: outage, managed-session, fallback, возврат Grid, recovery |
-| `power_transfer.py` | Основные контакторы Grid / Generator, break-before-make и подтверждения |
-| `generator_controller.py` | Жизненный цикл одного двигателя: REMOTE, choke, запуск, прогрев, cooldown, stop |
-| `generator_bus.py` | Наблюдаемый owner общей генераторной шины и происхождение текущих запусков |
-| `ha_adapter.py` | Преобразование HA states в доменные observations и исполнение service calls |
-| `main.py` | Composition root, единый tick, persistent journal, status/log |
-| `state_store.py` | Атомарное сохранение состояния App |
+| `domain.py` | Общие термины: A/B, `PowerSource`, `PowerPath`, причина managed-сессии |
+| `generator_bus.py` | FIFO-owner общей генераторной шины и контекст непрерывных RUNNING |
+| `generator_controller.py` | Жизненный цикл одного двигателя: choke, REMOTE, запуск, прогрев, cooldown, stop |
+| `power_transfer.py` | Основные контакторы Grid / Generator и break-before-make |
+| `energy_supervisor.py` | Policy: outage, managed-сессия, fallback, возврат Grid, recovery |
+| `ha_adapter.py` | HA states -> observations и разрешённые HA service calls |
+| `main.py` | Composition root: единый tick, orchestration, journal, status и log |
+| `state_store.py` | Атомарное сохранение persistent state |
 | `ha_client.py` | WebSocket/REST transport Home Assistant |
 
-Доменные контроллеры не используют HA entities как внутреннюю шину сообщений.
+Главное правило границ: **Supervisor решает, что требуется; GC и TPC решают, как безопасно выполнить уже разрешённую операцию; HA Adapter только связывает доменную модель с реальными entities.**
 
-## 3. Модель питания 0.4
+## 3. Доменные термины питания
 
-### 3.1. Основные контакторы дома
+### `PowerSource`
 
-TPC управляет только реальными управляющими сигналами:
+Фактически наблюдаемый режим питания дома:
 
-```text
-switch.grid_power
-switch.use_generator_as_power_source
-```
+- `GRID` — дом питается от основной сети;
+- `GENERATOR` — дом подключён к общей генераторной шине;
+- `UPS_ONLY` — обычная шина дома не получает внешний источник, но UPS-линия может работать от MAP;
+- `NO_POWER` — питание отсутствует;
+- `UNKNOWN` — состояние нельзя безопасно определить.
 
-`grid_power` — разрешение сетевой ветви. `use_generator_as_power_source` — выбор основных контакторов в сторону генераторной шины.
+В 0.4 нет `BATTERY`, `GENERATOR_A` или `GENERATOR_B` как отдельных силовых источников.
 
-Основные контакторы аппаратно взаимно заблокированы.
+### `PowerPath`
 
-### 3.2. Нет Battery path
+Подтверждённое положение основной пары контакторов:
 
-МАП самостоятельно переходит на АКБ при исчезновении входного AC.
+- `GRID`;
+- `ISOLATED`;
+- `GENERATOR`;
+- `UNKNOWN`.
 
-Поэтому в доменной модели нет `Battery contactor` и нет `PowerPath.BATTERY`.
-
-Когда основная часть дома не получает Grid/Generator, EnergyATS использует наблюдаемое состояние:
-
-```text
-PowerSource.UPS_ONLY
-```
-
-Это описание пользовательского режима, а не команда на МАП.
-
-### 3.3. Генераторная шина
-
-A и B могут работать одновременно. Конкретный генератор к общей генераторной шине выбирают физические взаимно заблокированные контакторы.
-
-TPC не имеет software-selector A/B и не пытается им управлять.
+`PowerPath` и `PowerSource` различаются намеренно. Например, при выбранном Grid path и отсутствующей внешней Grid фактический режим может быть `UPS_ONLY`.
 
 ## 4. GeneratorBusTracker
 
-`generator_bus.py` хранит логическую копию наблюдаемого аппаратного FIFO.
+`generator_bus.py` — единственное место, где определяется логический owner общей генераторной шины.
 
 Owner:
 
-```text
-A
-B
-NONE
-UNKNOWN
-```
+- `A`;
+- `B`;
+- `NONE`;
+- `UNKNOWN`.
 
-Правила:
+Tracker использует историю `generator_*_is_running` и повторяет аппаратное FIFO-поведение контакторов:
 
-- один RUNNING -> он owner;
-- A стал owner, затем запустился B -> owner остаётся A;
-- owner остановился при уже работающем втором -> owner переходит второму;
-- restart при A+B RUNNING и отсутствии достоверной истории -> `UNKNOWN`, без угадывания.
+- первый появившийся RUNNING получает owner;
+- второй RUNNING не меняет owner;
+- пока текущий owner продолжает RUNNING, owner не меняется;
+- если owner остановился, а второй генератор продолжает RUNNING, owner автоматически переходит ко второму;
+- если после restart/history gap оба уже RUNNING и порядок нельзя восстановить, owner = `UNKNOWN`.
 
-Tracker также хранит run-context каждого слота:
+Ни TPC, ни HA Adapter не пытаются повторно вычислять owner.
 
-```text
-NONE
-MANAGED_OUTAGE
-MANAGED_OTHER
-EXTERNAL_OUTAGE
-TEST_RUN
-OTHER_EXTERNAL
-UNKNOWN_EXTERNAL
-```
+### Контекст непрерывного RUNNING
 
-`MANAGED_OUTAGE` и `EXTERNAL_OUTAGE` являются outage-related.
+Для каждого двигателя Tracker хранит один из следующих контекстов:
 
-Известный owner и run-context записываются в persistent journal.
+- `NONE` — двигатель не работает;
+- `OUTAGE_RELATED` — RUNNING начался при отсутствующей Grid и относится к outage;
+- `TEST_RUN` — RUNNING начался при явно включённом test mode;
+- `OTHER` — известный не-outage запуск;
+- `UNKNOWN` — причина уже существующего RUNNING не может быть доказана.
 
-## 5. Три разных ownership
+Это не ownership двигателя. Контекст нужен прежде всего для узкого правила завершения outage: после безопасного возврата дома на стабильную Grid можно остановить `OUTAGE_RELATED`, но нельзя автоматически останавливать `TEST_RUN` или неизвестный запуск.
 
-В 0.4 важно не смешивать три понятия.
+## 5. GeneratorController
 
-### 5.1. Managed generator
+Один экземпляр GC обслуживает один физический генератор и не знает про PRIMARY/SECONDARY или общую политику ATS.
 
-Двигатель, жизненным циклом которого управляет текущая сессия EnergyATS.
+Текущие фазы:
 
-### 5.2. Bus owner
+- `WAITING_FOR_DATA`;
+- `IDLE`;
+- `PREPARING`;
+- `WAITING_FOR_RUNNING`;
+- `HOLDING_COLD_START_CHOKE`;
+- `WARMING_UP`;
+- `READY_FOR_LOAD`;
+- `WAITING_FOR_LOAD_RELEASE`;
+- `COOLING_DOWN`;
+- `WAITING_FOR_STOP`;
+- `EXTERNAL_RUNNING`;
+- `FAULT`.
 
-Генератор, физически подключённый аппаратной схемой к общей генераторной шине.
+GC выдаёт только команды одного двигателя:
 
-### 5.3. External run
+- `REMOTE_ON`;
+- `REMOTE_OFF`;
+- `CHOKE_TO_COLD_START`;
+- `CHOKE_TO_RUN`.
 
-Работающий двигатель, который не принадлежит managed-сессии EnergyATS.
+Ошибка жизненного цикла фиксируется локальным `FAULT`. Решение о fallback или системном `RECOVERY_REQUIRED` принимает Supervisor.
 
-Возможна штатная ситуация:
+`step_authorized_shutdown()` используется только после того, как Supervisor уже разрешил остановить конкретный разгруженный двигатель. Повторной policy-проверки ownership внутри GC нет.
 
-```text
-managed generator = A
-A RUNNING = ON
-B RUNNING = ON
-bus owner = A
-B run context = EXTERNAL_OUTAGE
-```
+## 6. PowerTransferController
 
-Сам факт двух RUNNING не является fault.
+TPC управляет только основной парой Grid / Generator и ничего не знает о Generator A/B.
 
-## 6. Energy Supervisor
+Фазы:
 
-ES выдаёт уровневые цели, но не service calls.
+- устойчивые: `STABLE_GRID`, `STABLE_ISOLATED`, `STABLE_GENERATOR`;
+- переходные: `DISCONNECTING_GRID`, `SELECTING_GENERATOR`, `DISCONNECTING_GENERATOR`, `CONNECTING_GRID`;
+- служебные: `WAITING_FOR_DATA`, `RECOVERY_REQUIRED`.
 
-Он отвечает за:
+Правило Grid -> Generator:
 
-- ручную managed-сессию;
-- автоматическую outage-сессию;
-- выбор PRIMARY из `select.primary_generator`;
-- policy-флаги `generator_a_enabled` / `generator_b_enabled`;
-- один fallback `PRIMARY -> SECONDARY`;
-- возврат дома на Grid;
-- завершение outage-related runs;
-- recovery при неоднозначном безопасном продолжении.
+1. `grid_power -> OFF`;
+2. дождаться снятия Grid control feedback;
+3. `use_generator_as_power_source -> ON`;
+4. дождаться generator control feedback.
 
-### 6.1. Fallback
+Правило Generator -> Grid симметрично:
 
-Если managed PRIMARY не запустился или неожиданно потерян и SECONDARY остановлен/доступен, ES разрешает один переход:
+1. `use_generator_as_power_source -> OFF`;
+2. дождаться снятия generator feedback;
+3. `grid_power -> ON`;
+4. дождаться Grid feedback.
 
-```text
-PRIMARY -> SECONDARY
-```
+Каждый tick выдаёт не более одной новой силовой команды и не начинает следующий шаг до подтверждения предыдущего.
 
-Повторного `SECONDARY -> PRIMARY` нет.
+## 7. EnergySupervisor
 
-Если SECONDARY уже работает внешне, ES не превращает его в managed. После остановки прежнего owner аппаратная схема может передать шину внешнему SECONDARY; ES лишь наблюдает этот takeover.
+Supervisor содержит только policy, которую нельзя вывести из одного локального контроллера.
 
-## 7. Generator Controller
+Фазы 0.4:
 
-Один FSM используется независимо для A и B:
+- `WAITING_FOR_DATA`;
+- `NORMAL`;
+- `GRID_FAILURE_DELAY`;
+- `STARTING_GENERATOR`;
+- `ON_GENERATOR`;
+- `RETURNING_TO_GRID`;
+- `EXTERNAL_RUNNING`;
+- `RECOVERY_REQUIRED`.
 
-```text
-WAITING_FOR_DATA
-IDLE
-PREPARING
-WAITING_FOR_RUNNING
-HOLDING_COLD_START_CHOKE
-WARMING_UP
-READY_FOR_LOAD
-WAITING_FOR_LOAD_RELEASE
-COOLING_DOWN
-WAITING_FOR_STOP
-EXTERNAL_RUNNING
-FAULT
-RECOVERY_REQUIRED
-```
+Отдельных фаз `ON_EXTERNAL_GENERATOR`, `STOPPING_GENERATORS` или `TRANSFERRING_TO_GENERATOR` нет: внешний owner, силовой переход и остановка видны из `GeneratorBusTracker`, TPC и GC и не должны дублироваться в Supervisor.
 
-GC знает только собственный двигатель и его `load_connected`.
+### Managed-сессия
 
-Он не знает о Grid и не выбирает источник дома.
+Сессия хранит только то, что действительно является policy-state:
 
-При внутренней ошибке управляемого запуска GC снимает REMOTE и возвращает заслонку в рабочее положение. Это, в частности, позволяет Supervisor после неудачного PRIMARY безопасно перейти к SECONDARY.
+- причина (`manual_generator_start` / `grid_outage`);
+- текущий managed slot;
+- началась ли сессия при отсутствующей Grid;
+- запрошена ли остановка;
+- использован ли единственный fallback.
 
-## 8. Power Transfer Controller
+### Fallback
 
-TPC моделирует только основные контакторы.
+При отказе managed PRIMARY допускается один переход на SECONDARY.
 
-Переход Grid -> Generator:
+- если SECONDARY уже работает, он остаётся внешним; EnergyATS не присваивает себе его ownership;
+- если SECONDARY свободен и разрешён, начинается единственный managed fallback;
+- после отказа SECONDARY повторного возврата к PRIMARY нет — требуется recovery.
 
-```text
-Grid permission OFF
--> подтверждение сетевой управляющей цепи OFF
--> generator selector ON
--> подтверждение генераторной управляющей цепи ON
-```
+### Возврат Grid
 
-Возврат Generator -> Grid:
+После стабильной Grid:
 
-```text
-generator selector OFF
--> подтверждение генераторной управляющей цепи OFF
--> Grid permission ON
--> подтверждение сетевой управляющей цепи
-```
+1. Supervisor требует `GRID` у TPC;
+2. TPC безопасно снимает Generator и возвращает Grid;
+3. только после подтверждённого Grid path Supervisor разрешает остановку всех известных `OUTAGE_RELATED` генераторов;
+4. `TEST_RUN`, `OTHER` и `UNKNOWN` этим правилом не останавливаются.
 
-Это break-before-make.
+## 8. HomeAssistantAdapter
 
-`binary_sensor.house_powered_by_grid` и `binary_sensor.house_powered_by_generator` являются датчиками **управляющих цепей контакторов**, а не независимыми датчиками силового напряжения после контакторов. TPC учитывает именно такой смысл обратной связи.
+Adapter является границей с Home Assistant и не содержит альтернативной модели системы.
 
-## 9. Внешние генераторы и локальная защита Adapter
+Он:
 
-Внешний генератор не захватывается в managed ownership.
+- читает физические/управляющие entities;
+- формирует `GeneratorObservation` и `PowerTransferObservation`;
+- исполняет уже сформированные `GeneratorAction` / `TransferAction`;
+- выполняет локальные аппаратные safety checks перед service call;
+- публикует status, Logbook и critical notifications.
 
-Одновременно работающие A+B принимаются как нормальный физический факт.
+Важно: **одновременный RUNNING A и B разрешён**. Adapter не запрещает `REMOTE_ON` только из-за работы второго генератора. Аппаратная взаимная блокировка генераторных контакторов является частью физической схемы.
 
-При этом Adapter сохраняет дополнительный локальный предохранитель: EnergyATS сам не подаёт новый `REMOTE_ON` одному генератору, пока другой подтверждённо RUNNING. Текущий policy fallback сначала фиксирует отказ/остановку PRIMARY и только затем запускает SECONDARY. Это ограничение **не запрещает внешний/локальный параллельный запуск** второго генератора и не объявляет два RUNNING аварией.
+## 9. Один tick
 
-`REMOTE_OFF` работающего генератора также блокируется, пока управляющая цепь дома подтверждает генераторную ветвь и данный двигатель ещё RUNNING.
-
-## 10. Outage-related shutdown и TEST_RUN
-
-Новый OFF->ON фронт внешнего генератора классифицируется по состоянию Grid и `input_boolean.generator_test_mode`.
-
-Если запуск произошёл при `grid_input_ready = OFF` и не был помечен TEST, он получает `EXTERNAL_OUTAGE`.
-
-После стабильного восстановления Grid:
-
-1. TPC возвращает дом на сетевую сторону;
-2. подтверждается снятие генераторной ветви;
-3. GC выполняет cooldown;
-4. EnergyATS останавливает все известные outage-related runs.
-
-`TEST_RUN` не останавливается только из-за возврата Grid.
-
-Если состояние test helper недоступно в момент нового внешнего запуска, контекст становится `UNKNOWN_EXTERNAL`; такой двигатель безопаснее не остановить автоматически, чем ошибочно классифицировать как outage-related.
-
-## 11. Tick приложения
-
-На каждом tick `main.py` выполняет порядок:
+Нормальный цикл имеет один направленный поток данных:
 
 ```text
 HA snapshot
--> generator metadata / primary sync
--> GeneratorBusTracker update
--> refresh GC/TPC observations без команд
--> EnergySupervisor decision
--> GC actions
--> TPC actions
--> persistent pending-actions journal
--> hardware service calls
--> events / runtime log / status sensor
+  -> GeneratorBusTracker
+  -> GC/TPC observation refresh
+  -> Supervisor.step()
+  -> GC/TPC actions
+  -> HA Adapter service calls
+  -> status/log
+  -> persistent journal
 ```
 
-Силовые TPC actions исполняются раньше команд двигателя.
+Policy не должна повторно выполняться из слоя публикации status/log.
 
-Перед аппаратными service calls pending actions уже находятся в journal.
+## 10. Persistent journal 0.4
 
-## 12. Persistent state 0.4
+Top-level `schema_version = 2` относится только к текущему формату 0.4.
 
-Файл:
+Journal содержит:
+
+- `app_version`;
+- состояние Supervisor;
+- состояние `GeneratorBusTracker`;
+- список `pending_actions`.
+
+Отдельной вложенной schema-version Supervisor нет.
+
+Состояние 0.3 не мигрируется. Неподдерживаемый или противоречивый journal переводит систему в безопасный `RECOVERY_REQUIRED`, а не угадывает прежний смысл данных.
+
+`pending_actions` перед физическим service call нужны для определения restart/connection-loss в момент незавершённой операции.
+
+## 11. Status sensor
+
+`sensor.energy_ats_status` — диагностическая проекция текущего состояния, а не дополнительный источник истины.
+
+Основные атрибуты текущей реализации:
+
+- `source`;
+- `phase`;
+- `generator`, `generator_model`, `generator_slot`;
+- `managed_generator`;
+- `bus_owner`;
+- `generator_a_run_context`, `generator_b_run_context`;
+- `primary_generator`;
+- `remaining_seconds`;
+- `session_reason`;
+- `fallback_used`;
+- `armed`.
+
+Отдельных `bus_owner_slot`, `primary_generator_slot` и status `schema_version` в 0.4 нет.
+
+## 12. Safety-инварианты реализации
+
+1. Неизвестное обязательное физическое состояние блокирует управляющие действия.
+2. Команда никогда не считается подтверждением.
+3. TPC соблюдает break-before-make независимо от policy Supervisor.
+4. Два RUNNING — допустимый физический режим.
+5. Нельзя угадывать bus owner при недостаточной истории.
+6. Внешний RUNNING не становится managed автоматически.
+7. Единственный fallback не превращается в ping-pong.
+8. Остановка outage-related выполняется только после снятия дома с генераторной ветви.
+9. Recovery не захватывает внешний генератор.
+10. UI/log/persistence не должны сами продвигать управляющие FSM.
+
+## 13. Проверка архитектуры
+
+Изменение считается законченным только если одновременно согласованы:
 
 ```text
-/data/energy-supervisor-state.json
+PHYSICAL_POWER_TOPOLOGY_RU.md
+        ↓
+REQUIREMENTS_RU.md
+        ↓
+production code
+        ↓
+unit / end-to-end tests
+        ↓
+commissioning на реальном оборудовании
 ```
 
-Envelope journal использует `journal_schema_version = 2`.
-
-Supervisor использует собственную schema version 4. Journal также хранит `generator_bus`, включая owner, run-context и предыдущие RUNNING.
-
-Миграция ошибочной модели persistent state 0.3 в 0.4 намеренно не выполняется.
-
-Если restart произошёл во время неподтверждённой физической транзакции, App переходит в `RECOVERY_REQUIRED` и не продолжает её вслепую.
-
-## 13. Диагностический status
-
-`sensor.energy_ats_status` — read-only представление.
-
-В 0.4 используется `schema_version = 3`. Помимо source/phase и managed generator он содержит:
-
-```text
-bus_owner
-bus_owner_slot
-generator_a_run_context
-generator_b_run_context
-fallback_used
-```
-
-Пользовательские поля generator/primary содержат реальные имена из HA, машинные поля сохраняют A/B.
-
-## 14. Конфигурация
-
-Generator Controller / HA описывают установленное оборудование:
-
-```text
-sensor.generator_a_name
-sensor.generator_b_name
-sensor.generator_a_model
-sensor.generator_b_model
-select.primary_generator
-```
-
-EnergyATS хранит policy:
-
-```text
-armed
-grid_failure_delay
-grid_restore_stable_time
-transfer_confirmation_timeout
-generator_a_enabled
-generator_b_enabled
-```
-
-Смена primary применяется к следующей новой managed-сессии и не переписывает уже активную.
-
-## 15. Главный инвариант
-
-> Физика определяет, что возможно. Requirements определяют, что разрешено. Supervisor решает **что делать**, TPC — **как переключить основные контакторы**, GC — **как управлять одним двигателем**, GeneratorBusTracker — **кто физически владеет общей генераторной шиной**.
+Зелёный CI проверяет программную модель, но не заменяет физическую проверку контакторов, обратных связей и реального поведения DKG116/MAP.
