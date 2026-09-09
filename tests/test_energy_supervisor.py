@@ -186,6 +186,24 @@ def test_disabled_primary_blocks_new_session():
     assert supervisor.session is None
 
 
+def test_faulted_primary_is_not_silently_replaced_before_session():
+    supervisor = EnergySupervisor()
+    initialize(supervisor)
+    supervisor.request_manual_start()
+    decision = supervisor.step(
+        1.0,
+        observation(
+            a=generator_status(
+                GeneratorSlot.A,
+                phase=GeneratorPhase.FAULT,
+                fault="latched fault",
+            )
+        ),
+    )
+    assert supervisor.session is None
+    assert not any(decision.desired_generators.values())
+
+
 def test_grid_outage_waits_delay_then_starts_primary():
     supervisor = EnergySupervisor(SupervisorConfig(grid_failure_delay=5.0))
     outage = observation(
@@ -291,32 +309,32 @@ def test_primary_failure_falls_back_once_without_ping_pong():
 
 def test_external_secondary_takeover_does_not_become_managed():
     supervisor = stable_session()
-    decision = supervisor.step(
-        1.0,
-        observation(
-            grid_ready=False,
-            source=PowerSource.GENERATOR,
-            path=PowerPath.GENERATOR,
-            a=generator_status(
-                GeneratorSlot.A,
-                phase=GeneratorPhase.FAULT,
-                running=False,
-                remote_on=True,
-                fault="A stopped",
-            ),
-            b=generator_status(
-                GeneratorSlot.B,
-                phase=GeneratorPhase.EXTERNAL_RUNNING,
-                running=True,
-                remote_on=False,
-            ),
-            bus_status=bus(
-                GeneratorBusOwner.B,
-                b_context=GeneratorRunContext.OUTAGE_RELATED,
-            ),
+    o = observation(
+        grid_ready=False,
+        source=PowerSource.GENERATOR,
+        path=PowerPath.GENERATOR,
+        a=generator_status(
+            GeneratorSlot.A,
+            phase=GeneratorPhase.FAULT,
+            running=False,
+            remote_on=True,
+            fault="A stopped",
+        ),
+        b=generator_status(
+            GeneratorSlot.B,
+            phase=GeneratorPhase.EXTERNAL_RUNNING,
+            running=True,
+            remote_on=False,
+        ),
+        bus_status=bus(
+            GeneratorBusOwner.B,
+            b_context=GeneratorRunContext.OUTAGE_RELATED,
         ),
     )
-    assert supervisor.phase == SupervisorPhase.ON_EXTERNAL_GENERATOR
+    decision = supervisor.step(1.0, o)
+
+    assert supervisor.phase == SupervisorPhase.ON_GENERATOR
+    assert supervisor.status_text(o) == "Питание от внешнего генератора"
     assert supervisor.session is not None
     assert supervisor.session.generator == GeneratorSlot.A
     assert decision.desired_generators[GeneratorSlot.B] is False
@@ -341,7 +359,6 @@ def test_stable_grid_starts_return_and_cleanup_of_all_outage_runs():
     assert supervisor.phase == SupervisorPhase.RETURNING_TO_GRID
     assert decision.desired_source == PowerSource.GRID
 
-    supervisor.phase = SupervisorPhase.RETURNING_TO_GRID
     decision = supervisor.step(
         71.0,
         observation(
@@ -362,7 +379,7 @@ def test_stable_grid_starts_return_and_cleanup_of_all_outage_runs():
             ),
         ),
     )
-    assert supervisor.phase == SupervisorPhase.STOPPING_GENERATORS
+    assert supervisor.phase == SupervisorPhase.RETURNING_TO_GRID
     assert decision.stop_outage_generators == frozenset(
         {GeneratorSlot.A, GeneratorSlot.B}
     )
@@ -464,7 +481,7 @@ def test_stable_session_survives_restart_but_transient_session_does_not():
     assert restored.phase == SupervisorPhase.ON_GENERATOR
     assert restored.recovery_reason is None
 
-    supervisor.phase = SupervisorPhase.TRANSFERRING_TO_GENERATOR
+    supervisor.phase = SupervisorPhase.STARTING_GENERATOR
     restored = EnergySupervisor.from_dict(supervisor.to_dict(), SupervisorConfig())
     restored.step(10.0, observation(grid_ready=False, source=PowerSource.UPS_ONLY))
     assert restored.phase == SupervisorPhase.RECOVERY_REQUIRED
@@ -476,6 +493,6 @@ def test_connection_loss_requires_recovery_only_during_transient_operation():
     assert stable.phase == SupervisorPhase.ON_GENERATOR
 
     transient = stable_session()
-    transient.phase = SupervisorPhase.TRANSFERRING_TO_GENERATOR
+    transient.phase = SupervisorPhase.STARTING_GENERATOR
     transient.mark_connection_lost()
     assert transient.phase == SupervisorPhase.RECOVERY_REQUIRED
