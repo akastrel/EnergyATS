@@ -330,16 +330,23 @@ class HomeAssistantAdapter:
                 f"REMOTE ON {action.slot.value} запрещён при активном/неизвестном Emergency Stop."
             )
 
-        # Здесь намеренно нет запрета REMOTE ON при работающем втором
-        # генераторе: два RUNNING разрешены физической схемой.
-        if (
-            action.kind == GeneratorActionKind.REMOTE_OFF
-            and self.bool_state(ENTITIES["house_generator"]) is True
-        ):
-            raise UnsafeHardwareCommand(
-                f"REMOTE OFF {action.slot.value} запрещён: дом ещё подключён "
-                "к генераторной шине."
+        # Два RUNNING разрешены физической схемой. REMOTE OFF опасен только
+        # если отключаемый двигатель всё ещё работает и дом может быть на
+        # генераторной шине. Уже остановившемуся двигателю REMOTE можно снять,
+        # даже когда второй генератор продолжает питать дом.
+        if action.kind == GeneratorActionKind.REMOTE_OFF:
+            running_entity = (
+                ENTITIES["generator_a_running"]
+                if action.slot == GeneratorSlot.A
+                else ENTITIES["generator_b_running"]
             )
+            target_running = self.bool_state(running_entity)
+            house_generator = self.bool_state(ENTITIES["house_generator"])
+            if target_running is not False and house_generator is not False:
+                raise UnsafeHardwareCommand(
+                    f"REMOTE OFF {action.slot.value} запрещён: отключаемый генератор "
+                    "может ещё питать дом."
+                )
 
     def _assert_transfer_action_safe(self, action: TransferAction) -> None:
         if action.kind == TransferActionKind.SELECT_GENERATOR:
