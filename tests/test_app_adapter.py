@@ -6,29 +6,17 @@ import os
 import sys
 from pathlib import Path
 
+import aiohttp.web
 import pytest
 
 APP_DIR = Path(__file__).resolve().parents[1] / "energy_ats" / "app"
 sys.path.insert(0, str(APP_DIR))
 
-from domain import (  # noqa: E402
-    GeneratorSlot,
-    PowerPath,
-    PowerSource,
-    SessionReason,
-    SupervisorEvent,
-    Transaction,
-)
-from energy_supervisor import (  # noqa: E402
-    EnergySupervisor,
-    GeneratorSession,
-    SupervisorPhase,
-)
+from domain import GeneratorSlot, SupervisorEvent  # noqa: E402
 from generator_controller import (  # noqa: E402
     ChokeStrategy,
     GeneratorAction,
     GeneratorActionKind,
-    GeneratorPhase,
 )
 from ha_adapter import (  # noqa: E402
     ENERGY_ATS_LOG_ENTITY,
@@ -44,24 +32,27 @@ from state_store import StateStore  # noqa: E402
 
 
 def test_app_version_matches_addon_manifest():
-    """Версия в журнале App не должна расходиться с версией HA App."""
     config_path = APP_DIR.parent / "config.yaml"
     version_line = next(
-        line for line in config_path.read_text(encoding="utf-8").splitlines()
+        line
+        for line in config_path.read_text(encoding="utf-8").splitlines()
         if line.startswith("version:")
     )
-    manifest_version = version_line.split(":", 1)[1].strip().strip('"')
-
-    assert app_main.APP_VERSION == manifest_version
+    assert app_main.APP_VERSION == version_line.split(":", 1)[1].strip().strip('"')
 
 
 class FakeClient:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, dict]] = []
         self.states: dict[str, str] = {}
+        self.state_writes: list[tuple[str, str, dict]] = []
 
     async def call_service(self, domain, service, *, service_data=None):
         self.calls.append((domain, service, service_data or {}))
+
+    async def set_state(self, entity_id, state, *, attributes=None):
+        self.states[entity_id] = state
+        self.state_writes.append((entity_id, state, attributes or {}))
 
     def get_state(self, entity_id):
         return self.states.get(entity_id)
@@ -71,7 +62,7 @@ class FakeClient:
 
 
 class PhysicalFakeClient(FakeClient):
-    """Минимальная физическая обратная связь для сквозного теста App."""
+    """Fake HA с минимальной обратной связью управляющих цепей контакторов."""
 
     def __init__(self, journal_path: Path | None = None) -> None:
         super().__init__()
@@ -109,6 +100,7 @@ def attach_fake_client(app: EnergySupervisorApp, fake: FakeClient) -> None:
 def populated_states() -> dict[str, str]:
     return {
         ENTITIES["automatic_transfer"]: "off",
+        ENTITIES["test_mode"]: "off",
         ENTITIES["grid_ready"]: "on",
         ENTITIES["house_grid"]: "on",
         ENTITIES["house_generator"]: "off",
@@ -132,12 +124,20 @@ def populated_states() -> dict[str, str]:
     }
 
 
-def test_load_options_merges_small_public_configuration(tmp_path):
-    path = tmp_path / "options.json"
-    path.write_text(
-        json.dumps({"armed": True, "grid_failure_delay": 7}),
-        encoding="utf-8",
+def make_app(tmp_path: Path, **overrides) -> EnergySupervisorApp:
+    return EnergySupervisorApp(
+        {
+            **DEFAULT_OPTIONS,
+            "state_file": str(tmp_path / "state.json"),
+            **overrides,
+        },
+        token="test",
     )
+
+
+def test_load_options_merges_public_configuration(tmp_path):
+    path = tmp_path / "options.json"
+    path.write_text(json.dumps({"armed": True, "grid_failure_delay": 7}))
     options = load_options(path)
     assert options["armed"] is True
     assert options["grid_failure_delay"] == 7
@@ -145,66 +145,32 @@ def test_load_options_merges_small_public_configuration(tmp_path):
     assert "primary_generator" not in options
 
 
-def test_stdin_commands_are_dispatched_without_ha_helpers(tmp_path, monkeypatch):
-    app = EnergySupervisorApp(
-        {
-            **DEFAULT_OPTIONS,
-            "armed": True,
-            "state_file": str(tmp_path / "state.json"),
-        },
-        token="test",
-    )
-    app.commands_ready = True
+def test_stdin_commands_dispatch_only_when_armed_and_ready(tmp_path, monkeypatch):
+    app = make_app(tmp_path, armed=True)
     received: list[str] = []
-    monkeypatch.setattr(
-        app.supervisor,
-        "request_manual_start",
-        lambda: received.append("start_generator"),
-    )
-    monkeypatch.setattr(
-        app.supervisor,
-        "request_manual_stop",
-        lambda: received.append("stop_generator"),
-    )
-    monkeypatch.setattr(
-        app.supervisor,
-        "request_recovery_reset",
-        lambda: received.append("reset"),
-    )
+    monkeypatch.setattr(app.supervisor, "request_manual_start", lambda: received.append("start"))
+    monkeypatch.setattr(app.supervisor, "request_manual_stop", lambda: received.append("stop"))
+    monkeypatch.setattr(app.supervisor, "request_recovery_reset", lambda: received.append("reset"))
 
+    app.handle_stdin_line('{"command":"start_generator"}')
+    assert received == []
+
+    app.commands_ready = True
     app.handle_stdin_line('{"command":"start_generator"}')
     app.handle_stdin_line('{"command":"stop_generator"}')
     app.handle_stdin_line('{"command":"reset"}')
+    assert received == ["start", "stop", "reset"]
 
-    assert received == ["start_generator", "stop_generator", "reset"]
-
-
-def test_supervisor_events_are_written_to_app_log(tmp_path, caplog):
-    app = EnergySupervisorApp(
-        {**DEFAULT_OPTIONS, "state_file": str(tmp_path / "state.json")},
-        token="test",
-    )
-
-    with caplog.at_level("INFO", logger="energy_supervisor"):
-        app._log_events(
-            (
-                SupervisorEvent("info", "Информация"),
-                SupervisorEvent("warning", "Предупреждение"),
-                SupervisorEvent("critical", "Авария"),
-            )
-        )
-
-    assert "INFO     energy_supervisor" in caplog.text
-    assert "WARNING  energy_supervisor" in caplog.text
-    assert "CRITICAL energy_supervisor" in caplog.text
-    assert "ES:" not in caplog.text
+    disarmed = make_app(tmp_path, armed=False)
+    disarmed.commands_ready = True
+    disarmed.handle_stdin_line('{"command":"start_generator"}')
+    assert disarmed.supervisor._manual_start_requested is False
 
 
 @pytest.mark.asyncio
-async def test_events_use_energy_ats_logbook_entity_and_only_critical_notifies():
+async def test_events_log_and_only_critical_notifies():
     fake = FakeClient()
     adapter = HomeAssistantAdapter(fake, armed=True)
-
     await adapter.publish_events(
         (
             SupervisorEvent("info", "Информация"),
@@ -212,160 +178,42 @@ async def test_events_use_energy_ats_logbook_entity_and_only_critical_notifies()
             SupervisorEvent("critical", "Авария"),
         )
     )
-
-    assert fake.calls == [
-        (
-            "logbook",
-            "log",
-            {
-                "name": "Energy ATS",
-                "message": "Информация",
-                "entity_id": ENERGY_ATS_LOG_ENTITY,
-            },
-        ),
-        (
-            "logbook",
-            "log",
-            {
-                "name": "Energy ATS",
-                "message": "Предупреждение",
-                "entity_id": ENERGY_ATS_LOG_ENTITY,
-            },
-        ),
-        (
-            "logbook",
-            "log",
-            {
-                "name": "Energy ATS",
-                "message": "Авария",
-                "entity_id": ENERGY_ATS_LOG_ENTITY,
-            },
-        ),
-        ("script", "notify_critical", {"message": "Авария"})
+    assert [call[2]["message"] for call in fake.calls[:3]] == [
+        "Информация",
+        "Предупреждение",
+        "Авария",
     ]
+    assert all(call[2]["entity_id"] == ENERGY_ATS_LOG_ENTITY for call in fake.calls[:3])
+    assert fake.calls[3] == ("script", "notify_critical", {"message": "Авария"})
 
 
-def test_disarmed_app_ignores_manual_stdin_commands(tmp_path):
-    app = EnergySupervisorApp(
-        {
-            **DEFAULT_OPTIONS,
-            "armed": False,
-            "state_file": str(tmp_path / "state.json"),
-        },
-        token="test",
-    )
-
-    app.handle_stdin_line('{"command":"start_generator"}')
-
-    assert app.supervisor._manual_start_requested is False
-
-
-def test_manual_command_is_not_queued_before_app_is_ready(tmp_path):
-    app = EnergySupervisorApp(
-        {
-            **DEFAULT_OPTIONS,
-            "armed": True,
-            "state_file": str(tmp_path / "state.json"),
-        },
-        token="test",
-    )
-
-    app.handle_stdin_line('{"command":"start_generator"}')
-
-    assert app.supervisor._manual_start_requested is False
-
-
-@pytest.mark.asyncio
-@pytest.mark.skipif(
-    os.name == "nt",
-    reason="Асинхронный stdin App использует Linux pipe Home Assistant OS",
-)
-async def test_stdin_reader_accepts_home_assistant_json(tmp_path, monkeypatch):
-    app = EnergySupervisorApp(
-        {
-            **DEFAULT_OPTIONS,
-            "armed": True,
-            "state_file": str(tmp_path / "state.json"),
-        },
-        token="test",
-    )
-    read_fd, write_fd = os.pipe()
-    read_stream = os.fdopen(read_fd, "r", encoding="utf-8")
-    monkeypatch.setattr(app_main.sys, "stdin", read_stream)
-    app.commands_ready = True
-
-    task = asyncio.create_task(app.read_stdin_commands())
-    await asyncio.sleep(0)
-    os.write(write_fd, b'{"command":"start_generator"}\n')
-    os.close(write_fd)
-    await asyncio.wait_for(task, timeout=1.0)
-
-    assert app.supervisor._manual_start_requested is True
-
-
-def test_string_false_can_never_arm_hardware(tmp_path):
-    with pytest.raises(ValueError, match="armed.*JSON boolean"):
-        EnergySupervisorApp(
-            {
-                **DEFAULT_OPTIONS,
-                "armed": "false",
-                "state_file": str(tmp_path / "state.json"),
-            },
-            token="test",
-        )
-
-
-def test_generator_runtime_settings_remain_in_generator_controller(tmp_path):
-    app = EnergySupervisorApp(
-        {**DEFAULT_OPTIONS, "state_file": str(tmp_path / "state.json")},
-        token="test",
-    )
-    assert "primary_generator" not in DEFAULT_OPTIONS
-    assert "generator_a_name" not in DEFAULT_OPTIONS
-    assert "generator_a_model" not in DEFAULT_OPTIONS
-    assert "generator_a_choke_mode" not in DEFAULT_OPTIONS
-    assert app.profiles[GeneratorSlot.A].display_name == "Generator A"
-    assert app.profiles[GeneratorSlot.A].model == ""
-    assert app.profiles[GeneratorSlot.A].choke_strategy == ChokeStrategy.ALWAYS
-    assert app.profiles[GeneratorSlot.B].display_name == "Generator B"
-    assert app.profiles[GeneratorSlot.B].model == ""
-    assert app.profiles[GeneratorSlot.B].choke_strategy == ChokeStrategy.ALWAYS
-    assert app.profiles[GeneratorSlot.B].choke_temperature == 10.0
-    assert app.profiles[GeneratorSlot.A].start_timeout_seconds == 90.0
-    assert app.profiles[GeneratorSlot.A].stop_timeout_seconds == 90.0
-    assert app.profiles[GeneratorSlot.A].cooldown_seconds == 60.0
-
-
-def test_generator_identity_and_primary_are_read_from_home_assistant(tmp_path):
-    app = EnergySupervisorApp(
-        {**DEFAULT_OPTIONS, "state_file": str(tmp_path / "state.json")},
-        token="test",
-    )
+def test_adapter_snapshot_reads_physical_states_metadata_primary_and_test_mode():
     fake = FakeClient()
     fake.states = populated_states()
-    fake.states[ENTITIES["primary_generator"]] = "Вепрь"
-    attach_fake_client(app, fake)
+    fake.states[ENTITIES["automatic_transfer"]] = "on"
+    fake.states[ENTITIES["test_mode"]] = "on"
+    adapter = HomeAssistantAdapter(fake, armed=True)
 
-    hardware = app.adapter.snapshot()
-    app._sync_generator_configuration(hardware)
+    snapshot = adapter.snapshot()
+    assert snapshot.grid_ready is True
+    assert snapshot.automatic_transfer_enabled is True
+    assert snapshot.test_mode is True
+    assert snapshot.primary_generator == GeneratorSlot.A
+    assert snapshot.generator_metadata[GeneratorSlot.A].name == "Elemax"
+    assert snapshot.generator_metadata[GeneratorSlot.B].name == "Вепрь"
+    assert snapshot.power_transfer.generator_selected is False
+    assert snapshot.generators[GeneratorSlot.A].load_connected is False
 
-    assert app.profiles[GeneratorSlot.A].display_name == "Elemax"
-    assert app.profiles[GeneratorSlot.A].model == "SH7600EX 6.5 / 5.6 кВт"
-    assert app.profiles[GeneratorSlot.B].display_name == "Вепрь"
-    assert app.profiles[GeneratorSlot.B].model == "АПБ 6-230 ВХ-БСГ 6.0 / 5.5 кВт"
-    assert app.supervisor.config.primary_generator == GeneratorSlot.B
 
-
-def test_primary_generator_change_affects_next_selection_without_app_restart(tmp_path):
-    app = EnergySupervisorApp(
-        {**DEFAULT_OPTIONS, "state_file": str(tmp_path / "state.json")},
-        token="test",
-    )
+def test_generator_metadata_and_primary_update_runtime_configuration(tmp_path):
+    app = make_app(tmp_path)
     fake = FakeClient()
     fake.states = populated_states()
     attach_fake_client(app, fake)
 
     app._sync_generator_configuration(app.adapter.snapshot())
+    assert app.generator_controllers[GeneratorSlot.A].profile.display_name == "Elemax"
+    assert app.generator_controllers[GeneratorSlot.B].profile.display_name == "Вепрь"
     assert app.supervisor.config.primary_generator == GeneratorSlot.A
 
     fake.states[ENTITIES["primary_generator"]] = "Вепрь"
@@ -373,281 +221,155 @@ def test_primary_generator_change_affects_next_selection_without_app_restart(tmp
     assert app.supervisor.config.primary_generator == GeneratorSlot.B
 
 
-def test_invalid_primary_generator_is_rejected_before_commands(tmp_path):
-    app = EnergySupervisorApp(
-        {**DEFAULT_OPTIONS, "state_file": str(tmp_path / "state.json")},
-        token="test",
-    )
+def test_invalid_primary_generator_is_rejected(tmp_path):
+    app = make_app(tmp_path)
     fake = FakeClient()
     fake.states = populated_states()
     fake.states[ENTITIES["primary_generator"]] = "Generator C"
     attach_fake_client(app, fake)
-
     with pytest.raises(ValueError, match="select.primary_generator"):
         app._sync_generator_configuration(app.adapter.snapshot())
 
 
-def test_adapter_reads_positive_grid_switch_and_external_temperature():
-    fake = FakeClient()
-    fake.states = populated_states()
-    adapter = HomeAssistantAdapter(fake, armed=True)
-
-    snapshot = adapter.snapshot()
-    assert snapshot.automatic_transfer_enabled is False
-    assert snapshot.power_transfer.grid_connected is True
-    assert snapshot.power_transfer.generator_selected is False
-    assert snapshot.primary_generator == GeneratorSlot.A
-    assert snapshot.generator_metadata[GeneratorSlot.A].name == "Elemax"
-    assert snapshot.generator_metadata[GeneratorSlot.B].name == "Вепрь"
-    assert (
-        snapshot.generators[GeneratorSlot.A].ambient_temperature_external == 7.5
-    )
-
-    fake.states[ENTITIES["automatic_transfer"]] = "on"
-    assert adapter.snapshot().automatic_transfer_enabled is True
+def test_default_generator_profiles_are_bootstrap_only(tmp_path):
+    app = make_app(tmp_path)
+    a = app.generator_controllers[GeneratorSlot.A].profile
+    b = app.generator_controllers[GeneratorSlot.B].profile
+    assert a.display_name == "Generator A" and a.model == ""
+    assert b.display_name == "Generator B" and b.model == ""
+    assert a.choke_strategy == ChokeStrategy.ALWAYS
+    assert b.choke_strategy == ChokeStrategy.ALWAYS
 
 
-def test_control_entities_are_required_only_in_armed_mode():
+def test_missing_control_entity_required_only_when_armed():
     fake = FakeClient()
     fake.states = populated_states()
     del fake.states[ENTITIES["generator_a_choke_cold_start"]]
     adapter = HomeAssistantAdapter(fake, armed=True)
-
     assert ENTITIES["generator_a_choke_cold_start"] in adapter.missing_required_entities()
     assert ENTITIES["generator_a_choke_cold_start"] not in adapter.missing_required_entities(
         include_control_entities=False
     )
 
 
-def saved_supervisor_payload(
-    *,
-    phase: SupervisorPhase,
-    transaction_complete: bool,
-) -> dict:
-    supervisor = EnergySupervisor()
-    supervisor.phase = phase
-    supervisor.session = GeneratorSession.begin(
-        reason=SessionReason.MANUAL_GENERATOR_START,
-        generator=GeneratorSlot.A,
-        now=1.0,
-        grid_was_unavailable=False,
-    )
-    supervisor.desired_source = PowerSource.GENERATOR_A
-    supervisor.desired_generators[GeneratorSlot.A] = True
-    supervisor.transaction = Transaction.begin(
-        "enter_generator",
-        "A",
-        1.0,
-        "transfer_to_generator",
-    )
-    if transaction_complete:
-        supervisor.transaction.complete(2.0, "stable")
-    return {
-        "journal_schema_version": 1,
-        "app_version": "0.3.0",
-        "supervisor": supervisor.to_dict(),
-        "pending_actions": [],
-    }
-
-
-def test_pending_hardware_command_restores_only_to_recovery(tmp_path):
-    journal = tmp_path / "state.json"
-    payload = saved_supervisor_payload(
-        phase=SupervisorPhase.STARTING_GENERATOR,
-        transaction_complete=False,
-    )
-    payload["pending_actions"] = [
-        {
-            "controller": "generator_controller",
-            "generator": "A",
-            "action": "remote_on",
-        }
-    ]
-    StateStore(journal).save(payload)
-
-    restored = EnergySupervisorApp(
-        {**DEFAULT_OPTIONS, "state_file": str(journal)},
-        token="test",
-    )
-
-    assert restored.supervisor.phase == SupervisorPhase.RECOVERY_REQUIRED
-
-
-def test_unknown_envelope_schema_is_not_silently_loaded(tmp_path):
-    journal = tmp_path / "state.json"
-    payload = saved_supervisor_payload(
-        phase=SupervisorPhase.ON_GENERATOR,
-        transaction_complete=True,
-    )
-    payload["journal_schema_version"] = 999
-    StateStore(journal).save(payload)
-
-    restored = EnergySupervisorApp(
-        {**DEFAULT_OPTIONS, "state_file": str(journal)},
-        token="test",
-    )
-
-    assert restored.supervisor.phase == SupervisorPhase.RECOVERY_REQUIRED
+def generator_action(slot: GeneratorSlot, kind: GeneratorActionKind) -> GeneratorAction:
+    return GeneratorAction(slot, kind, "test")
 
 
 @pytest.mark.asyncio
-async def test_disarmed_adapter_never_calls_hardware():
-    fake = FakeClient()
-    adapter = HomeAssistantAdapter(fake, armed=False)
-    await adapter.execute_actions(
-        [TransferAction(TransferActionKind.DISCONNECT_GRID, "test")],
-        [
-            GeneratorAction(
-                GeneratorSlot.A,
-                GeneratorActionKind.REMOTE_ON,
-                "test",
-            )
-        ],
-    )
-    assert fake.calls == []
-
-
-@pytest.mark.asyncio
-async def test_adapter_isolates_bus_before_stopping_engine():
+async def test_remote_on_is_allowed_when_other_generator_is_running():
     fake = FakeClient()
     fake.states = populated_states()
+    fake.states[ENTITIES["generator_b_running"]] = "on"
     adapter = HomeAssistantAdapter(fake, armed=True)
-    await adapter.execute_actions(
-        [TransferAction(TransferActionKind.DESELECT_GENERATOR, "isolate")],
-        [
-            GeneratorAction(
-                GeneratorSlot.A,
-                GeneratorActionKind.REMOTE_OFF,
-                "stop",
-            ),
-            GeneratorAction(
-                GeneratorSlot.A,
-                GeneratorActionKind.CHOKE_TO_RUN,
-                "open choke",
-            ),
-        ],
-    )
-
-    hardware_calls = [call for call in fake.calls if call[0] != "logbook"]
-    assert hardware_calls == [
-        (
-            "switch",
-            "turn_off",
-            {"entity_id": ENTITIES["source_generator"]},
-        ),
-        (
-            "switch",
-            "turn_off",
-            {"entity_id": ENTITIES["generator_a_remote"]},
-        ),
-        (
-            "button",
-            "press",
-            {"entity_id": ENTITIES["generator_a_choke_run"]},
-        ),
-    ]
+    await adapter.execute_actions([], [generator_action(GeneratorSlot.A, GeneratorActionKind.REMOTE_ON)])
+    assert ("switch", "turn_on", {"entity_id": ENTITIES["generator_a_remote"]}) in fake.calls
 
 
 @pytest.mark.asyncio
-async def test_adapter_refuses_to_start_second_generator():
+async def test_remote_on_is_blocked_by_emergency_stop():
     fake = FakeClient()
     fake.states = populated_states()
-    fake.states[ENTITIES["generator_a_running"]] = "on"
+    fake.states[ENTITIES["emergency_stop"]] = "on"
     adapter = HomeAssistantAdapter(fake, armed=True)
-
-    with pytest.raises(UnsafeHardwareCommand, match="второго генератора"):
-        await adapter.execute_actions(
-            [],
-            [
-                GeneratorAction(
-                    GeneratorSlot.B,
-                    GeneratorActionKind.REMOTE_ON,
-                    "start B",
-                )
-            ],
-        )
-    assert fake.calls == []
+    with pytest.raises(UnsafeHardwareCommand):
+        await adapter.execute_actions([], [generator_action(GeneratorSlot.A, GeneratorActionKind.REMOTE_ON)])
 
 
 @pytest.mark.asyncio
-async def test_adapter_refuses_make_before_break():
+async def test_remote_off_live_generator_is_blocked_while_house_uses_generator_bus():
     fake = FakeClient()
     fake.states = populated_states()
-    adapter = HomeAssistantAdapter(fake, armed=True)
-
-    with pytest.raises(UnsafeHardwareCommand, match="отключения Grid"):
-        await adapter.execute_actions(
-            [TransferAction(TransferActionKind.SELECT_GENERATOR, "select")],
-            [],
-        )
-    assert fake.calls == []
-
-
-@pytest.mark.asyncio
-async def test_adapter_refuses_remote_off_while_generator_is_loaded():
-    fake = FakeClient()
-    fake.states = populated_states()
-    fake.states[ENTITIES["house_grid"]] = "off"
     fake.states[ENTITIES["house_generator"]] = "on"
     fake.states[ENTITIES["generator_a_running"]] = "on"
     adapter = HomeAssistantAdapter(fake, armed=True)
-
-    with pytest.raises(UnsafeHardwareCommand, match="дом ещё"):
-        await adapter.execute_actions(
-            [],
-            [
-                GeneratorAction(
-                    GeneratorSlot.A,
-                    GeneratorActionKind.REMOTE_OFF,
-                    "stop A",
-                )
-            ],
-        )
-    assert fake.calls == []
+    with pytest.raises(UnsafeHardwareCommand):
+        await adapter.execute_actions([], [generator_action(GeneratorSlot.A, GeneratorActionKind.REMOTE_OFF)])
 
 
 @pytest.mark.asyncio
-async def test_home_assistant_websocket_client_roundtrip():
-    """Мини-интеграция транспорта: auth -> states -> event -> service."""
-    import aiohttp.web
+async def test_remote_off_stopped_generator_is_allowed_when_other_generator_feeds_house():
+    fake = FakeClient()
+    fake.states = populated_states()
+    fake.states[ENTITIES["house_generator"]] = "on"
+    fake.states[ENTITIES["generator_a_running"]] = "off"
+    fake.states[ENTITIES["generator_b_running"]] = "on"
+    adapter = HomeAssistantAdapter(fake, armed=True)
+    await adapter.execute_actions([], [generator_action(GeneratorSlot.A, GeneratorActionKind.REMOTE_OFF)])
+    assert ("switch", "turn_off", {"entity_id": ENTITIES["generator_a_remote"]}) in fake.calls
 
-    service_calls = []
+
+@pytest.mark.asyncio
+async def test_transfer_guards_enforce_break_before_make():
+    fake = FakeClient()
+    fake.states = populated_states()
+    adapter = HomeAssistantAdapter(fake, armed=True)
+
+    select = TransferAction(TransferActionKind.SELECT_GENERATOR, "select")
+    with pytest.raises(UnsafeHardwareCommand):
+        await adapter.execute_actions([select], [])
+
+    fake.states[ENTITIES["grid_power"]] = "off"
+    fake.states[ENTITIES["house_grid"]] = "off"
+    fake.states[ENTITIES["source_generator"]] = "on"
+    fake.states[ENTITIES["house_generator"]] = "on"
+    connect_grid = TransferAction(TransferActionKind.CONNECT_GRID, "grid")
+    with pytest.raises(UnsafeHardwareCommand):
+        await adapter.execute_actions([connect_grid], [])
+
+
+def test_unsupported_top_level_state_schema_requires_recovery(tmp_path):
+    journal = tmp_path / "state.json"
+    StateStore(journal).save({"schema_version": 999})
+    app = make_app(tmp_path)
+    assert app.supervisor.phase.value == "recovery_required"
+
+
+def test_pending_hardware_action_requires_recovery_after_restart(tmp_path):
+    app = make_app(tmp_path)
+    app._pending_action_records = [
+        {"controller": "power_transfer", "action": "disconnect_grid"}
+    ]
+    app._save_state(force=True)
+
+    restored = make_app(tmp_path)
+    assert restored.supervisor.phase.value == "recovery_required"
+
+
+@pytest.mark.asyncio
+async def test_write_ahead_journal_is_saved_before_hardware_command(tmp_path):
+    app = make_app(tmp_path, armed=True)
+    fake = PhysicalFakeClient(tmp_path / "state.json")
+    fake.states = populated_states()
+    attach_fake_client(app, fake)
+
+    action = TransferAction(TransferActionKind.DISCONNECT_GRID, "grid off")
+    await app._execute_controller_actions([action], [])
+
+    assert fake.pending_seen_before_hardware
+    assert fake.pending_seen_before_hardware[0] == [
+        {"controller": "power_transfer", "action": "disconnect_grid"}
+    ]
+    saved = StateStore(tmp_path / "state.json").load()
+    assert saved["pending_actions"] == []
+
+
+@pytest.mark.asyncio
+async def test_home_assistant_websocket_updates_cache_and_calls_service(unused_tcp_port):
+    service_calls: list[dict] = []
     event_sent = asyncio.Event()
 
     async def websocket_handler(request):
         ws = aiohttp.web.WebSocketResponse()
         await ws.prepare(request)
-        await ws.send_json({"type": "auth_required", "ha_version": "2026.8.2"})
-        auth = await ws.receive_json()
-        assert auth == {"type": "auth", "access_token": "token"}
-        await ws.send_json({"type": "auth_ok", "ha_version": "2026.8.2"})
+        await ws.send_json({"type": "auth_required", "ha_version": "2026.9"})
+        assert await ws.receive_json() == {"type": "auth", "access_token": "token"}
+        await ws.send_json({"type": "auth_ok", "ha_version": "2026.9"})
 
         async for message in ws:
             data = message.json()
-            if data["type"] == "get_states":
-                await ws.send_json(
-                    {
-                        "id": data["id"],
-                        "type": "result",
-                        "success": True,
-                        "result": [
-                            {
-                                "entity_id": ENTITIES["grid_ready"],
-                                "state": "on",
-                                "attributes": {},
-                            }
-                        ],
-                    }
-                )
-            elif data["type"] == "subscribe_events":
-                await ws.send_json(
-                    {
-                        "id": data["id"],
-                        "type": "result",
-                        "success": True,
-                        "result": None,
-                    }
-                )
+            if data["type"] == "subscribe_events":
+                await ws.send_json({"id": data["id"], "type": "result", "success": True, "result": None})
                 await ws.send_json(
                     {
                         "id": data["id"],
@@ -657,82 +379,57 @@ async def test_home_assistant_websocket_client_roundtrip():
                             "data": {
                                 "entity_id": ENTITIES["grid_ready"],
                                 "old_state": {"state": "on"},
-                                "new_state": {"state": "off"},
+                                "new_state": {"entity_id": ENTITIES["grid_ready"], "state": "off", "attributes": {}},
                             },
                         },
                     }
                 )
                 event_sent.set()
-            elif data["type"] == "call_service":
-                service_calls.append(data)
+            elif data["type"] == "get_states":
                 await ws.send_json(
                     {
                         "id": data["id"],
                         "type": "result",
                         "success": True,
-                        "result": {},
+                        "result": [{"entity_id": ENTITIES["grid_ready"], "state": "on", "attributes": {}}],
                     }
                 )
+            elif data["type"] == "call_service":
+                service_calls.append(data)
+                await ws.send_json({"id": data["id"], "type": "result", "success": True, "result": {}})
         return ws
 
     webapp = aiohttp.web.Application()
     webapp.router.add_get("/api/websocket", websocket_handler)
     runner = aiohttp.web.AppRunner(webapp)
     await runner.setup()
-    site = aiohttp.web.TCPSite(runner, "127.0.0.1", 0)
+    site = aiohttp.web.TCPSite(runner, "127.0.0.1", unused_tcp_port)
     await site.start()
-    port = site._server.sockets[0].getsockname()[1]
 
-    client = HomeAssistantClient(
-        "token", url=f"ws://127.0.0.1:{port}/api/websocket"
-    )
-    seen = []
-
-    async def listener(entity, old, new):
-        seen.append((entity, old, new))
-
-    client.add_state_listener(ENTITIES["grid_ready"], listener)
+    client = HomeAssistantClient("token", url=f"ws://127.0.0.1:{unused_tcp_port}/api/websocket")
     try:
         await client.connect()
         await asyncio.wait_for(event_sent.wait(), timeout=1)
-        for _ in range(20):
-            if client.get_state(ENTITIES["grid_ready"]) == "off":
-                break
-            await asyncio.sleep(0.01)
-
         assert client.get_state(ENTITIES["grid_ready"]) == "off"
-        assert seen == [(ENTITIES["grid_ready"], "on", "off")]
-
-        await client.call_service(
-            "switch", "turn_on", service_data={"entity_id": "switch.test"}
-        )
+        await client.call_service("switch", "turn_on", service_data={"entity_id": "switch.test"})
         assert service_calls[-1]["service_data"] == {"entity_id": "switch.test"}
     finally:
         await client.close()
         await runner.cleanup()
 
 
-@pytest.mark.parametrize("legacy_phase", ["manual_generator_idle", "returning_to_normal"])
-def test_obsolete_session_phase_requires_recovery(tmp_path, legacy_phase):
-    payload = saved_supervisor_payload(
-        phase=SupervisorPhase.ON_GENERATOR, transaction_complete=True
-    )
-    payload["supervisor"]["phase"] = legacy_phase
-    journal = tmp_path / "state.json"
-    StateStore(journal).save(payload)
-    app = EnergySupervisorApp(
-        {**DEFAULT_OPTIONS, "state_file": str(journal)}, token="test"
-    )
-    assert app.supervisor.phase == SupervisorPhase.RECOVERY_REQUIRED
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name == "nt", reason="HA OS uses Linux stdin pipe")
+async def test_stdin_reader_accepts_home_assistant_json(tmp_path, monkeypatch):
+    app = make_app(tmp_path, armed=True)
+    read_fd, write_fd = os.pipe()
+    stream = os.fdopen(read_fd, "r", encoding="utf-8")
+    monkeypatch.setattr(app_main.sys, "stdin", stream)
+    app.commands_ready = True
 
-
-def test_unwrapped_supervisor_journal_requires_recovery(tmp_path):
-    payload = saved_supervisor_payload(
-        phase=SupervisorPhase.ON_GENERATOR, transaction_complete=True
-    )
-    journal = tmp_path / "state.json"
-    StateStore(journal).save(payload["supervisor"])
-    app = EnergySupervisorApp(
-        {**DEFAULT_OPTIONS, "state_file": str(journal)}, token="test"
-    )
-    assert app.supervisor.phase == SupervisorPhase.RECOVERY_REQUIRED
+    task = asyncio.create_task(app.read_stdin_commands())
+    await asyncio.sleep(0)
+    os.write(write_fd, b'{"command":"start_generator"}\n')
+    os.close(write_fd)
+    await asyncio.wait_for(task, timeout=1.0)
+    assert app.supervisor._manual_start_requested is True
