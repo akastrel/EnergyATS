@@ -62,7 +62,6 @@ _GENERATOR_PHASE_TEXT = {
     GeneratorPhase.WAITING_FOR_STOP: "остановка",
     GeneratorPhase.EXTERNAL_RUNNING: "внешний запуск",
     GeneratorPhase.FAULT: "АВАРИЯ",
-    GeneratorPhase.RECOVERY_REQUIRED: "требуется восстановление",
 }
 
 
@@ -209,7 +208,7 @@ class EnergySupervisorApp:
         for slot, controller in self.generator_controllers.items():
             if slot in decision.stop_outage_generators:
                 actions, error = controller.step_authorized_shutdown(
-                    now, hardware.generators[slot], authorized=True
+                    now, hardware.generators[slot]
                 )
                 generator_actions.extend(actions)
                 if error is not None:
@@ -375,7 +374,7 @@ class EnergySupervisorApp:
             self.supervisor.phase == SupervisorPhase.RECOVERY_REQUIRED
             or self.power_transfer.status().recovery_required
             or any(
-                controller.phase in {GeneratorPhase.FAULT, GeneratorPhase.RECOVERY_REQUIRED}
+                controller.phase == GeneratorPhase.FAULT
                 for controller in self.generator_controllers.values()
             )
         )
@@ -414,7 +413,7 @@ class EnergySupervisorApp:
         managed_slot = self.supervisor.session.generator if self.supervisor.session else None
         if managed_slot is not None:
             actions, error = self.generator_controllers[managed_slot].step_authorized_shutdown(
-                now, hardware.generators[managed_slot], authorized=True
+                now, hardware.generators[managed_slot]
             )
             if error is not None:
                 self.supervisor.fail_recovery_reset(error)
@@ -585,12 +584,11 @@ class EnergySupervisorApp:
         self,
         now: float,
         hardware: HardwareSnapshot,
-        events: tuple[SupervisorEvent, ...] = (),
+        events: tuple[SupervisorEvent, ...] | None = None,
     ) -> None:
         observation = self._supervisor_observation(hardware)
-        if not events:
-            decision = self.supervisor.step(now, observation)
-            events = decision.events
+        if events is None:
+            events = self.supervisor.step(now, observation).events
         self._log_events(events)
         await self.adapter.publish_events(events)
         self._log_runtime_if_changed(observation)
