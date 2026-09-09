@@ -1,48 +1,72 @@
-# Home Assistant entities и команды — Energy ATS 0.3.13
+# Home Assistant entities и команды — Energy ATS 0.4.0
 
-Вся привязка Energy ATS к конкретным `entity_id` находится в
-`energy_ats/app/ha_adapter.py`. Доменные автоматы не знают имён Home Assistant
-entities.
+Этот документ описывает фактический HA-контракт текущей реализации. Физический смысл сигналов задаёт `PHYSICAL_POWER_TOPOLOGY_RU.md`, policy — `REQUIREMENTS_RU.md`.
 
-## 1. Стабильные аппаратные слоты
+A/B — стабильные аппаратные слоты. Пользовательские имена и модели читаются отдельно и не меняют entity_id.
 
-Внутри Energy ATS генераторы обозначаются как `A` и `B`. Это стабильные
-аппаратные слоты и часть машинного контракта. Они не являются именами или
-моделями установленных генераторов.
+## 1. Helper-ы EnergyATS
 
-Человеко-читаемая идентичность поступает из Generator Controller через Home
-Assistant.
-
-## 2. Обязательная физическая обратная связь
+Корневой `ats.yaml` создаёт:
 
 ```text
 input_boolean.automatic_generator_transfer
+input_boolean.generator_test_mode
+```
+
+### `input_boolean.automatic_generator_transfer`
+
+Разрешает автоматическую outage-сессию после физического исчезновения Grid. Ручная команда `start_generator` от него не зависит.
+
+### `input_boolean.generator_test_mode`
+
+Явный классификатор **нового фронта RUNNING** как `TEST_RUN`.
+
+Helper не запускает и не останавливает двигатель. Он только сообщает `GeneratorBusTracker`, что новый запуск является тестовым и не должен автоматически останавливаться правилом завершения outage.
+
+## 2. Обязательные входные entities
+
+### Grid и основные контакторы
+
+```text
 binary_sensor.grid_input_ready
 binary_sensor.house_powered_by_grid
 binary_sensor.house_powered_by_generator
+switch.grid_power
+switch.use_generator_as_power_source
+```
+
+Смысл:
+
+- `grid_input_ready` — физическая доступность/пригодность внешней Grid;
+- `house_powered_by_grid` — подтверждение цепи управления основного Grid-контактора;
+- `house_powered_by_generator` — подтверждение цепи управления основного Generator-контактора;
+- `grid_power` — разрешение Grid-ветви;
+- `use_generator_as_power_source` — выбор основной парой контакторов Generator (`ON`) / Grid (`OFF`).
+
+`house_powered_by_*` **не являются независимым измерением напряжения после силовых контактов**.
+
+### Генераторы
+
+```text
 binary_sensor.generator_a_is_running
 binary_sensor.generator_b_is_running
 switch.generator_a_remote_start
 switch.generator_b_remote_start
-switch.grid_power
-switch.use_generator_as_power_source
+```
+
+`generator_*_is_running` используется как физическое подтверждение работающего генератора/наличия его выхода.
+
+Оба `*_is_running` могут одновременно быть `ON`. Это штатный режим и не означает одновременного подключения обоих генераторов к общей генераторной шине.
+
+### Emergency Stop
+
+```text
 switch.generators_emergency_stop
 ```
 
-Назначение:
+E-stop имеет приоритет над обычным управлением. Неизвестное состояние этого entity также не считается безопасным разрешением на запуск.
 
-- `automatic_generator_transfer` — разрешение автоматического АВР;
-- `grid_input_ready` — Grid пригодна для использования;
-- `house_powered_by_*` — физическое подтверждение источника дома;
-- `generator_*_is_running` — физический RUNNING соответствующего слота;
-- `generator_*_remote_start` — состояние/команда REMOTE DKG116;
-- `grid_power` — подключение Grid path;
-- `use_generator_as_power_source` — генераторная шина;
-- `generators_emergency_stop` — общий Emergency Stop.
-
-## 3. Идентичность генераторов и primary
-
-Energy ATS 0.3.13 обязательно читает:
+### Метаданные и PRIMARY
 
 ```text
 sensor.generator_a_name
@@ -52,30 +76,19 @@ sensor.generator_b_model
 select.primary_generator
 ```
 
-Пример текущей установки:
+Имена должны быть непустыми и различаться. `select.primary_generator` содержит одно из фактических имён и преобразуется во внутренний слот A/B.
+
+### Температура
 
 ```text
-sensor.generator_a_name   = Elemax
-sensor.generator_b_name   = Вепрь
-sensor.generator_a_model  = SH7600EX 6.5 / 5.6 кВт
-sensor.generator_b_model  = АПБ 6-230 ВХ-БСГ 6.0 / 5.5 кВт
-select.primary_generator  = Elemax
+sensor.garage_temperature
 ```
 
-Правила:
+Используется GC для choke/warmup. Недоступная температура обрабатывается консервативным профилем, но не подменяет обязательные RUNNING/REMOTE/E-stop данные.
 
-1. имена A и B должны быть непустыми и различными;
-2. модели должны быть доступны как строки;
-3. состояние `select.primary_generator` должно в точности совпадать с одним из
-   `sensor.generator_*_name`;
-4. Energy ATS преобразует имя primary во внутренний `GeneratorSlot.A/B`;
-5. изменение primary влияет только на выбор следующей новой управляемой
-   сессии и не переключает уже работающий генератор.
+## 3. Управляющие buttons
 
-Если эти entities отсутствуют или имеют `unknown/unavailable`, App не считается
-готовым к аппаратным действиям.
-
-## 4. Команды заслонки Generator Controller
+Для каждого генератора используются две физические команды заслонки:
 
 ```text
 button.generator_a_choke_to_cold_start
@@ -84,36 +97,11 @@ button.generator_b_choke_to_cold_start
 button.generator_b_choke_to_run
 ```
 
-Названия описывают физический результат, а не электрическое направление
-привода. Energy ATS не использует исторические `choke_open/choke_close`.
+Их физический смысл уже нормализован именами: `to_cold_start` переводит заслонку в положение холодного запуска, `to_run` — в рабочее положение.
 
-## 5. Внешняя температура
+## 4. Команды App через STDIN
 
-```text
-sensor.garage_temperature
-```
-
-Преобразуется в `ambient_temperature_external`. Температура не является
-источником истины для RUNNING и не участвует в силовой коммутации. При
-`unknown/unavailable` Generator Controller применяет консервативный сценарий
-прогрева.
-
-## 6. Команды Energy ATS
-
-Однократные команды передаются непосредственно в App через
-`hassio.app_stdin`.
-
-Пример:
-
-```yaml
-action: hassio.app_stdin
-data:
-  app: YOUR_ENERGY_ATS_APP_ID
-  input:
-    command: start_generator
-```
-
-Поддерживаются ровно:
+EnergyATS принимает:
 
 ```text
 start_generator
@@ -121,56 +109,130 @@ stop_generator
 reset
 ```
 
-- `start_generator` — создать управляемую ручную сессию;
-- `stop_generator` — безопасно снять генераторную нагрузку, выполнить cooldown
-  и остановить управляемый генератор;
-- `reset` — после осмотра выполнить ограниченную recovery-процедуру.
+- `start_generator` — начать managed-сессию на выбранном PRIMARY;
+- `stop_generator` — безопасно завершить текущую managed-сессию;
+- `reset` — начать контролируемое восстановление после `RECOVERY_REQUIRED`.
 
-При `armed: false` аппаратные команды запрещены.
+Команды не обходят safety checks и в режиме DISARMED не исполняют аппаратные действия.
 
-## 7. Диагностический sensor Energy ATS
+## 5. Status sensor
 
-Сам App публикует:
+App публикует:
 
 ```text
 sensor.energy_ats_status
 ```
 
-Это read-only диагностика. Sensor не используется контроллерами как вход.
+Это диагностическая проекция, а не вход управляющей логики.
 
-Основные атрибуты schema version 2:
+### State
+
+Человекочитаемое состояние, например:
+
+```text
+Питание от основной сети
+Запуск генератора
+Питание от генератора
+Питание от внешнего генератора
+Возврат на основную сеть
+В доме работает только UPS линия
+Требуется восстановление
+DISARMED — только наблюдение
+```
+
+### Attributes
+
+Текущая реализация публикует:
 
 ```text
 source
 generator
 generator_model
 generator_slot
+managed_generator
+bus_owner
+generator_a_run_context
+generator_b_run_context
 primary_generator
-primary_generator_slot
 phase
 remaining_seconds
 session_reason
+fallback_used
 armed
-schema_version
 ```
 
-`generator` и `generator_model` относятся к активной управляемой сессии либо
-подтверждённому генераторному источнику, когда он однозначно известен.
+Также публикуются стандартные `friendly_name` и `icon`.
 
-## 8. Необязательные уведомления
+В status sensor 0.4 **нет** отдельных `schema_version`, `bus_owner_slot` или `primary_generator_slot`.
+
+### `source`
+
+Допустимые значения доменной модели:
 
 ```text
-script.notify_warning
-script.notify_critical
-logbook.log
+grid
+generator
+ups_only
+no_power
+unknown
 ```
 
-Ошибка диагностического уведомления или Logbook не должна прерывать уже
-начатую аппаратную последовательность.
+A/B не кодируются в `source`. Конкретный генератор определяется `generator` / `generator_slot` и `bus_owner`.
 
-## 9. UI helper-ы
+### `phase`
 
-Такие сущности, как `sensor.house_powered_by_generator_name` или текстовые
-label-сенсоры для dashboard, являются представлением UI и не входят в
-управляющий контракт Energy ATS. Их можно строить поверх обязательных entities
-без изменения алгоритма App.
+Фаза Supervisor:
+
+```text
+waiting_for_data
+normal
+grid_failure_delay
+starting_generator
+on_generator
+returning_to_grid
+external_running
+recovery_required
+```
+
+### Run context
+
+`generator_a_run_context` и `generator_b_run_context`:
+
+```text
+none
+outage_related
+test_run
+other
+unknown
+```
+
+- `outage_related` — разрешено автоматически остановить после безопасного возврата на стабильную Grid;
+- `test_run` — не останавливается этим правилом;
+- `other` — известный не-outage запуск;
+- `unknown` — причина непрерывного RUNNING не доказана, поэтому автоматическая остановка запрещена.
+
+## 6. Logbook и уведомления
+
+Аппаратные действия и события Supervisor публикуются через HA Logbook. События уровня `critical` дополнительно вызывают:
+
+```text
+script.notify_critical
+```
+
+Ошибка Logbook/status/notification считается диагностической и не должна сама прерывать управляющую последовательность.
+
+## 7. Что намеренно отсутствует
+
+В HA-контракте EnergyATS 0.4 нет:
+
+- отдельного Battery contactor/path;
+- selector A/B генераторной шины — owner выбирает физическая взаимно заблокированная схема;
+- A/B position feedback контакторов генераторов;
+- helper-а, который объявляет внешний генератор managed;
+- автоматического запрета второго RUNNING.
+
+## 8. Fail-safe по неизвестным данным
+
+Перед аппаратным управлением обязательные entities должны иметь определённые значения. `unknown`, `unavailable` или отсутствие обязательного entity не интерпретируются как удобное значение по умолчанию.
+
+Если физическое состояние нельзя доказать, EnergyATS сохраняет наблюдаемость, но не получает права угадывать и выдавать активные команды.

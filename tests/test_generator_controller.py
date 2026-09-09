@@ -33,291 +33,58 @@ def profile(**changes) -> GeneratorProfile:
 
 
 def observed(**changes) -> GeneratorObservation:
-    base = GeneratorObservation(
-        running=False,
-        remote_on=False,
-        load_connected=False,
-        emergency_stop=False,
-        ambient_temperature_external=20.0,
+    return replace(
+        GeneratorObservation(
+            running=False,
+            remote_on=False,
+            load_connected=False,
+            emergency_stop=False,
+            ambient_temperature_external=20.0,
+        ),
+        **changes,
     )
-    return replace(base, **changes)
 
 
-def action_kinds(actions):
+def kinds(actions):
     return [action.kind for action in actions]
 
 
 def test_complete_managed_start_warmup_cooldown_and_stop():
     controller = GeneratorController(profile())
-    controller.step(0.0, observed(), desired_running=False)
+    controller.step(0.0, observed(), False)
     assert controller.phase == GeneratorPhase.IDLE
 
-    actions = controller.step(1.0, observed(), desired_running=True)
-    assert action_kinds(actions) == [GeneratorActionKind.CHOKE_TO_COLD_START]
-    assert controller.start_temperature_source == "ambient_temperature_external"
-
-    actions = controller.step(1.5, observed(), desired_running=True)
-    assert action_kinds(actions) == [GeneratorActionKind.REMOTE_ON]
-    assert controller.phase == GeneratorPhase.WAITING_FOR_RUNNING
+    assert kinds(controller.step(1.0, observed(), True)) == [
+        GeneratorActionKind.CHOKE_TO_COLD_START
+    ]
+    assert kinds(controller.step(1.5, observed(), True)) == [
+        GeneratorActionKind.REMOTE_ON
+    ]
 
     running = observed(running=True, remote_on=True)
-    assert controller.step(2.0, running, desired_running=True) == []
+    controller.step(2.0, running, True)
     assert controller.phase == GeneratorPhase.HOLDING_COLD_START_CHOKE
-
-    actions = controller.step(3.0, running, desired_running=True)
-    assert action_kinds(actions) == [GeneratorActionKind.CHOKE_TO_RUN]
-    assert controller.phase == GeneratorPhase.WARMING_UP
-
-    controller.step(5.0, running, desired_running=True)
-    assert controller.phase == GeneratorPhase.READY_FOR_LOAD
+    assert kinds(controller.step(3.0, running, True)) == [
+        GeneratorActionKind.CHOKE_TO_RUN
+    ]
+    controller.step(5.0, running, True)
     assert controller.status(running).ready_for_load is True
 
-    loaded = replace(running, load_connected=True)
-    controller.step(6.0, loaded, desired_running=False)
+    controller.step(6.0, replace(running, load_connected=True), False)
     assert controller.phase == GeneratorPhase.WAITING_FOR_LOAD_RELEASE
-
-    controller.step(7.0, running, desired_running=False)
+    controller.step(7.0, running, False)
     assert controller.phase == GeneratorPhase.COOLING_DOWN
-    actions = controller.step(10.0, running, desired_running=False)
-    assert action_kinds(actions) == [GeneratorActionKind.REMOTE_OFF]
-
-    controller.step(11.0, observed(), desired_running=False)
-    assert controller.phase == GeneratorPhase.IDLE
-
-
-def test_temperature_strategy_uses_external_ambient_temperature():
-    controller = GeneratorController(
-        profile(
-            choke_strategy=ChokeStrategy.TEMPERATURE,
-            choke_temperature=10.0,
-        )
-    )
-    controller.step(0.0, observed(), desired_running=False)
-
-    actions = controller.step(1.0, observed(ambient_temperature_external=18.0), True)
-    assert action_kinds(actions) == [GeneratorActionKind.CHOKE_TO_RUN]
-    assert controller.start_temperature == 18.0
-    assert controller.start_temperature_source == "ambient_temperature_external"
-
-
-def test_unknown_temperature_uses_conservative_cold_start():
-    controller = GeneratorController(
-        profile(choke_strategy=ChokeStrategy.TEMPERATURE)
-    )
-    controller.step(0.0, observed(), False)
-    actions = controller.step(
-        1.0,
-        observed(ambient_temperature_external=None),
-        True,
-    )
-    assert action_kinds(actions) == [GeneratorActionKind.CHOKE_TO_COLD_START]
-    assert controller.start_temperature_source == "conservative_fallback"
-
-
-def test_external_start_is_observed_but_never_captured():
-    controller = GeneratorController(profile())
-    external = observed(running=True, remote_on=False)
-
-    assert controller.step(0.0, external, desired_running=False) == []
-    assert controller.phase == GeneratorPhase.EXTERNAL_RUNNING
-    assert controller.status(external).externally_started is True
-
-    # Даже появившееся позднее намерение Supervisor не даёт ownership.
-    assert controller.step(1.0, external, desired_running=True) == []
-    assert controller.phase == GeneratorPhase.EXTERNAL_RUNNING
-
-    controller.step(
-        2.0,
-        observed(),
-        desired_running=False,
-        actions_allowed=False,
-    )
-    assert controller.phase == GeneratorPhase.IDLE
-
-
-def test_external_remote_request_is_observed_before_engine_is_running():
-    controller = GeneratorController(profile())
-    external_request = observed(running=False, remote_on=True)
-
-    assert controller.step(0.0, external_request, desired_running=False) == []
-    assert controller.phase == GeneratorPhase.EXTERNAL_RUNNING
-    assert controller.status(external_request).externally_started is True
-
-    controller.step(
-        1.0,
-        external_request,
-        desired_running=False,
-        actions_allowed=False,
-    )
-    assert controller.phase == GeneratorPhase.EXTERNAL_RUNNING
-
-    controller.step(
-        2.0,
-        observed(),
-        desired_running=False,
-        actions_allowed=False,
-    )
-    assert controller.phase == GeneratorPhase.IDLE
-
-
-def test_restart_restores_ownership_only_for_stable_managed_session():
-    running = observed(running=True, remote_on=True, load_connected=True)
-
-    managed = GeneratorController(profile())
-    managed.step(
-        0.0,
-        running,
-        desired_running=True,
-        stable_managed_session=True,
-    )
-    assert managed.phase == GeneratorPhase.READY_FOR_LOAD
-
-    unowned = GeneratorController(profile())
-    unowned.step(
-        0.0,
-        running,
-        desired_running=True,
-        stable_managed_session=False,
-    )
-    assert unowned.phase == GeneratorPhase.EXTERNAL_RUNNING
-
-
-def test_cancelled_start_waits_for_remote_off_confirmation():
-    controller = GeneratorController(profile())
-    controller.step(0.0, observed(), False)
-    controller.step(1.0, observed(), True)
-    controller.step(1.5, observed(remote_on=True), True)
-
-    actions = controller.step(2.0, observed(remote_on=True), False)
-    assert action_kinds(actions) == [
-        GeneratorActionKind.REMOTE_OFF,
-        GeneratorActionKind.CHOKE_TO_RUN,
+    assert kinds(controller.step(10.0, running, False)) == [
+        GeneratorActionKind.REMOTE_OFF
     ]
-
-
-def test_recovery_shutdown_uses_cooldown_for_owned_unloaded_generator():
-    controller = GeneratorController(profile())
-    running = observed(running=True, remote_on=True, load_connected=False)
-    controller.require_recovery("test")
-
-    actions, error = controller.step_recovery_shutdown(
-        1.0,
-        running,
-        owned_by_interrupted_session=True,
-    )
-    assert error is None
-    assert action_kinds(actions) == [GeneratorActionKind.CHOKE_TO_RUN]
-    assert controller.phase == GeneratorPhase.COOLING_DOWN
-
-    actions, error = controller.step_recovery_shutdown(
-        4.0,
-        running,
-        owned_by_interrupted_session=True,
-    )
-    assert error is None
-    assert action_kinds(actions) == [GeneratorActionKind.REMOTE_OFF]
-
-    actions, error = controller.step_recovery_shutdown(
-        5.0,
-        observed(),
-        owned_by_interrupted_session=True,
-    )
-    assert error is None
-    assert actions == []
+    controller.step(11.0, observed(), False)
     assert controller.phase == GeneratorPhase.IDLE
 
 
-def test_recovery_shutdown_never_adopts_external_generator():
-    controller = GeneratorController(profile())
-    external = observed(running=True, remote_on=True, load_connected=False)
-
-    actions, error = controller.step_recovery_shutdown(
-        1.0,
-        external,
-        owned_by_interrupted_session=False,
-    )
-
-    assert actions == []
-    assert error is not None
-    assert "вне управляемой сессии" in error
-    assert controller.phase == GeneratorPhase.EXTERNAL_RUNNING
-
-    controller.step(2.5, observed(remote_on=True), False)
-    assert controller.phase == GeneratorPhase.EXTERNAL_RUNNING
-    controller.step(3.0, observed(remote_on=False), False)
-    assert controller.phase == GeneratorPhase.IDLE
-
-
-def test_generator_is_never_stopped_while_load_is_connected():
-    controller = GeneratorController(profile())
-    running = observed(running=True, remote_on=True, load_connected=True)
-    controller.step(
-        0.0,
-        running,
-        desired_running=True,
-        stable_managed_session=True,
-    )
-
-    for now in (1.0, 10.0, 100.0):
-        actions = controller.step(now, running, desired_running=False)
-        assert GeneratorActionKind.REMOTE_OFF not in action_kinds(actions)
-    assert controller.phase == GeneratorPhase.WAITING_FOR_LOAD_RELEASE
-
-
-def test_temporary_unavailable_state_freezes_instead_of_losing_phase():
-    controller = GeneratorController(profile())
-    running = observed(running=True, remote_on=True)
-    controller.step(
-        0.0,
-        running,
-        desired_running=True,
-        stable_managed_session=True,
-    )
-    assert controller.phase == GeneratorPhase.READY_FOR_LOAD
-
-    unavailable = observed(running=None)
-    assert controller.step(1.0, unavailable, desired_running=True) == []
-    assert controller.phase == GeneratorPhase.READY_FOR_LOAD
-
-    controller.step(2.0, running, desired_running=True)
-    assert controller.phase == GeneratorPhase.READY_FOR_LOAD
-
-
-def test_start_timeout_opens_choke_and_removes_remote():
-    controller = GeneratorController(profile())
-    controller.step(0.0, observed(), False)
-    controller.step(1.0, observed(), True)
-    controller.step(1.5, observed(remote_on=True), True)
-
-    actions = controller.step(5.6, observed(remote_on=True), True)
-
-    assert action_kinds(actions) == [
-        GeneratorActionKind.REMOTE_OFF,
-        GeneratorActionKind.CHOKE_TO_RUN,
-    ]
-    assert controller.phase == GeneratorPhase.FAULT
-
-
-def test_temperature_equal_to_threshold_uses_run_position():
-    controller = GeneratorController(
-        profile(
-            choke_strategy=ChokeStrategy.TEMPERATURE,
-            choke_temperature=10.0,
-        )
-    )
-    controller.step(0.0, observed(), False)
-
-    actions = controller.step(
-        1.0,
-        observed(ambient_temperature_external=10.0),
-        True,
-    )
-
-    assert action_kinds(actions) == [GeneratorActionKind.CHOKE_TO_RUN]
-
-
-def test_warmup_table_has_explicit_temperature_boundaries():
+def test_temperature_strategy_and_warmup_boundaries():
     configured = profile(
+        choke_strategy=ChokeStrategy.TEMPERATURE,
+        choke_temperature=10.0,
         warm_temperature=10.0,
         cool_temperature=-5.0,
         cold_temperature=-10.0,
@@ -326,65 +93,131 @@ def test_warmup_table_has_explicit_temperature_boundaries():
         warmup_cold_seconds=180.0,
         warmup_very_cold_seconds=300.0,
     )
-
+    assert configured.should_use_choke(10.0) is False
+    assert configured.should_use_choke(9.9) is True
+    assert configured.should_use_choke(None) is True
     assert configured.warmup_seconds(10.0) == 30.0
     assert configured.warmup_seconds(-4.9) == 60.0
     assert configured.warmup_seconds(-5.0) == 180.0
     assert configured.warmup_seconds(-10.0) == 300.0
     assert configured.warmup_seconds(None) == 300.0
 
+    warm = GeneratorController(configured)
+    warm.step(0.0, observed(), False)
+    assert kinds(warm.step(
+        1.0, observed(ambient_temperature_external=18.0), True
+    )) == [GeneratorActionKind.CHOKE_TO_RUN]
+    assert warm.start_temperature == 18.0
 
-def test_ready_requires_both_running_and_managed_remote():
+
+def test_external_run_is_observed_but_never_captured():
     controller = GeneratorController(profile())
-    running = observed(running=True, remote_on=True)
-    controller.step(
-        0.0,
-        running,
-        desired_running=True,
-        stable_managed_session=True,
-    )
-    assert controller.status(running).ready_for_load is True
-
-    remote_lost = observed(running=True, remote_on=False)
-    assert controller.status(remote_lost).ready_for_load is False
-
-
-def test_already_stopped_unloaded_generator_needs_no_stop_command():
-    controller = GeneratorController(profile())
-    running = observed(running=True, remote_on=True, load_connected=False)
-    controller.step(
-        0.0,
-        running,
-        desired_running=True,
-        stable_managed_session=True,
-    )
-
-    actions = controller.step(1.0, observed(), desired_running=False)
-
-    assert actions == []
+    external = observed(running=True, remote_on=False)
+    assert controller.step(0.0, external, False) == []
+    assert controller.phase == GeneratorPhase.EXTERNAL_RUNNING
+    assert controller.step(1.0, external, True) == []
+    assert controller.phase == GeneratorPhase.EXTERNAL_RUNNING
+    controller.step(2.0, observed(), False, actions_allowed=False)
     assert controller.phase == GeneratorPhase.IDLE
 
 
-def test_running_off_without_remote_off_is_not_accepted_as_local_stop():
+def test_external_remote_request_is_observed_before_running():
     controller = GeneratorController(profile())
-    running = observed(running=True, remote_on=True, load_connected=False)
-    controller.step(
+    external = observed(remote_on=True)
+    controller.step(0.0, external, False)
+    assert controller.phase == GeneratorPhase.EXTERNAL_RUNNING
+    assert controller.step(1.0, external, True) == []
+
+
+def test_restart_restores_only_stable_managed_generator():
+    running = observed(running=True, remote_on=True, load_connected=True)
+
+    managed = GeneratorController(profile())
+    managed.step(0.0, running, True, stable_managed_session=True)
+    assert managed.phase == GeneratorPhase.READY_FOR_LOAD
+
+    external = GeneratorController(profile())
+    external.step(0.0, running, True, stable_managed_session=False)
+    assert external.phase == GeneratorPhase.EXTERNAL_RUNNING
+
+    uncertain = GeneratorController(profile())
+    uncertain.step(
         0.0,
-        running,
-        desired_running=True,
+        observed(remote_on=True),
+        True,
         stable_managed_session=True,
     )
-    controller.step(1.0, running, desired_running=False)
-    assert controller.phase == GeneratorPhase.COOLING_DOWN
+    assert uncertain.phase == GeneratorPhase.FAULT
 
-    actions = controller.step(
-        2.0,
-        observed(running=False, remote_on=True, load_connected=False),
-        desired_running=False,
-    )
 
-    assert controller.phase == GeneratorPhase.FAULT
-    assert action_kinds(actions) == [
+def test_cancelled_start_removes_remote_and_opens_choke():
+    controller = GeneratorController(profile())
+    controller.step(0.0, observed(), False)
+    controller.step(1.0, observed(), True)
+    controller.step(1.5, observed(remote_on=True), True)
+    assert kinds(controller.step(2.0, observed(remote_on=True), False)) == [
         GeneratorActionKind.REMOTE_OFF,
         GeneratorActionKind.CHOKE_TO_RUN,
     ]
+
+
+def test_load_must_be_released_before_managed_stop():
+    controller = GeneratorController(profile())
+    running = observed(running=True, remote_on=True, load_connected=True)
+    controller.step(0.0, running, True, stable_managed_session=True)
+    for now in (1.0, 10.0, 100.0):
+        assert GeneratorActionKind.REMOTE_OFF not in kinds(
+            controller.step(now, running, False)
+        )
+    assert controller.phase == GeneratorPhase.WAITING_FOR_LOAD_RELEASE
+
+
+def test_authorized_shutdown_cools_then_removes_remote():
+    controller = GeneratorController(profile())
+    running = observed(running=True, remote_on=True, load_connected=False)
+    controller.step(0.0, running, True, stable_managed_session=True)
+
+    actions, error = controller.step_authorized_shutdown(1.0, running)
+    assert error is None and actions == []
+    assert controller.phase == GeneratorPhase.COOLING_DOWN
+
+    actions, error = controller.step_authorized_shutdown(4.0, running)
+    assert error is None
+    assert kinds(actions) == [GeneratorActionKind.REMOTE_OFF]
+
+    actions, error = controller.step_authorized_shutdown(5.0, observed())
+    assert error is None and actions == []
+    assert controller.phase == GeneratorPhase.IDLE
+
+
+def test_authorized_shutdown_requires_released_load():
+    controller = GeneratorController(profile())
+    actions, error = controller.step_authorized_shutdown(
+        1.0,
+        observed(running=True, remote_on=True, load_connected=True),
+    )
+    assert actions == []
+    assert error is not None
+
+
+def test_fault_reset_requires_physically_stopped_generator():
+    controller = GeneratorController(profile())
+    controller.step(0.0, observed(), False)
+    controller.step(1.0, observed(), True)
+    controller.step(1.5, observed(remote_on=True), True)
+    controller.step(5.6, observed(remote_on=True), True)
+    assert controller.phase == GeneratorPhase.FAULT
+
+    assert controller.reset_if_safe(observed(remote_on=True)) is False
+    assert controller.phase == GeneratorPhase.FAULT
+    assert controller.reset_if_safe(observed()) is True
+    assert controller.phase == GeneratorPhase.IDLE
+
+
+def test_unknown_state_freezes_current_phase():
+    controller = GeneratorController(profile())
+    running = observed(running=True, remote_on=True)
+    controller.step(0.0, running, True, stable_managed_session=True)
+    assert controller.phase == GeneratorPhase.READY_FOR_LOAD
+    assert controller.step(1.0, observed(running=None), True) == []
+    assert controller.phase == GeneratorPhase.READY_FOR_LOAD

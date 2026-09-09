@@ -1,6 +1,6 @@
 """Граница между чистыми контроллерами и Home Assistant.
 
-Все entity_id и все HA service calls собраны здесь. Доменные автоматы получают
+Все entity_id и HA service calls собраны здесь. Доменные автоматы получают
 обычные dataclass-снимки и не зависят от протокола Home Assistant.
 """
 
@@ -26,6 +26,7 @@ from power_transfer import (
 
 ENTITIES = {
     "automatic_transfer": "input_boolean.automatic_generator_transfer",
+    "test_mode": "input_boolean.generator_test_mode",
     "grid_ready": "binary_sensor.grid_input_ready",
     "house_grid": "binary_sensor.house_powered_by_grid",
     "house_generator": "binary_sensor.house_powered_by_generator",
@@ -48,19 +49,12 @@ ENTITIES = {
     "source_generator": "switch.use_generator_as_power_source",
 }
 
-# Entity обновления создаётся Supervisor для установленного App и принадлежит
-# HA device "Energy ATS". Через неё записи Logbook связываются с этим device.
 ENERGY_ATS_LOG_ENTITY = "update.energy_ats_update"
-
-# Диагностический read-only sensor принадлежит самому App. Он создаётся через
-# HA State API и не участвует ни в одном управляющем решении.
 ENERGY_ATS_STATUS_ENTITY = "sensor.energy_ats_status"
 
 
 @dataclass(frozen=True)
 class GeneratorMetadata:
-    """Человеко-читаемая идентичность физического слота генератора из HA."""
-
     name: str
     model: str
 
@@ -69,6 +63,7 @@ class GeneratorMetadata:
 class HardwareSnapshot:
     grid_ready: bool | None
     automatic_transfer_enabled: bool
+    test_mode: bool | None
     emergency_stop: bool | None
     generators: dict[GeneratorSlot, GeneratorObservation]
     generator_metadata: dict[GeneratorSlot, GeneratorMetadata | None]
@@ -96,69 +91,58 @@ class HomeAssistantAdapter:
         grid_ready = self.bool_state(ENTITIES["grid_ready"])
         house_grid = self.bool_state(ENTITIES["house_grid"])
         house_generator = self.bool_state(ENTITIES["house_generator"])
-        running_a = self.bool_state(ENTITIES["generator_a_running"])
-        running_b = self.bool_state(ENTITIES["generator_b_running"])
         emergency_stop = self.bool_state(ENTITIES["emergency_stop"])
+        running = {
+            GeneratorSlot.A: self.bool_state(ENTITIES["generator_a_running"]),
+            GeneratorSlot.B: self.bool_state(ENTITIES["generator_b_running"]),
+        }
         ambient_temperature = self.float_state(
             ENTITIES["ambient_temperature_external"]
         )
 
-        generator_names = {
+        names = {
             GeneratorSlot.A: self.text_state(ENTITIES["generator_a_name"]),
             GeneratorSlot.B: self.text_state(ENTITIES["generator_b_name"]),
         }
-        generator_models = {
+        models = {
             GeneratorSlot.A: self.text_state(ENTITIES["generator_a_model"]),
             GeneratorSlot.B: self.text_state(ENTITIES["generator_b_model"]),
         }
-        generator_metadata = {
+        metadata = {
             slot: (
-                GeneratorMetadata(name=generator_names[slot], model=generator_models[slot])
-                if generator_names[slot] is not None
-                and generator_models[slot] is not None
+                GeneratorMetadata(name=names[slot], model=models[slot])
+                if names[slot] is not None and models[slot] is not None
                 else None
             )
             for slot in (GeneratorSlot.A, GeneratorSlot.B)
         }
 
         primary_name = self.text_state(ENTITIES["primary_generator"])
-        matching_primary_slots = [
+        primary_matches = [
             slot
-            for slot, name in generator_names.items()
+            for slot, name in names.items()
             if primary_name is not None and name == primary_name
         ]
         primary_generator = (
-            matching_primary_slots[0]
-            if len(matching_primary_slots) == 1
-            else None
+            primary_matches[0] if len(primary_matches) == 1 else None
         )
 
-        active_generator = None
-        if running_a is True and running_b is not True:
-            active_generator = GeneratorSlot.A
-        elif running_b is True and running_a is not True:
-            active_generator = GeneratorSlot.B
-
+        # По RUNNING нельзя определять владельца общей генераторной шины, когда
+        # работают оба двигателя. До GeneratorBusTracker здесь известен только
+        # факт, что при снятой генераторной ветви нагрузки точно нет.
+        load_connected = False if house_generator is False else None
         generators = {
             GeneratorSlot.A: GeneratorObservation(
-                running=running_a,
+                running=running[GeneratorSlot.A],
                 remote_on=self.bool_state(ENTITIES["generator_a_remote"]),
-                load_connected=self._generator_load(
-                    GeneratorSlot.A,
-                    house_generator,
-                    active_generator,
-                ),
+                load_connected=load_connected,
                 emergency_stop=emergency_stop,
                 ambient_temperature_external=ambient_temperature,
             ),
             GeneratorSlot.B: GeneratorObservation(
-                running=running_b,
+                running=running[GeneratorSlot.B],
                 remote_on=self.bool_state(ENTITIES["generator_b_remote"]),
-                load_connected=self._generator_load(
-                    GeneratorSlot.B,
-                    house_generator,
-                    active_generator,
-                ),
+                load_connected=load_connected,
                 emergency_stop=emergency_stop,
                 ambient_temperature_external=ambient_temperature,
             ),
@@ -169,9 +153,10 @@ class HomeAssistantAdapter:
             automatic_transfer_enabled=(
                 self.bool_state(ENTITIES["automatic_transfer"]) is True
             ),
+            test_mode=self.bool_state(ENTITIES["test_mode"]),
             emergency_stop=emergency_stop,
             generators=generators,
-            generator_metadata=generator_metadata,
+            generator_metadata=metadata,
             primary_generator=primary_generator,
             power_transfer=PowerTransferObservation(
                 grid_ready=grid_ready,
@@ -179,13 +164,14 @@ class HomeAssistantAdapter:
                 house_on_generator=house_generator,
                 grid_connected=self.bool_state(ENTITIES["grid_power"]),
                 generator_selected=self.bool_state(ENTITIES["source_generator"]),
-                active_generator=active_generator,
                 emergency_stop=emergency_stop,
             ),
         )
 
     def missing_required_entities(
-        self, *, include_control_entities: bool = True
+        self,
+        *,
+        include_control_entities: bool = True,
     ) -> list[str]:
         state_required = [
             ENTITIES["automatic_transfer"],
@@ -207,12 +193,12 @@ class HomeAssistantAdapter:
         ]
         existence_only: list[str] = []
         if include_control_entities:
-            existence_only.extend([
+            existence_only = [
                 ENTITIES["generator_a_choke_cold_start"],
                 ENTITIES["generator_a_choke_run"],
                 ENTITIES["generator_b_choke_cold_start"],
                 ENTITIES["generator_b_choke_run"],
-            ])
+            ]
 
         missing = [
             entity_id
@@ -231,14 +217,9 @@ class HomeAssistantAdapter:
         transfer_actions: list[TransferAction],
         generator_actions: list[GeneratorAction],
     ) -> None:
-        """Сначала выполнить все силовые команды, затем вспомогательный Logbook.
+        """Выполнить силовые команды, затем best-effort Logbook."""
 
-        Изоляция генераторной шины имеет приоритет перед командами двигателя.
-        Ошибка необязательного Logbook не может оборвать аппаратную
-        последовательность посередине.
-        """
         log_entries: list[tuple[str, str]] = []
-
         for action in transfer_actions:
             if not self.armed:
                 self.log.info("DISARMED: подавлена команда %s", action)
@@ -268,11 +249,6 @@ class HomeAssistantAdapter:
         await self._publish_log_entries(log_entries)
 
     async def publish_events(self, events: tuple[SupervisorEvent, ...]) -> None:
-        """Отправлять в HA только события, требующие немедленного внимания.
-
-        Все события уже записаны в журнал App. Обычные ``info`` и ``warning``
-        не должны превращаться в пользовательские уведомления.
-        """
         for event in events:
             try:
                 await self._logbook(event.message, ENERGY_ATS_LOG_ENTITY)
@@ -281,7 +257,6 @@ class HomeAssistantAdapter:
                     "Не удалось записать событие Energy ATS в Logbook: %s",
                     exc,
                 )
-
             if not self.armed or event.level != "critical":
                 continue
             try:
@@ -297,12 +272,6 @@ class HomeAssistantAdapter:
                 )
 
     async def publish_status(self, state: str, attributes: dict[str, Any]) -> bool:
-        """Best-effort публикация диагностического состояния Energy ATS.
-
-        Сенсор нужен человеку и dashboard, но не является частью контура
-        управления. Поэтому любая ошибка State API только попадает в журнал и
-        никогда не прерывает основной цикл ATS.
-        """
         try:
             await self.client.set_state(
                 ENERGY_ATS_STATUS_ENTITY,
@@ -340,20 +309,6 @@ class HomeAssistantAdapter:
         return str(state)
 
     @staticmethod
-    def _generator_load(
-        slot: GeneratorSlot,
-        house_generator: bool | None,
-        active_generator: GeneratorSlot | None,
-    ) -> bool | None:
-        if house_generator is False:
-            return False
-        if house_generator is None:
-            return None
-        if active_generator is None:
-            return None
-        return active_generator == slot
-
-    @staticmethod
     def _generator_service(
         action: GeneratorAction,
     ) -> tuple[str, str, str]:
@@ -367,35 +322,30 @@ class HomeAssistantAdapter:
         return ENTITIES[f"{prefix}_choke_run"], "button", "press"
 
     def _assert_generator_action_safe(self, action: GeneratorAction) -> None:
-        if action.kind == GeneratorActionKind.REMOTE_ON:
-            other = (
-                GeneratorSlot.B
-                if action.slot == GeneratorSlot.A
-                else GeneratorSlot.A
-            )
-            prefix = "generator_a" if other == GeneratorSlot.A else "generator_b"
-            if (
-                self.bool_state(ENTITIES[f"{prefix}_running"]) is not False
-                or self.bool_state(ENTITIES[f"{prefix}_remote"]) is not False
-            ):
-                raise UnsafeHardwareCommand(
-                    f"REMOTE {action.slot.value} запрещён: состояние второго "
-                    "генератора не подтверждено как OFF."
-                )
-
         if (
-            action.kind == GeneratorActionKind.REMOTE_OFF
-            and self.bool_state(ENTITIES["house_generator"]) is True
+            action.kind == GeneratorActionKind.REMOTE_ON
+            and self.bool_state(ENTITIES["emergency_stop"]) is not False
         ):
-            running_key = (
-                "generator_a_running"
-                if action.slot == GeneratorSlot.A
-                else "generator_b_running"
+            raise UnsafeHardwareCommand(
+                f"REMOTE ON {action.slot.value} запрещён при активном/неизвестном Emergency Stop."
             )
-            if self.bool_state(ENTITIES[running_key]) is True:
+
+        # Два RUNNING разрешены физической схемой. REMOTE OFF опасен только
+        # если отключаемый двигатель всё ещё работает и дом может быть на
+        # генераторной шине. Уже остановившемуся двигателю REMOTE можно снять,
+        # даже когда второй генератор продолжает питать дом.
+        if action.kind == GeneratorActionKind.REMOTE_OFF:
+            running_entity = (
+                ENTITIES["generator_a_running"]
+                if action.slot == GeneratorSlot.A
+                else ENTITIES["generator_b_running"]
+            )
+            target_running = self.bool_state(running_entity)
+            house_generator = self.bool_state(ENTITIES["house_generator"])
+            if target_running is not False and house_generator is not False:
                 raise UnsafeHardwareCommand(
-                    f"REMOTE OFF {action.slot.value} запрещён: дом ещё "
-                    "подтверждённо питается от работающего генератора."
+                    f"REMOTE OFF {action.slot.value} запрещён: отключаемый генератор "
+                    "может ещё питать дом."
                 )
 
     def _assert_transfer_action_safe(self, action: TransferAction) -> None:
@@ -414,8 +364,7 @@ class HomeAssistantAdapter:
                 or self.bool_state(ENTITIES["house_generator"]) is not False
             ):
                 raise UnsafeHardwareCommand(
-                    "Подключение Grid запрещено до подтверждённой изоляции "
-                    "генераторной шины."
+                    "Подключение Grid запрещено до подтверждённой изоляции генераторной ветви."
                 )
 
     @staticmethod
@@ -429,10 +378,7 @@ class HomeAssistantAdapter:
         return ENTITIES["source_generator"], "turn_off"
 
     async def _logbook(self, message: str, entity_id: str | None) -> None:
-        service_data = {
-            "name": "Energy ATS",
-            "message": message,
-        }
+        service_data = {"name": "Energy ATS", "message": message}
         if entity_id is not None:
             service_data["entity_id"] = entity_id
         await self.client.call_service(
@@ -442,9 +388,9 @@ class HomeAssistantAdapter:
         )
 
     async def _publish_log_entries(
-        self, entries: list[tuple[str, str]]
+        self,
+        entries: list[tuple[str, str]],
     ) -> None:
-        """Логирование не должно прерывать последовательность команд железу."""
         for message, entity_id in entries:
             try:
                 await self._logbook(message, entity_id)

@@ -4,11 +4,11 @@ configuration:
     description: >-
       Главный deployment-предохранитель. При выключенном параметре приложение
       только наблюдает за состояниями и не выполняет аппаратных service calls.
-      Чтение и журналирование физических состояний остаётся разрешено.
+      Чтение и журналирование состояний остаётся разрешено.
       Для первого запуска обязательно оставить выключенным.
   tick_seconds:
     name: "Период цикла ATS, с"
-    description: "Период вызова конечного автомата в рабочем режиме."
+    description: "Период вызова конечных автоматов в рабочем режиме."
   log_level:
     name: "Уровень логирования"
     description: "info рекомендуется для эксплуатации; debug — для диагностики."
@@ -18,20 +18,20 @@ configuration:
     description: "Сколько Grid Input Ready должен непрерывно быть OFF до начала запуска генератора."
   grid_restore_stable_time:
     name: "Стабилизация вернувшейся Grid, с"
-    description: "Сколько Grid Input Ready должен непрерывно быть ON перед возвратом дома на сеть."
+    description: "Сколько Grid Input Ready должен непрерывно быть ON перед возвратом дома на сеть и завершением outage-related запусков."
   transfer_confirmation_timeout:
     name: "Timeout подтверждения силового переключения, с"
-    description: "Ожидание физических house_powered_by_* после каждого шага силовой коммутации."
+    description: "Ожидание house_powered_by_* из цепей управления основных контакторов после шага коммутации."
 
   generator_a_enabled:
     name: "Разрешить генератор A"
     description: >-
       Разрешить Energy Supervisor использовать физический слот A для новой
-      управляемой сессии. Это policy-флаг Energy ATS; имя, модель и primary
+      managed-сессии. Это policy-флаг Energy ATS; имя, модель и primary
       читаются из Home Assistant.
   generator_b_enabled:
     name: "Разрешить генератор B"
     description: >-
       Разрешить Energy Supervisor использовать физический слот B для новой
-      управляемой сессии. Это policy-флаг Energy ATS; имя, модель и primary
+      managed-сессии. Это policy-флаг Energy ATS; имя, модель и primary
       читаются из Home Assistant.

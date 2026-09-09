@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import pytest
 
-from domain import GeneratorSlot
+from domain import GeneratorSlot, SessionReason
+from energy_supervisor import GeneratorSession, SupervisorPhase
 from ha_adapter import ENTITIES, ENERGY_ATS_STATUS_ENTITY
 from main import DEFAULT_OPTIONS, EnergySupervisorApp, _seconds_left
+from state_store import StateStore
 
 
 class StatusFakeClient:
@@ -25,9 +27,10 @@ class StatusFakeClient:
         self.published.append((entity_id, state, attributes or {}))
 
 
-def _grid_states() -> dict[str, str]:
+def grid_states() -> dict[str, str]:
     return {
         ENTITIES["automatic_transfer"]: "on",
+        ENTITIES["test_mode"]: "off",
         ENTITIES["grid_ready"]: "on",
         ENTITIES["house_grid"]: "on",
         ENTITIES["house_generator"]: "off",
@@ -51,76 +54,63 @@ def _grid_states() -> dict[str, str]:
     }
 
 
-def _app_with_fake(tmp_path):
+def app_with_fake(tmp_path):
     app = EnergySupervisorApp(
-        {
-            **DEFAULT_OPTIONS,
-            "armed": True,
-            "state_file": str(tmp_path / "state.json"),
-        },
+        {**DEFAULT_OPTIONS, "armed": True, "state_file": str(tmp_path / "state.json")},
         token="test",
     )
-    fake = StatusFakeClient(_grid_states())
+    fake = StatusFakeClient(grid_states())
     app.client = fake
     app.adapter.client = fake
     return app, fake
 
 
-def _normal_grid_observation(app: EnergySupervisorApp, now: float):
+def normal_observation(app: EnergySupervisorApp, now: float):
     hardware = app.adapter.snapshot()
     app._sync_generator_configuration(hardware)
+    hardware = app._apply_bus_model(hardware)
     app._refresh_component_views(now, hardware)
     observation = app._supervisor_observation(hardware)
     app.supervisor.step(now, observation)
     return app._supervisor_observation(hardware)
 
 
-def test_status_payload_uses_confirmed_source_and_public_contract(tmp_path):
-    app, _ = _app_with_fake(tmp_path)
-    observation = _normal_grid_observation(app, 100.0)
-
-    payload = app._status_payload(100.0, observation)
+def test_status_payload_exposes_current_v04_contract(tmp_path):
+    app, _ = app_with_fake(tmp_path)
+    payload = app._status_payload(100.0, normal_observation(app, 100.0))
 
     assert payload["state"] == "Питание от основной сети"
-    assert payload["attributes"] == {
-        "friendly_name": "Energy ATS Status",
-        "icon": "mdi:transfer-switch",
-        "source": "grid",
-        "phase": "normal",
-        "generator": None,
-        "generator_model": None,
-        "generator_slot": None,
-        "primary_generator": "Elemax",
-        "primary_generator_slot": "A",
-        "remaining_seconds": None,
-        "session_reason": None,
-        "armed": True,
-        "schema_version": 2,
-    }
+    attrs = payload["attributes"]
+    assert attrs["source"] == "grid"
+    assert attrs["phase"] == "normal"
+    assert attrs["generator"] is None
+    assert attrs["managed_generator"] is None
+    assert attrs["bus_owner"] in {"none", "unknown"}
+    assert attrs["generator_a_run_context"] == "none"
+    assert attrs["generator_b_run_context"] == "none"
+    assert attrs["primary_generator"] == "Elemax"
+    assert attrs["fallback_used"] is False
+    assert attrs["armed"] is True
+    assert "schema_version" not in attrs
+    assert "primary_generator_slot" not in attrs
+    assert "bus_owner_slot" not in attrs
 
 
-def test_status_reports_manual_battery_path_when_grid_is_available(tmp_path):
-    app, fake = _app_with_fake(tmp_path)
+def test_status_reports_ups_only_when_grid_is_intentionally_isolated(tmp_path):
+    app, fake = app_with_fake(tmp_path)
     fake.states[ENTITIES["grid_power"]] = "off"
     fake.states[ENTITIES["house_grid"]] = "off"
-    observation = _normal_grid_observation(app, 100.0)
-
-    payload = app._status_payload(100.0, observation)
-
-    assert payload["state"] == (
-        "Grid доступна · Grid path отключён · питание от аккумуляторов МАП"
-    )
-    assert payload["attributes"]["source"] == "battery"
+    payload = app._status_payload(100.0, normal_observation(app, 100.0))
+    assert payload["state"] == "В доме работает только UPS линия"
+    assert payload["attributes"]["source"] == "ups_only"
 
 
 @pytest.mark.asyncio
 async def test_status_publication_is_deduplicated(tmp_path):
-    app, fake = _app_with_fake(tmp_path)
-    observation = _normal_grid_observation(app, 100.0)
-
+    app, fake = app_with_fake(tmp_path)
+    observation = normal_observation(app, 100.0)
     await app._publish_status(100.0, observation)
     await app._publish_status(100.0, observation)
-
     assert len(fake.published) == 1
     entity_id, state, attributes = fake.published[0]
     assert entity_id == ENERGY_ATS_STATUS_ENTITY
@@ -128,7 +118,39 @@ async def test_status_publication_is_deduplicated(tmp_path):
     assert attributes["source"] == "grid"
 
 
-def test_seconds_left_rounds_up_and_never_becomes_negative():
+def test_grid_restore_remaining_time_uses_only_current_supervisor_phase(tmp_path):
+    app, _ = app_with_fake(tmp_path)
+    observation = normal_observation(app, 100.0)
+    app.supervisor.session = GeneratorSession.begin(
+        SessionReason.GRID_OUTAGE,
+        GeneratorSlot.A,
+        grid_was_unavailable=True,
+    )
+    app.supervisor.phase = SupervisorPhase.ON_GENERATOR
+    app.supervisor.grid_ready_since = 90.0
+
+    assert app._remaining_seconds(100.0, observation) == 50
+
+
+def test_corrupted_generator_bus_journal_requires_recovery(tmp_path):
+    state_file = tmp_path / "state.json"
+    app = EnergySupervisorApp(
+        {**DEFAULT_OPTIONS, "state_file": str(state_file)},
+        token="test",
+    )
+    app._save_state(force=True)
+    payload = StateStore(state_file).load()
+    payload["generator_bus"] = {"owner": "impossible"}
+    StateStore(state_file).save(payload)
+
+    restored = EnergySupervisorApp(
+        {**DEFAULT_OPTIONS, "state_file": str(state_file)},
+        token="test",
+    )
+    assert restored.supervisor.phase == SupervisorPhase.RECOVERY_REQUIRED
+
+
+def test_seconds_left_rounds_up_and_never_negative():
     assert _seconds_left(3.01) == 4
     assert _seconds_left(3.0) == 3
     assert _seconds_left(0.01) == 1

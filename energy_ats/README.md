@@ -1,17 +1,24 @@
-# Energy ATS 0.3.13
+# Energy ATS 0.4.0
 
-Home Assistant App, реализующий логику управления источниками электроэнергии
-частного дома.
+Home Assistant App для управления резервным электроснабжением дома.
 
-Полное описание логики и границ ответственности:
+Версия 0.4 перестраивает внутреннюю модель вокруг фактической физической схемы:
 
-- `../docs/REQUIREMENTS_RU.md` — утверждённые сценарии и требования;
+- `UPS_ONLY` вместо виртуального Battery path;
+- аппаратный FIFO owner общей генераторной шины;
+- штатные два RUNNING;
+- один managed fallback `PRIMARY -> SECONDARY`;
+- внешний SECONDARY без автоматического захвата ownership;
+- outage-related shutdown после возврата Grid;
+- исключение `TEST_RUN`;
+- persistent owner/run-context между restart.
+
+Основные документы:
+
+- `../docs/PHYSICAL_POWER_TOPOLOGY_RU.md` — физическая схема;
+- `../docs/REQUIREMENTS_RU.md` — требования;
 - `../docs/ARCHITECTURE_RU.md` — архитектура;
-- `../docs/ENTITIES_RU.md` — внешний контракт Home Assistant;
-- `../docs/INSTALL_RU.md` — обновление и первый запуск.
+- `../docs/ENTITIES_RU.md` — Home Assistant contract;
+- `../docs/INSTALL_RU.md` — установка, обновление и физические испытания.
 
-В 0.3.13 имя, модель и primary генератора читаются из Home Assistant; A/B
-остаются стабильными аппаратными слотами Energy ATS.
-
-Для первого безопасного запуска и после обновления обязательно использовать
-`armed: false`.
+Для первого запуска и после обновления с 0.3.x использовать `armed: false`. Старый persistent journal автоматически в новую модель не мигрируется.

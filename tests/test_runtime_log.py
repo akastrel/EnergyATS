@@ -1,4 +1,4 @@
-"""Человеко-читаемое представление runtime-состояния Energy ATS."""
+"""Человеко-читаемое runtime-состояние EnergyATS v0.4."""
 
 from __future__ import annotations
 
@@ -8,63 +8,66 @@ from types import SimpleNamespace
 
 from domain import GeneratorSlot, PowerPath, PowerSource
 from energy_supervisor import SupervisorObservation
-from generator_controller import GeneratorPhase, GeneratorStatus, default_generator_profiles
+from generator_bus import GeneratorBusTracker
+from generator_controller import (
+    GeneratorController,
+    GeneratorPhase,
+    GeneratorStatus,
+    default_generator_profiles,
+)
 from main import EnergySupervisorApp
 from power_transfer import PowerTransferStatus, TransferPhase
 
 
-def _generator_status(slot: GeneratorSlot, phase: GeneratorPhase) -> GeneratorStatus:
+def generator_status(slot: GeneratorSlot, phase: GeneratorPhase) -> GeneratorStatus:
+    running = phase != GeneratorPhase.IDLE
     return GeneratorStatus(
         slot=slot,
         display_name=slot.value,
         phase=phase,
-        running=phase != GeneratorPhase.IDLE,
-        remote_on=phase != GeneratorPhase.IDLE,
+        running=running,
+        remote_on=running,
         ready_for_load=phase == GeneratorPhase.READY_FOR_LOAD,
-        externally_started=phase == GeneratorPhase.EXTERNAL_RUNNING,
         fault=None,
-        start_temperature=None,
-        start_temperature_source=None,
     )
 
 
-def _observation(
+def observation(
     *,
-    grid_ready: bool = True,
-    source: PowerSource = PowerSource.GRID,
-    path: PowerPath = PowerPath.GRID,
-    transfer_phase: TransferPhase = TransferPhase.STABLE_GRID_PATH,
-    target_source: PowerSource | None = PowerSource.GRID,
-    generator_a_phase: GeneratorPhase = GeneratorPhase.IDLE,
-    generator_b_phase: GeneratorPhase = GeneratorPhase.IDLE,
-) -> SupervisorObservation:
+    grid_ready=True,
+    source=PowerSource.GRID,
+    path=PowerPath.GRID,
+    phase=TransferPhase.STABLE_GRID,
+    target=PowerSource.GRID,
+    a_phase=GeneratorPhase.IDLE,
+    b_phase=GeneratorPhase.IDLE,
+):
     return SupervisorObservation(
         grid_ready=grid_ready,
         automatic_transfer_enabled=True,
         emergency_stop=False,
         power=PowerTransferStatus(
-            phase=transfer_phase,
+            phase=phase,
             actual_source=source,
             actual_path=path,
-            target_source=target_source,
-            transition_in_progress=transfer_phase
-            in {
+            target_source=target,
+            transition_in_progress=phase in {
                 TransferPhase.DISCONNECTING_GRID,
                 TransferPhase.SELECTING_GENERATOR,
                 TransferPhase.DISCONNECTING_GENERATOR,
                 TransferPhase.CONNECTING_GRID,
             },
-            recovery_required=transfer_phase == TransferPhase.RECOVERY_REQUIRED,
+            recovery_required=phase == TransferPhase.RECOVERY_REQUIRED,
             fault=None,
         ),
         generators={
-            GeneratorSlot.A: _generator_status(GeneratorSlot.A, generator_a_phase),
-            GeneratorSlot.B: _generator_status(GeneratorSlot.B, generator_b_phase),
+            GeneratorSlot.A: generator_status(GeneratorSlot.A, a_phase),
+            GeneratorSlot.B: generator_status(GeneratorSlot.B, b_phase),
         },
     )
 
 
-def _app() -> EnergySupervisorApp:
+def app_for_log() -> EnergySupervisorApp:
     app = object.__new__(EnergySupervisorApp)
     profiles = default_generator_profiles()
     profiles[GeneratorSlot.A] = replace(
@@ -73,82 +76,80 @@ def _app() -> EnergySupervisorApp:
     profiles[GeneratorSlot.B] = replace(
         profiles[GeneratorSlot.B], display_name="Вепрь"
     )
-    app.profiles = profiles
+    app.generator_controllers = {
+        slot: GeneratorController(profile)
+        for slot, profile in profiles.items()
+    }
     app.armed = True
     app._last_runtime_signature = None
     app.log = logging.getLogger("test_runtime_log")
+    app.generator_bus = GeneratorBusTracker()
     app.supervisor = SimpleNamespace(
         config=SimpleNamespace(primary_generator=GeneratorSlot.A),
         session=None,
-        status_text=lambda observation: "Питание от основной сети",
+        status_text=lambda _observation: "Питание от основной сети",
     )
     return app
 
 
-def test_stable_grid_log_uses_names_and_hides_transfer(caplog) -> None:
-    app = _app()
-    observation = _observation()
-
+def test_stable_grid_log_names_generators_and_bus(caplog):
+    app = app_for_log()
     with caplog.at_level(logging.INFO, logger="test_runtime_log"):
-        app._log_runtime_if_changed(observation)
+        app._log_runtime_if_changed(observation())
 
     assert caplog.messages == [
         "Состояние: Питание от основной сети; Grid=ON; AVR=ON; power=Grid; "
-        "Elemax: остановлен; Вепрь: остановлен; primary=Elemax."
+        "bus=unknown; Elemax: остановлен; Вепрь: остановлен; primary=Elemax."
     ]
 
 
-def test_generator_transfer_names_target_generator(caplog) -> None:
-    app = _app()
-    observation = _observation(
+def test_ups_only_is_not_reported_as_battery_path(caplog):
+    app = app_for_log()
+    app.supervisor.status_text = lambda _observation: "В доме работает только UPS линия"
+    obs = observation(
         grid_ready=False,
-        source=PowerSource.BATTERY,
-        path=PowerPath.BATTERY,
-        transfer_phase=TransferPhase.SELECTING_GENERATOR,
-        target_source=PowerSource.GENERATOR_A,
-        generator_a_phase=GeneratorPhase.READY_FOR_LOAD,
+        source=PowerSource.UPS_ONLY,
+        path=PowerPath.ISOLATED,
+        phase=TransferPhase.STABLE_ISOLATED,
+        target=None,
     )
-    app.supervisor.status_text = lambda observation: "Переключение на генератор"
-
     with caplog.at_level(logging.INFO, logger="test_runtime_log"):
-        app._log_runtime_if_changed(observation)
-
-    assert caplog.messages == [
-        "Состояние: Переключение на генератор; Grid=OFF; AVR=ON; power=Battery; "
-        "transfer=connecting Elemax; Elemax: готов; Вепрь: остановлен; "
-        "primary=Elemax."
-    ]
+        app._log_runtime_if_changed(obs)
+    assert "power=UPS only" in caplog.messages[0]
+    assert "Battery" not in caplog.messages[0]
 
 
-def test_generator_under_load_is_reported_as_loaded(caplog) -> None:
-    app = _app()
-    observation = _observation(
+def test_generator_owner_is_named_and_reported_under_load(caplog):
+    app = app_for_log()
+    app.generator_bus.update(
+        {GeneratorSlot.A: True, GeneratorSlot.B: False},
         grid_ready=False,
-        source=PowerSource.GENERATOR_A,
+        test_mode=False,
+        managed_slot=GeneratorSlot.A,
+        managed_outage=True,
+    )
+    app.supervisor.status_text = lambda _observation: "Питание от генератора"
+    obs = observation(
+        grid_ready=False,
+        source=PowerSource.GENERATOR,
         path=PowerPath.GENERATOR,
-        transfer_phase=TransferPhase.STABLE_GENERATOR,
-        target_source=PowerSource.GENERATOR_A,
-        generator_a_phase=GeneratorPhase.READY_FOR_LOAD,
+        phase=TransferPhase.STABLE_GENERATOR,
+        target=PowerSource.GENERATOR,
+        a_phase=GeneratorPhase.READY_FOR_LOAD,
     )
-    app.supervisor.status_text = lambda observation: "Питание от генератора"
-
     with caplog.at_level(logging.INFO, logger="test_runtime_log"):
-        app._log_runtime_if_changed(observation)
+        app._log_runtime_if_changed(obs)
 
-    assert caplog.messages == [
-        "Состояние: Питание от генератора; Grid=OFF; AVR=ON; "
-        "power=Generator Elemax; Elemax: под нагрузкой; Вепрь: остановлен; "
-        "primary=Elemax."
-    ]
+    assert "power=Generator Elemax" in caplog.messages[0]
+    assert "bus=Elemax" in caplog.messages[0]
+    assert "Elemax: под нагрузкой" in caplog.messages[0]
 
 
-def test_grid_change_is_part_of_visible_signature(caplog) -> None:
-    app = _app()
-
+def test_grid_change_changes_visible_signature(caplog):
+    app = app_for_log()
     with caplog.at_level(logging.INFO, logger="test_runtime_log"):
-        app._log_runtime_if_changed(_observation(grid_ready=False))
-        app._log_runtime_if_changed(_observation(grid_ready=True))
-
+        app._log_runtime_if_changed(observation(grid_ready=False))
+        app._log_runtime_if_changed(observation(grid_ready=True))
     assert len(caplog.messages) == 2
     assert "Grid=OFF" in caplog.messages[0]
     assert "Grid=ON" in caplog.messages[1]
