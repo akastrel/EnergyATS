@@ -1,4 +1,4 @@
-"""Политика EnergyATS поверх GC, TPC и наблюдаемой генераторной шины."""
+"""Policy EnergyATS поверх GC, TPC и наблюдаемой генераторной шины."""
 
 from __future__ import annotations
 
@@ -112,6 +112,8 @@ class SupervisorDecision:
 
 
 class EnergySupervisor:
+    """Хранит только policy-state; физические переходы выполняют GC/TPC."""
+
     def __init__(self, config: SupervisorConfig | None = None) -> None:
         self.config = config or SupervisorConfig()
         self.phase = SupervisorPhase.WAITING_FOR_DATA
@@ -131,7 +133,7 @@ class EnergySupervisor:
         self._events: list[SupervisorEvent] = []
         self._stop_outage_generators: set[GeneratorSlot] = set()
 
-    # Requests / recovery ---------------------------------------------
+    # Requests / recovery --------------------------------------------
 
     def request_manual_start(self) -> None:
         self._manual_start_requested = True
@@ -196,7 +198,13 @@ class EnergySupervisor:
             and self.session.generator == slot
         )
 
-    # Main policy ------------------------------------------------------
+    def take_events(self) -> tuple[SupervisorEvent, ...]:
+        """Забрать накопленные события без повторного шага policy FSM."""
+        events = tuple(self._events)
+        self._events.clear()
+        return events
+
+    # Main policy -----------------------------------------------------
 
     def step(self, now: float, o: SupervisorObservation) -> SupervisorDecision:
         self._stop_outage_generators.clear()
@@ -217,7 +225,9 @@ class EnergySupervisor:
             return self._decision(o)
         if o.power.recovery_required:
             self._discard_requests()
-            self._require_recovery(o.power.fault or "Power Transfer требует восстановления.")
+            self._require_recovery(
+                o.power.fault or "Power Transfer требует восстановления."
+            )
             return self._decision(o)
 
         if self._manual_start_requested:
@@ -251,14 +261,14 @@ class EnergySupervisor:
 
         if self.phase != SupervisorPhase.ON_GENERATOR or not self._restored_session_matches(o):
             self._require_recovery(
-                "После restart сохранённая managed-сессия не совпадает с устойчивой физической схемой."
+                "После restart сохранённая managed-сессия не совпадает "
+                "с устойчивой физической схемой."
             )
             return
 
         self.desired_source = PowerSource.GENERATOR
         self.desired_generators = _stopped_generators()
-        owner = self._owner(o)
-        if owner == self.session.generator:
+        if self._owner(o) == self.session.generator:
             self.desired_generators[self.session.generator] = True
 
     def _without_session(self, now: float, o: SupervisorObservation) -> None:
@@ -349,17 +359,19 @@ class EnergySupervisor:
                 "Дом подключён к генераторной шине, но её physical owner неизвестен."
             )
             return
+
         self.phase = SupervisorPhase.ON_GENERATOR
         if owner == slot:
             self._event(
-                "warning", f"Дом переведён на резервное питание от {generator.display_name}."
+                "warning",
+                f"Дом переведён на резервное питание от {generator.display_name}.",
             )
         else:
             self.desired_generators[slot] = generator.running is True
             self._event(
                 "warning",
-                f"Генераторную шину удерживает внешний {o.generators[owner].display_name}; "
-                "EnergyATS не принимает его под управление.",
+                f"Генераторную шину удерживает внешний "
+                f"{o.generators[owner].display_name}; EnergyATS не принимает его под управление.",
             )
 
     def _on_generator(self, o: SupervisorObservation) -> None:
@@ -381,8 +393,10 @@ class EnergySupervisor:
             return
 
         if owner is not None and o.generators[owner].running is True:
-            # Второй двигатель физически питает шину, но ownership остаётся внешним.
-            self.desired_generators[slot] = managed.running is True and managed.remote_on is True
+            # Hardware already moved the common bus. External owner stays external.
+            self.desired_generators[slot] = (
+                managed.running is True and managed.remote_on is True
+            )
             return
 
         if o.bus is not None and o.bus.owner == GeneratorBusOwner.UNKNOWN:
@@ -398,9 +412,7 @@ class EnergySupervisor:
         other_status = o.generators[other]
         self.desired_generators[failed] = False
 
-        # Fallback в одной managed-сессии разрешён только один раз. После отказа
-        # SECONDARY автоматика не возвращается к PRIMARY, даже если его REMOTE
-        # остался включён после предыдущей неудачной попытки.
+        # Once fallback was used, never ping-pong back to the previous slot.
         if self.session.fallback_used:
             self._require_recovery(f"Отказ SECONDARY после fallback: {reason}")
             return
@@ -467,11 +479,14 @@ class EnergySupervisor:
         owner = self._owner(o)
         if owner is not None and o.generators[owner].running is True:
             self.desired_source = PowerSource.GENERATOR
-            self.desired_generators[self.session.generator] = owner == self.session.generator
+            self.desired_generators[self.session.generator] = (
+                owner == self.session.generator
+            )
             self.phase = SupervisorPhase.ON_GENERATOR
             self._event(
                 "warning",
-                "Grid снова пропала во время возврата; сохраняем доступный генераторный источник.",
+                "Grid снова пропала во время возврата; "
+                "сохраняем доступный генераторный источник.",
             )
             return
 
@@ -486,7 +501,7 @@ class EnergySupervisor:
             else SupervisorPhase.STARTING_GENERATOR
         )
 
-    # Session commands -------------------------------------------------
+    # Session commands ------------------------------------------------
 
     def _manual_start(self, o: SupervisorObservation) -> None:
         if self.session is not None:
@@ -520,23 +535,10 @@ class EnergySupervisor:
 
         slot = self.config.primary_generator
         status = o.generators[slot]
-
-        # Новая сессия всегда начинается с выбранного PRIMARY. Автоматически
-        # подменять запрещённый/уже неисправный PRIMARY на SECONDARY до попытки
-        # запуска требования 0.4 не разрешают; fallback существует только внутри
-        # уже начатой managed-сессии после фактического отказа PRIMARY.
-        if not self.config.generator_enabled(slot):
+        if not self.config.generator_enabled(slot) or _generator_failed(status):
             self._event(
                 "warning",
-                f"PRIMARY {status.display_name} запрещён политикой EnergyATS; "
-                "managed-сессия не создана.",
-            )
-            return
-        if _generator_failed(status):
-            self._event(
-                "warning",
-                f"PRIMARY {status.display_name} находится в fault; "
-                "managed-сессия не создана.",
+                f"PRIMARY {status.display_name} недоступен; новая managed-сессия не начата.",
             )
             return
 
@@ -550,15 +552,12 @@ class EnergySupervisor:
             GeneratorSlot.B: slot == GeneratorSlot.B,
         }
         self.desired_source = (
-            PowerSource.UPS_ONLY
-            if o.grid_ready is False
-            else o.power.actual_source
+            PowerSource.UPS_ONLY if o.grid_ready is False else o.power.actual_source
         )
         self.phase = SupervisorPhase.STARTING_GENERATOR
         self._event(
             "info",
-            f"Начата сессия {reason.value}; запрошен запуск "
-            f"{o.generators[slot].display_name}.",
+            f"Начата сессия {reason.value}; запрошен запуск {status.display_name}.",
         )
 
     def _finish_session(self) -> None:
@@ -569,11 +568,9 @@ class EnergySupervisor:
         self.grid_failed_since = None
         self._stop_outage_generators.clear()
 
-    # Derived state / persistence -------------------------------------
+    # Derived state / persistence ------------------------------------
 
     def _decision(self, o: SupervisorObservation) -> SupervisorDecision:
-        events = tuple(self._events)
-        self._events.clear()
         owner = self._owner(o)
         stable_managed = (
             self.session.generator
@@ -593,7 +590,7 @@ class EnergySupervisor:
             ),
             stable_managed_generator=stable_managed,
             stop_outage_generators=frozenset(self._stop_outage_generators),
-            events=events,
+            events=self.take_events(),
         )
 
     def status_text(self, o: SupervisorObservation) -> str:
@@ -614,7 +611,10 @@ class EnergySupervisor:
         if self.phase == SupervisorPhase.RECOVERY_REQUIRED:
             return "Требуется восстановление"
         if self.phase == SupervisorPhase.ON_GENERATOR:
-            if self.session is not None and self._owner(o) not in {None, self.session.generator}:
+            if (
+                self.session is not None
+                and self._owner(o) not in {None, self.session.generator}
+            ):
                 return "Питание от внешнего генератора"
             return "Питание от генератора"
         return {
@@ -628,7 +628,9 @@ class EnergySupervisor:
         return {
             "phase": self.phase.value,
             "session": self.session.to_dict() if self.session else None,
-            "automatic_start_suppressed_until_grid": self.automatic_start_suppressed_until_grid,
+            "automatic_start_suppressed_until_grid": (
+                self.automatic_start_suppressed_until_grid
+            ),
             "recovery_reason": self.recovery_reason,
         }
 
@@ -642,7 +644,9 @@ class EnergySupervisor:
         supervisor.phase = SupervisorPhase(str(data["phase"]))
         session = data.get("session")
         supervisor.session = (
-            GeneratorSession.from_dict(session) if isinstance(session, Mapping) else None
+            GeneratorSession.from_dict(session)
+            if isinstance(session, Mapping)
+            else None
         )
         supervisor.automatic_start_suppressed_until_grid = _strict_bool(
             data.get("automatic_start_suppressed_until_grid", False),
