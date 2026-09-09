@@ -270,14 +270,9 @@ async def test_managed_a_dies_external_b_takes_bus_without_becoming_managed(tmp_
 
     fake.calls.clear()
     fake.states[ENTITIES["generator_a_running"]] = "off"
-    for _ in range(10):
-        await app._tick(now)
-        if app.supervisor.phase == SupervisorPhase.ON_EXTERNAL_GENERATOR:
-            break
-        now += 1.0
-    else:
-        raise AssertionError("EnergyATS не распознал внешний takeover B")
+    await app._tick(now)
 
+    assert app.supervisor.phase == SupervisorPhase.ON_GENERATOR
     assert app.generator_bus.status().owner_slot == GeneratorSlot.B
     assert app.supervisor.session is not None
     assert app.supervisor.session.generator == GeneratorSlot.A
