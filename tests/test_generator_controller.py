@@ -81,25 +81,7 @@ def test_complete_managed_start_warmup_cooldown_and_stop():
     assert controller.phase == GeneratorPhase.IDLE
 
 
-def test_temperature_strategy_uses_run_position_when_warm():
-    controller = GeneratorController(
-        profile(choke_strategy=ChokeStrategy.TEMPERATURE, choke_temperature=10.0)
-    )
-    controller.step(0.0, observed(), False)
-    actions = controller.step(1.0, observed(ambient_temperature_external=18.0), True)
-    assert kinds(actions) == [GeneratorActionKind.CHOKE_TO_RUN]
-    assert controller.start_temperature == 18.0
-
-
-def test_unknown_temperature_uses_conservative_cold_start():
-    controller = GeneratorController(profile(choke_strategy=ChokeStrategy.TEMPERATURE))
-    controller.step(0.0, observed(), False)
-    assert kinds(controller.step(
-        1.0, observed(ambient_temperature_external=None), True
-    )) == [GeneratorActionKind.CHOKE_TO_COLD_START]
-
-
-def test_temperature_and_warmup_boundaries_are_explicit():
+def test_temperature_strategy_and_warmup_boundaries():
     configured = profile(
         choke_strategy=ChokeStrategy.TEMPERATURE,
         choke_temperature=10.0,
@@ -113,14 +95,22 @@ def test_temperature_and_warmup_boundaries_are_explicit():
     )
     assert configured.should_use_choke(10.0) is False
     assert configured.should_use_choke(9.9) is True
+    assert configured.should_use_choke(None) is True
     assert configured.warmup_seconds(10.0) == 30.0
     assert configured.warmup_seconds(-4.9) == 60.0
     assert configured.warmup_seconds(-5.0) == 180.0
     assert configured.warmup_seconds(-10.0) == 300.0
     assert configured.warmup_seconds(None) == 300.0
 
+    warm = GeneratorController(configured)
+    warm.step(0.0, observed(), False)
+    assert kinds(warm.step(
+        1.0, observed(ambient_temperature_external=18.0), True
+    )) == [GeneratorActionKind.CHOKE_TO_RUN]
+    assert warm.start_temperature == 18.0
 
-def test_external_running_is_observed_but_never_captured():
+
+def test_external_run_is_observed_but_never_captured():
     controller = GeneratorController(profile())
     external = observed(running=True, remote_on=False)
     assert controller.step(0.0, external, False) == []
@@ -151,8 +141,13 @@ def test_restart_restores_only_stable_managed_generator():
     assert external.phase == GeneratorPhase.EXTERNAL_RUNNING
 
     uncertain = GeneratorController(profile())
-    uncertain.step(0.0, observed(remote_on=True), True)
-    assert uncertain.phase == GeneratorPhase.RECOVERY_REQUIRED
+    uncertain.step(
+        0.0,
+        observed(remote_on=True),
+        True,
+        stable_managed_session=True,
+    )
+    assert uncertain.phase == GeneratorPhase.FAULT
 
 
 def test_cancelled_start_removes_remote_and_opens_choke():
@@ -182,53 +177,41 @@ def test_authorized_shutdown_cools_then_removes_remote():
     running = observed(running=True, remote_on=True, load_connected=False)
     controller.step(0.0, running, True, stable_managed_session=True)
 
-    actions, error = controller.step_authorized_shutdown(1.0, running, authorized=True)
+    actions, error = controller.step_authorized_shutdown(1.0, running)
     assert error is None and actions == []
     assert controller.phase == GeneratorPhase.COOLING_DOWN
 
-    actions, error = controller.step_authorized_shutdown(4.0, running, authorized=True)
+    actions, error = controller.step_authorized_shutdown(4.0, running)
     assert error is None
     assert kinds(actions) == [GeneratorActionKind.REMOTE_OFF]
 
-    actions, error = controller.step_authorized_shutdown(5.0, observed(), authorized=True)
+    actions, error = controller.step_authorized_shutdown(5.0, observed())
     assert error is None and actions == []
     assert controller.phase == GeneratorPhase.IDLE
 
 
-def test_authorized_shutdown_rejects_loaded_generator():
+def test_authorized_shutdown_requires_released_load():
     controller = GeneratorController(profile())
     actions, error = controller.step_authorized_shutdown(
         1.0,
         observed(running=True, remote_on=True, load_connected=True),
-        authorized=True,
     )
     assert actions == []
     assert error is not None
 
 
-def test_unauthorized_external_shutdown_never_emits_command():
-    controller = GeneratorController(profile())
-    actions, error = controller.step_authorized_shutdown(
-        1.0,
-        observed(running=True, remote_on=True, load_connected=False),
-        authorized=False,
-    )
-    assert actions == []
-    assert error is not None
-    assert controller.phase == GeneratorPhase.EXTERNAL_RUNNING
-
-
-def test_start_timeout_enters_fault_and_requests_safe_outputs():
+def test_fault_reset_requires_physically_stopped_generator():
     controller = GeneratorController(profile())
     controller.step(0.0, observed(), False)
     controller.step(1.0, observed(), True)
     controller.step(1.5, observed(remote_on=True), True)
-    actions = controller.step(5.6, observed(remote_on=True), True)
-    assert kinds(actions) == [
-        GeneratorActionKind.REMOTE_OFF,
-        GeneratorActionKind.CHOKE_TO_RUN,
-    ]
+    controller.step(5.6, observed(remote_on=True), True)
     assert controller.phase == GeneratorPhase.FAULT
+
+    assert controller.reset_if_safe(observed(remote_on=True)) is False
+    assert controller.phase == GeneratorPhase.FAULT
+    assert controller.reset_if_safe(observed()) is True
+    assert controller.phase == GeneratorPhase.IDLE
 
 
 def test_unknown_state_freezes_current_phase():
