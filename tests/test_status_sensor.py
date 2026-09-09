@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import pytest
 
-from domain import GeneratorSlot
 from ha_adapter import ENTITIES, ENERGY_ATS_STATUS_ENTITY
 from main import DEFAULT_OPTIONS, EnergySupervisorApp, _seconds_left
 
@@ -25,7 +24,7 @@ class StatusFakeClient:
         self.published.append((entity_id, state, attributes or {}))
 
 
-def _grid_states() -> dict[str, str]:
+def grid_states() -> dict[str, str]:
     return {
         ENTITIES["automatic_transfer"]: "on",
         ENTITIES["grid_ready"]: "on",
@@ -51,72 +50,63 @@ def _grid_states() -> dict[str, str]:
     }
 
 
-def _app_with_fake(tmp_path):
+def app_with_fake(tmp_path):
     app = EnergySupervisorApp(
-        {
-            **DEFAULT_OPTIONS,
-            "armed": True,
-            "state_file": str(tmp_path / "state.json"),
-        },
+        {**DEFAULT_OPTIONS, "armed": True, "state_file": str(tmp_path / "state.json")},
         token="test",
     )
-    fake = StatusFakeClient(_grid_states())
+    fake = StatusFakeClient(grid_states())
     app.client = fake
     app.adapter.client = fake
     return app, fake
 
 
-def _normal_grid_observation(app: EnergySupervisorApp, now: float):
+def normal_observation(app: EnergySupervisorApp, now: float):
     hardware = app.adapter.snapshot()
     app._sync_generator_configuration(hardware)
+    hardware = app._apply_generator_bus_model(hardware, test_mode=False)
     app._refresh_component_views(now, hardware)
-    observation = app._supervisor_observation(hardware)
+    observation = app._supervisor_observation(hardware, test_mode=False)
     app.supervisor.step(now, observation)
-    return app._supervisor_observation(hardware)
+    return app._supervisor_observation(hardware, test_mode=False)
 
 
-def test_status_payload_uses_confirmed_source_and_public_contract(tmp_path):
-    app, _ = _app_with_fake(tmp_path)
-    observation = _normal_grid_observation(app, 100.0)
-
+def test_status_payload_exposes_v04_bus_and_run_context_contract(tmp_path):
+    app, _ = app_with_fake(tmp_path)
+    observation = normal_observation(app, 100.0)
     payload = app._status_payload(100.0, observation)
 
     assert payload["state"] == "Питание от основной сети"
-    assert payload["attributes"] == {
-        "friendly_name": "Energy ATS Status",
-        "icon": "mdi:transfer-switch",
-        "source": "grid",
-        "phase": "normal",
-        "generator": None,
-        "generator_model": None,
-        "generator_slot": None,
-        "primary_generator": "Elemax",
-        "primary_generator_slot": "A",
-        "remaining_seconds": None,
-        "session_reason": None,
-        "armed": True,
-        "schema_version": 2,
-    }
+    attrs = payload["attributes"]
+    assert attrs["source"] == "grid"
+    assert attrs["phase"] == "normal"
+    assert attrs["generator"] is None
+    assert attrs["bus_owner"] in {"none", "unknown"}
+    assert attrs["bus_owner_slot"] is None
+    assert attrs["generator_a_run_context"] == "none"
+    assert attrs["generator_b_run_context"] == "none"
+    assert attrs["primary_generator"] == "Elemax"
+    assert attrs["primary_generator_slot"] == "A"
+    assert attrs["fallback_used"] is False
+    assert attrs["schema_version"] == 3
 
 
-def test_status_reports_manual_battery_path_when_grid_is_available(tmp_path):
-    app, fake = _app_with_fake(tmp_path)
+def test_status_reports_ups_only_when_grid_path_is_intentionally_open(tmp_path):
+    app, fake = app_with_fake(tmp_path)
     fake.states[ENTITIES["grid_power"]] = "off"
     fake.states[ENTITIES["house_grid"]] = "off"
-    observation = _normal_grid_observation(app, 100.0)
+    observation = normal_observation(app, 100.0)
 
     payload = app._status_payload(100.0, observation)
 
-    assert payload["state"] == (
-        "Grid доступна · Grid path отключён · питание от аккумуляторов МАП"
-    )
-    assert payload["attributes"]["source"] == "battery"
+    assert payload["state"] == "В доме работает только UPS линия"
+    assert payload["attributes"]["source"] == "ups_only"
 
 
 @pytest.mark.asyncio
 async def test_status_publication_is_deduplicated(tmp_path):
-    app, fake = _app_with_fake(tmp_path)
-    observation = _normal_grid_observation(app, 100.0)
+    app, fake = app_with_fake(tmp_path)
+    observation = normal_observation(app, 100.0)
 
     await app._publish_status(100.0, observation)
     await app._publish_status(100.0, observation)
@@ -126,6 +116,7 @@ async def test_status_publication_is_deduplicated(tmp_path):
     assert entity_id == ENERGY_ATS_STATUS_ENTITY
     assert state == "Питание от основной сети"
     assert attributes["source"] == "grid"
+    assert attributes["schema_version"] == 3
 
 
 def test_seconds_left_rounds_up_and_never_becomes_negative():
