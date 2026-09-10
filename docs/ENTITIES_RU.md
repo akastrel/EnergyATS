@@ -1,8 +1,8 @@
-# Home Assistant entities и команды — Energy ATS 0.4.0
+# Home Assistant entities и команды — Energy ATS 0.6.0
 
 Этот документ описывает фактический HA-контракт текущей реализации. Физический смысл сигналов задаёт `PHYSICAL_POWER_TOPOLOGY_RU.md`, policy — `REQUIREMENTS_RU.md`.
 
-A/B — стабильные аппаратные слоты. Пользовательские имена и модели читаются отдельно и не меняют entity_id.
+A/B — стабильные аппаратные слоты. Пользовательские имена, модели и паспортные мощности читаются отдельно и не меняют внутренний смысл слотов.
 
 ## 1. Helper-ы EnergyATS
 
@@ -21,9 +21,9 @@ input_boolean.generator_test_mode
 
 Явный классификатор **нового фронта RUNNING** как `TEST_RUN`.
 
-Helper не запускает и не останавливает двигатель. Он только сообщает `GeneratorBusTracker`, что новый запуск является тестовым и не должен автоматически останавливаться правилом завершения outage.
+Helper не запускает и не останавливает двигатель. Он только сообщает `GeneratorBusTracker`, что новый запуск является тестовым и не должен автоматически останавливаться правилом завершения outage. Если helper вообще отсутствует, это трактуется как `OFF`; существующий `unknown/unavailable` остаётся неопределённым.
 
-## 2. Обязательные входные entities
+## 2. Обязательные входные entities core ATS
 
 ### Grid и основные контакторы
 
@@ -68,6 +68,8 @@ E-stop имеет приоритет над обычным управление�
 
 ### Метаданные и PRIMARY
 
+Core ATS использует:
+
 ```text
 sensor.generator_a_name
 sensor.generator_b_name
@@ -78,6 +80,17 @@ select.primary_generator
 
 Имена должны быть непустыми и различаться. `select.primary_generator` содержит одно из фактических имён и преобразуется во внутренний слот A/B.
 
+Load Manager дополнительно читает числовые read-only metadata:
+
+```text
+sensor.generator_a_nominal_power
+sensor.generator_a_maximum_power
+sensor.generator_b_nominal_power
+sensor.generator_b_maximum_power
+```
+
+Они измеряются в W и являются **soft dependency**: отсутствие/ошибка этих sensors не блокирует core ATS. При включённом Load Manager power-based admission/shedding в таком случае приостанавливаются локальным `DEGRADED`.
+
 ### Температура
 
 ```text
@@ -86,7 +99,35 @@ sensor.garage_temperature
 
 Используется GC для choke/warmup. Недоступная температура обрабатывается консервативным профилем, но не подменяет обязательные RUNNING/REMOTE/E-stop данные.
 
-## 3. Управляющие buttons
+## 3. Load Manager: soft-dependency entities
+
+Load Manager управляет только двумя группами:
+
+```text
+G1 = switch.non_critical_loads_first_floor
+G2 = switch.non_critical_loads_basement_floor
+```
+
+G1 имеет более высокий приоритет. Восстановление выполняется `G1 -> G2`, overload `LOAD_SHEDDING` — `G2 -> G1`.
+
+Счётчик общей генераторной шины:
+
+```text
+binary_sensor.generator_meter_status
+sensor.generator_power
+sensor.generator_current
+sensor.generator_voltage
+sensor.generator_apparent_power
+sensor.generator_reactive_power
+sensor.generator_power_factor
+sensor.generator_frequency
+```
+
+Для автоматических power-based решений используется `sensor.generator_power`. Остальные meter entities публикуются как диагностическая телеметрия.
+
+Все entities этого раздела являются soft dependencies относительно core ATS. Их отсутствие, `unknown/unavailable`, отказ Modbus или ошибка команды G1/G2 не должны сами по себе переводить Supervisor/TPC/GC в `RECOVERY_REQUIRED` либо блокировать возврат Grid.
+
+## 4. Управляющие buttons генераторов
 
 Для каждого генератора используются две физические команды заслонки:
 
@@ -99,7 +140,7 @@ button.generator_b_choke_to_run
 
 Их физический смысл уже нормализован именами: `to_cold_start` переводит заслонку в положение холодного запуска, `to_run` — в рабочее положение.
 
-## 4. Команды App через STDIN
+## 5. Команды App через STDIN
 
 EnergyATS принимает:
 
@@ -115,7 +156,7 @@ reset
 
 Команды не обходят safety checks и в режиме DISARMED не исполняют аппаратные действия.
 
-## 5. Status sensor
+## 6. Status sensor
 
 App публикует:
 
@@ -140,9 +181,7 @@ sensor.energy_ats_status
 DISARMED — только наблюдение
 ```
 
-### Attributes
-
-Текущая реализация публикует:
+### Базовые attributes
 
 ```text
 source
@@ -161,13 +200,9 @@ fallback_used
 armed
 ```
 
-Также публикуются стандартные `friendly_name` и `icon`.
+A/B не кодируются в `source`. Конкретный генератор определяется `generator` / `generator_slot` и `bus_owner`.
 
-В status sensor 0.4 **нет** отдельных `schema_version`, `bus_owner_slot` или `primary_generator_slot`.
-
-### `source`
-
-Допустимые значения доменной модели:
+`source` принимает:
 
 ```text
 grid
@@ -176,10 +211,6 @@ ups_only
 no_power
 unknown
 ```
-
-A/B не кодируются в `source`. Конкретный генератор определяется `generator` / `generator_slot` и `bus_owner`.
-
-### `phase`
 
 Фаза Supervisor:
 
@@ -194,9 +225,7 @@ external_running
 recovery_required
 ```
 
-### Run context
-
-`generator_a_run_context` и `generator_b_run_context`:
+Run context A/B:
 
 ```text
 none
@@ -206,33 +235,72 @@ other
 unknown
 ```
 
-- `outage_related` — разрешено автоматически остановить после безопасного возврата на стабильную Grid;
-- `test_run` — не останавливается этим правилом;
-- `other` — известный не-outage запуск;
-- `unknown` — причина непрерывного RUNNING не доказана, поэтому автоматическая остановка запрещена.
+### Load Manager attributes
 
-## 6. Logbook и уведомления
+```text
+load_management_enabled
+load_manager_phase
+load_manager_degraded_reason
+generator_power
+active_generator_nominal_power
+active_generator_maximum_power
+load_g1_state
+load_g1_shed_by_energy_ats
+load_g2_state
+load_g2_shed_by_energy_ats
+load_nominal_overload_since
+load_maximum_overload_since
+load_next_restore_retry
+load_last_reason
+```
 
-Аппаратные действия и события Supervisor публикуются через HA Logbook. События уровня `critical` дополнительно вызывают:
+`load_manager_phase` может принимать:
+
+```text
+disabled
+idle
+waiting_for_generator
+load_shedding
+measuring_base_load
+restoring_g1
+measuring_after_g1
+restoring_g2
+measuring_after_g2
+stable
+overload_control
+restoring_on_grid
+degraded
+```
+
+`degraded` относится только к Load Manager и сам по себе не означает системный `recovery_required`.
+
+Exercise Scheduler также публикует свои due/history/active attributes в этом же status sensor; их точный набор формируется Scheduler-ом.
+
+## 7. Logbook и уведомления
+
+Аппаратные действия и события Supervisor/Exercise/Load Manager публикуются через HA Logbook. События уровня `critical` дополнительно вызывают:
 
 ```text
 script.notify_critical
 ```
 
+Человеко-читаемые предупреждения Load Manager о локальной деградации и sustained overload могут также отправляться через тот же пользовательский notification script.
+
 Ошибка Logbook/status/notification считается диагностической и не должна сама прерывать управляющую последовательность.
 
-## 7. Что намеренно отсутствует
+## 8. Что намеренно отсутствует
 
-В HA-контракте EnergyATS 0.4 нет:
+В HA-контракте EnergyATS нет:
 
 - отдельного Battery contactor/path;
 - selector A/B генераторной шины — owner выбирает физическая взаимно заблокированная схема;
 - A/B position feedback контакторов генераторов;
 - helper-а, который объявляет внешний генератор managed;
-- автоматического запрета второго RUNNING.
+- автоматического запрета второго RUNNING;
+- права Load Manager управлять REMOTE/choke/stop генератора.
 
-## 8. Fail-safe по неизвестным данным
+## 9. Fail-safe по неизвестным данным
 
-Перед аппаратным управлением обязательные entities должны иметь определённые значения. `unknown`, `unavailable` или отсутствие обязательного entity не интерпретируются как удобное значение по умолчанию.
+Перед аппаратным управлением core ATS обязательные entities должны иметь определённые значения. `unknown`, `unavailable` или отсутствие обязательного entity не интерпретируются как удобное значение по умолчанию.
 
-Если физическое состояние нельзя доказать, EnergyATS сохраняет наблюдаемость, но не получает права угадывать и выдавать активные команды.
+Load Manager inputs из раздела 3 отделены от этого правила как soft dependencies. При их потере Load Manager прекращает те действия, для которых данных недостаточно, но core ATS продолжает работу согласно собственным требованиям.
