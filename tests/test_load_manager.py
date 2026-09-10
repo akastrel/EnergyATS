@@ -94,22 +94,22 @@ def test_disarmed_load_manager_never_creates_pending_or_load_command():
     assert manager.pending_action is None
 
 
-def test_pretransfer_sheds_g1_then_g2_while_grid_still_connected():
-    """Managed transfer отключает доступные G1/G2 по одной ещё на Grid и разрешает TPC только после подтверждения обоих OFF."""
+def test_pretransfer_sheds_g2_then_g1_while_grid_still_connected():
+    """Managed transfer снимает меньший приоритет G2 перед G1 и разрешает TPC только после подтверждения обоих OFF."""
     manager = LoadManager(config())
 
     first = manager.step(observation(0, on_grid=True, desired=True, ready=True))
     assert [(a.group, a.kind) for a in first.actions] == [
-        (LoadGroup.G1, LoadActionKind.TURN_OFF)
+        (LoadGroup.G2, LoadActionKind.TURN_OFF)
     ]
     assert first.transfer_permitted is False
 
     second = manager.step(
-        observation(1, on_grid=True, desired=True, ready=True, g1=False, sample=2)
+        observation(1, on_grid=True, desired=True, ready=True, g2=False, sample=2)
     )
-    assert manager.shed_by_energy_ats[LoadGroup.G1] is True
+    assert manager.shed_by_energy_ats[LoadGroup.G2] is True
     assert [(a.group, a.kind) for a in second.actions] == [
-        (LoadGroup.G2, LoadActionKind.TURN_OFF)
+        (LoadGroup.G1, LoadActionKind.TURN_OFF)
     ]
     assert second.transfer_permitted is False
 
@@ -124,7 +124,7 @@ def test_pretransfer_sheds_g1_then_g2_while_grid_still_connected():
             sample=3,
         )
     )
-    assert manager.shed_by_energy_ats[LoadGroup.G2] is True
+    assert manager.shed_by_energy_ats[LoadGroup.G1] is True
     assert third.actions == ()
     assert third.transfer_permitted is True
 
