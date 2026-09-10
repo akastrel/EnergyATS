@@ -142,7 +142,7 @@ async def test_app_load_manager_disabled_does_not_touch_loads_or_block_transfer(
 
 @pytest.mark.asyncio
 async def test_app_pretransfer_sheds_both_groups_before_generator_contactor(tmp_path):
-    """После прогрева Generator A Load Manager должен снять обе некритичные группы до подключения дома к generator bus. Только после подтверждения этих OFF TPC получает право выбрать генераторную ветвь."""
+    """После прогрева Generator A Load Manager снимает G2, затем G1 и только после подтверждения обоих OFF разрешает TPC подключить generator bus."""
 
     app, fake = make_app(
         tmp_path,
@@ -158,8 +158,7 @@ async def test_app_pretransfer_sheds_both_groups_before_generator_contactor(tmp_
     g1_off = calls.index(("turn_off", ENTITIES["load_g1"]))
     g2_off = calls.index(("turn_off", ENTITIES["load_g2"]))
     generator_on = calls.index(("turn_on", ENTITIES["source_generator"]))
-    assert g1_off < generator_on
-    assert g2_off < generator_on
+    assert g2_off < g1_off < generator_on
     assert fake.states[ENTITIES["load_g1"]] == "off"
     assert fake.states[ENTITIES["load_g2"]] == "off"
     assert app.load_manager.shed_by_energy_ats[LoadGroup.G1] is True
