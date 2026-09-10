@@ -65,6 +65,7 @@ class HardwareSnapshot:
     automatic_transfer_enabled: bool
     test_mode: bool | None
     emergency_stop: bool | None
+    family_present: bool | None
     generators: dict[GeneratorSlot, GeneratorObservation]
     generator_metadata: dict[GeneratorSlot, GeneratorMetadata | None]
     primary_generator: GeneratorSlot | None
@@ -82,10 +83,21 @@ class HomeAssistantAdapter:
         *,
         armed: bool,
         logger: logging.Logger | None = None,
+        family_presence_entity: str | None = None,
+        require_family_presence: bool = False,
     ) -> None:
         self.client = client
         self.armed = armed
         self.log = logger or logging.getLogger(__name__)
+        self.family_presence_entity = (
+            family_presence_entity.strip()
+            if isinstance(family_presence_entity, str) and family_presence_entity.strip()
+            else None
+        )
+        # Presence — мягкий input только для Exercise Scheduler. Даже когда
+        # scheduled exercise включён, unknown/unavailable presence не должен
+        # блокировать запуск самого ATS: Scheduler просто отложит обычный test.
+        self.require_family_presence = require_family_presence
 
     def snapshot(self) -> HardwareSnapshot:
         grid_ready = self.bool_state(ENTITIES["grid_ready"])
@@ -155,6 +167,11 @@ class HomeAssistantAdapter:
             ),
             test_mode=self.bool_state(ENTITIES["test_mode"]),
             emergency_stop=emergency_stop,
+            family_present=(
+                self.presence_state(self.family_presence_entity)
+                if self.family_presence_entity is not None
+                else None
+            ),
             generators=generators,
             generator_metadata=metadata,
             primary_generator=primary_generator,
@@ -191,6 +208,7 @@ class HomeAssistantAdapter:
             ENTITIES["grid_power"],
             ENTITIES["source_generator"],
         ]
+
         existence_only: list[str] = []
         if include_control_entities:
             existence_only = [
@@ -271,6 +289,22 @@ class HomeAssistantAdapter:
                     exc,
                 )
 
+    async def publish_user_notification(self, message: str) -> bool:
+        """Доставить обычное пользовательское уведомление через общий HA script."""
+        if not self.armed:
+            self.log.info("DISARMED: подавлено уведомление: %s", message)
+            return False
+        try:
+            await self.client.call_service(
+                "script",
+                "notify_critical",
+                service_data={"message": message},
+            )
+        except Exception as exc:
+            self.log.warning("Не удалось отправить уведомление: %s", exc)
+            return False
+        return True
+
     async def publish_status(self, state: str, attributes: dict[str, Any]) -> bool:
         try:
             await self.client.set_state(
@@ -292,6 +326,16 @@ class HomeAssistantAdapter:
         if state == "on":
             return True
         if state == "off":
+            return False
+        return None
+
+    def presence_state(self, entity_id: str | None) -> bool | None:
+        if entity_id is None:
+            return None
+        state = self.client.get_state(entity_id)
+        if state in {"home", "on"}:
+            return True
+        if state in {"not_home", "off"}:
             return False
         return None
 

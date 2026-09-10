@@ -1,29 +1,45 @@
-# Energy ATS 0.4.0
+# Energy ATS 0.5.0
 
 Energy ATS — Home Assistant App для безопасного управления резервным электроснабжением дома с двумя генераторами.
 
-## Что изменилось в 0.4
+## Базовая ATS-модель
 
-- модель приведена к реальной физической топологии;
-- удалён виртуальный `Battery path`, используется `UPS_ONLY`;
+Модель 0.4 сохраняется:
+
+- реальная физическая топология первична;
+- виртуального `Battery path` нет, используется `UPS_ONLY`;
 - два генератора могут штатно быть RUNNING одновременно;
-- добавлен persistent `GeneratorBusTracker` с аппаратным FIFO owner;
-- run-context упрощён до `OUTAGE_RELATED`, `TEST_RUN`, `OTHER`, `UNKNOWN`;
-- реализован один fallback `PRIMARY -> SECONDARY` без ping-pong;
-- внешний SECONDARY не захватывается в managed ownership;
-- outage-related генераторы останавливаются только после безопасного возврата дома на стабильную Grid;
-- `TEST_RUN` этим правилом не останавливается.
+- persistent `GeneratorBusTracker` ведёт аппаратный FIFO owner;
+- run-context: `OUTAGE_RELATED`, `TEST_RUN`, `OTHER`, `UNKNOWN`;
+- один fallback `PRIMARY -> SECONDARY` без ping-pong;
+- внешний SECONDARY не захватывается автоматически;
+- outage-related генераторы завершаются только после безопасного возврата дома на стабильную Grid.
 
-## Перед обновлением
+## Scheduled exercise в 0.5
 
-1. Обеспечить Grid.
-2. Остановить оба генератора.
-3. Установить `armed: false`.
-4. Обновить Generator Controller metadata/entities.
-5. Обновить корневой `ats.yaml`.
-6. Обновить App до 0.4.0.
+Добавлен независимый плановый пробный запуск каждого генератора после длительного простоя.
 
-Persistent journal 0.3 не мигрируется. Если после обновления получен `RECOVERY_REQUIRED`, сначала проверить физическую схему, затем выполнить безопасный `reset` по `docs/INSTALL_RU.md`.
+Defaults:
+
+```text
+A: enabled=false, interval=30 дней, start=15:00, run=10 мин, grace=7 дней
+B: enabled=false, interval=45 дней, start=15:00, run=10 мин, grace=14 дней
+family_presence_entity=group.family
+```
+
+Exercise:
+
+- использует обычный GC;
+- не переводит дом с Grid на generator bus;
+- до forced-date требует подтверждённого отсутствия семьи;
+- после grace игнорирует только presence, но не safety;
+- forced start требует успешно отправленного предупреждения минимум за 60 минут;
+- не запускает второй генератор как fallback;
+- любой достоверный run нужной длительности может стать qualifying run;
+- сохраняет active attempt и ownership между restart;
+- использует существующий bus-context `TEST_RUN`;
+- при реальном outage допускает явный handoff уже работающего generator в outage-session;
+- если handoff не состоялся, остаётся ответственным за остановку.
 
 ## Helper-ы
 
@@ -32,11 +48,11 @@ input_boolean.automatic_generator_transfer
 input_boolean.generator_test_mode
 ```
 
-`generator_test_mode` классифицирует новый фронт RUNNING как `TEST_RUN`. Helper сам не запускает и не останавливает двигатель.
+`generator_test_mode` остаётся маркером внешнего TEST_RUN. Scheduled exercise сам помечает собственный запуск как `TEST_RUN` и не требует включения helper-а.
 
 ## Конфигурация
 
-В App остаются policy/тайминги:
+Базовые policy/тайминги:
 
 - `armed`;
 - `tick_seconds`;
@@ -46,6 +62,16 @@ input_boolean.generator_test_mode
 - `transfer_confirmation_timeout`;
 - `generator_a_enabled`;
 - `generator_b_enabled`.
+
+Exercise:
+
+- `family_presence_entity`;
+- `generator_a_exercise_enabled`;
+- `generator_a_exercise_interval_days`;
+- `generator_a_exercise_start_time`;
+- `generator_a_exercise_run_minutes`;
+- `generator_a_exercise_presence_grace_days`;
+- аналогичный набор для B.
 
 Имя, модель и PRIMARY читаются из Home Assistant.
 
@@ -65,9 +91,9 @@ App публикует:
 sensor.energy_ats_status
 ```
 
-Ключевые attributes: фактический `source`, Supervisor `phase`, текущий generator/bus owner, managed generator, run-context A/B, PRIMARY, `fallback_used`, `remaining_seconds` и `armed`.
+Помимо базового source/phase/generator/bus/managed/run-context/PRIMARY/fallback status содержит per-generator exercise due/history state и active exercise timer.
 
-Status sensor не имеет отдельного version/schema attribute и не используется как управляющий вход.
+Status sensor не используется как управляющий вход.
 
 ## Документация
 

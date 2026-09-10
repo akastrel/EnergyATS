@@ -1,5 +1,5 @@
 name: "Energy ATS"
-version: "0.4.0"
+version: "0.5.0"
 slug: "energy_ats"
 description: >-
   Energy Supervisor: политика источников, безопасная силовая коммутация и
@@ -31,6 +31,22 @@ options:
   generator_a_enabled: true
   generator_b_enabled: true
 
+  # Плановые пробные пуски по умолчанию выключены. После включения Scheduler
+  # использует один общий HA entity присутствия семьи.
+  family_presence_entity: "group.family"
+
+  generator_a_exercise_enabled: false
+  generator_a_exercise_interval_days: 30
+  generator_a_exercise_start_time: "15:00"
+  generator_a_exercise_run_minutes: 10
+  generator_a_exercise_presence_grace_days: 7
+
+  generator_b_exercise_enabled: false
+  generator_b_exercise_interval_days: 45
+  generator_b_exercise_start_time: "15:00"
+  generator_b_exercise_run_minutes: 10
+  generator_b_exercise_presence_grace_days: 14
+
 schema:
   armed: bool
   tick_seconds: "float(0.2,10)"
@@ -42,3 +58,17 @@ schema:
 
   generator_a_enabled: bool
   generator_b_enabled: bool
+
+  family_presence_entity: str
+
+  generator_a_exercise_enabled: bool
+  generator_a_exercise_interval_days: "int(1,3650)"
+  generator_a_exercise_start_time: str
+  generator_a_exercise_run_minutes: "int(1,1440)"
+  generator_a_exercise_presence_grace_days: "int(0,365)"
+
+  generator_b_exercise_enabled: bool
+  generator_b_exercise_interval_days: "int(1,3650)"
+  generator_b_exercise_start_time: str
+  generator_b_exercise_run_minutes: "int(1,1440)"
+  generator_b_exercise_presence_grace_days: "int(0,365)"

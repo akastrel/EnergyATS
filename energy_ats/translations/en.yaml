@@ -25,3 +25,39 @@ configuration:
   generator_b_enabled:
     name: "Enable generator B"
     description: "Allow the Energy Supervisor to use physical slot B for a new managed session. This is Energy ATS policy; name, model and primary are read from Home Assistant."
+
+  family_presence_entity:
+    name: "Family presence HA entity"
+    description: "Home Assistant entity used by the exercise scheduler to determine family presence. home/not_home and on/off are supported."
+
+  generator_a_exercise_enabled:
+    name: "Generator A scheduled exercise"
+    description: "Enable automatic periodic exercise for physical generator slot A."
+  generator_a_exercise_interval_days:
+    name: "A exercise interval, days"
+    description: "Maximum period without a qualifying run before exercise becomes due."
+  generator_a_exercise_start_time:
+    name: "A exercise start time"
+    description: "Daily Home Assistant local-time window in HH:MM format."
+  generator_a_exercise_run_minutes:
+    name: "A exercise run time, min"
+    description: "Minimum continuous RUNNING time required for a successful exercise."
+  generator_a_exercise_presence_grace_days:
+    name: "A presence grace, days"
+    description: "How many days after due family presence may defer exercise."
+
+  generator_b_exercise_enabled:
+    name: "Generator B scheduled exercise"
+    description: "Enable automatic periodic exercise for physical generator slot B."
+  generator_b_exercise_interval_days:
+    name: "B exercise interval, days"
+    description: "Maximum period without a qualifying run before exercise becomes due."
+  generator_b_exercise_start_time:
+    name: "B exercise start time"
+    description: "Daily Home Assistant local-time window in HH:MM format."
+  generator_b_exercise_run_minutes:
+    name: "B exercise run time, min"
+    description: "Minimum continuous RUNNING time required for a successful exercise."
+  generator_b_exercise_presence_grace_days:
+    name: "B presence grace, days"
+    description: "How many days after due family presence may defer exercise."

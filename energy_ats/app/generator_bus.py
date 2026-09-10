@@ -83,19 +83,29 @@ class GeneratorBusTracker:
         test_mode: bool | None,
         managed_slot: GeneratorSlot | None = None,
         managed_outage: bool = False,
+        internal_test_slots: frozenset[GeneratorSlot] = frozenset(),
     ) -> GeneratorBusStatus:
         if any(running.get(slot) is None for slot in SLOTS):
             return self.status()
 
         current = {slot: running[slot] is True for slot in SLOTS}
         if self.previous_running is None:
-            self._initialize_contexts(current, managed_slot, managed_outage)
+            self._initialize_contexts(
+                current,
+                managed_slot,
+                managed_outage,
+                internal_test_slots,
+            )
         else:
             for slot in SLOTS:
                 if not self.previous_running[slot] and current[slot]:
-                    self.run_contexts[slot] = self._classify_new_run(
-                        grid_ready, test_mode
-                    )
+                    if slot in internal_test_slots:
+                        self.run_contexts[slot] = GeneratorRunContext.TEST_RUN
+                    else:
+                        self.run_contexts[slot] = self._classify_new_run(
+                            grid_ready,
+                            test_mode,
+                        )
                 elif self.previous_running[slot] and not current[slot]:
                     self.run_contexts[slot] = GeneratorRunContext.NONE
 
@@ -108,10 +118,13 @@ class GeneratorBusTracker:
         current: Mapping[GeneratorSlot, bool],
         managed_slot: GeneratorSlot | None,
         managed_outage: bool,
+        internal_test_slots: frozenset[GeneratorSlot],
     ) -> None:
         for slot in SLOTS:
             if not current[slot]:
                 self.run_contexts[slot] = GeneratorRunContext.NONE
+            elif slot in internal_test_slots:
+                self.run_contexts[slot] = GeneratorRunContext.TEST_RUN
             elif managed_slot == slot:
                 self.run_contexts[slot] = (
                     GeneratorRunContext.OUTAGE_RELATED
@@ -149,7 +162,9 @@ class GeneratorBusTracker:
         if self.owner.slot in active:
             return
         if self.previous_running is not None:
-            previous = [slot for slot in SLOTS if self.previous_running[slot]]
+            previous = [
+                slot for slot in SLOTS if self.previous_running[slot]
+            ]
             if len(previous) == 1 and previous[0] in active:
                 self.owner = GeneratorBusOwner.for_slot(previous[0])
                 return
@@ -164,7 +179,10 @@ class GeneratorBusTracker:
             "previous_running": (
                 None
                 if self.previous_running is None
-                else {slot.value: self.previous_running[slot] for slot in SLOTS}
+                else {
+                    slot.value: self.previous_running[slot]
+                    for slot in SLOTS
+                }
             ),
         }
 
@@ -176,7 +194,8 @@ class GeneratorBusTracker:
         if not isinstance(contexts, Mapping):
             raise ValueError("Некорректное состояние generator_bus.run_contexts")
         tracker.run_contexts = {
-            slot: GeneratorRunContext(str(contexts[slot.value])) for slot in SLOTS
+            slot: GeneratorRunContext(str(contexts[slot.value]))
+            for slot in SLOTS
         }
 
         previous = data.get("previous_running")

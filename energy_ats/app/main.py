@@ -11,15 +11,30 @@ import signal
 import sys
 import time
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from domain import GeneratorSlot, PowerPath, PowerSource, SupervisorEvent
+from domain import (
+    GeneratorSlot,
+    PowerPath,
+    PowerSource,
+    SessionReason,
+    SupervisorEvent,
+)
 from energy_supervisor import (
     EnergySupervisor,
     SupervisorConfig,
     SupervisorObservation,
     SupervisorPhase,
+)
+from exercise_scheduler import (
+    ExerciseConfig,
+    ExerciseDecision,
+    ExerciseGeneratorObservation,
+    ExerciseObservation,
+    ExerciseScheduler,
 )
 from generator_bus import GeneratorBusOwner, GeneratorBusTracker
 from generator_controller import (
@@ -34,7 +49,7 @@ from ha_client import HomeAssistantClient, HomeAssistantConnectionError
 from power_transfer import PowerTransferController, TransferAction, TransferPhase
 from state_store import StateStore
 
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.5.0"
 STATE_SCHEMA_VERSION = 2
 
 DEFAULT_OPTIONS: dict[str, Any] = {
@@ -46,6 +61,17 @@ DEFAULT_OPTIONS: dict[str, Any] = {
     "generator_a_enabled": True,
     "generator_b_enabled": True,
     "transfer_confirmation_timeout": 60,
+    "family_presence_entity": "group.family",
+    "generator_a_exercise_enabled": False,
+    "generator_a_exercise_interval_days": 30,
+    "generator_a_exercise_start_time": "15:00",
+    "generator_a_exercise_run_minutes": 10,
+    "generator_a_exercise_presence_grace_days": 7,
+    "generator_b_exercise_enabled": False,
+    "generator_b_exercise_interval_days": 45,
+    "generator_b_exercise_start_time": "15:00",
+    "generator_b_exercise_run_minutes": 10,
+    "generator_b_exercise_presence_grace_days": 14,
     "state_file": "/data/energy-supervisor-state.json",
 }
 
@@ -72,10 +98,17 @@ class EnergySupervisorApp:
         self.options = {**DEFAULT_OPTIONS, **options}
         self.armed = _boolean_option(self.options, "armed")
         self.tick_seconds = max(0.2, float(self.options["tick_seconds"]))
+        self.local_time_zone = timezone.utc
 
         self.log = logging.getLogger("energy_supervisor")
         self.client = HomeAssistantClient(token, logger=self.log)
-        self.adapter = HomeAssistantAdapter(self.client, armed=self.armed, logger=self.log)
+        exercise_configs = self._exercise_configs()
+        self.adapter = HomeAssistantAdapter(
+            self.client,
+            armed=self.armed,
+            logger=self.log,
+            family_presence_entity=str(self.options["family_presence_entity"]),
+        )
         self.generator_controllers = {
             slot: GeneratorController(profile)
             for slot, profile in default_generator_profiles().items()
@@ -86,7 +119,11 @@ class EnergySupervisorApp:
         self.state_store = StateStore(str(self.options["state_file"]))
 
         saved, load_error = self._load_state()
-        self.generator_bus, self.supervisor = self._restore_state(saved, load_error)
+        (
+            self.generator_bus,
+            self.supervisor,
+            self.exercise_scheduler,
+        ) = self._restore_state(saved, load_error, exercise_configs)
 
         self._pending_action_records: list[dict[str, str]] = []
         self._saved_state_signature: str | None = None
@@ -160,6 +197,7 @@ class EnergySupervisorApp:
             try:
                 await self.client.connect()
                 self._last_status_payload = None
+                self._set_home_assistant_timezone(await self.client.get_time_zone())
                 await self._wait_until_required_entities_ready()
                 if self.stop_event.is_set():
                     break
@@ -187,6 +225,14 @@ class EnergySupervisorApp:
 
         self.log.info("Energy ATS остановлен.")
 
+    def _set_home_assistant_timezone(self, value: str) -> None:
+        try:
+            self.local_time_zone = ZoneInfo(value)
+        except ZoneInfoNotFoundError as exc:
+            raise HomeAssistantConnectionError(
+                f"Home Assistant сообщил неизвестную time_zone: {value!r}"
+            ) from exc
+
     # One control tick ------------------------------------------------
 
     async def _tick(self, now: float) -> None:
@@ -201,15 +247,103 @@ class EnergySupervisorApp:
             return
 
         observation = self._supervisor_observation(hardware)
-        decision = self.supervisor.step(now, observation)
+        exercise_observation = self._exercise_observation(now, hardware, observation)
+        exercise_decision = self.exercise_scheduler.step(exercise_observation)
+        exercise_events = list(exercise_decision.events)
+
+        for warning in exercise_decision.warnings:
+            if await self.adapter.publish_user_notification(warning.message):
+                sent_at = datetime.fromtimestamp(now, self.local_time_zone)
+                exercise_events.append(
+                    self.exercise_scheduler.confirm_warning(
+                        warning.slot,
+                        warning.window_date,
+                        self._profile(warning.slot).display_name,
+                        sent_at,
+                    )
+                )
+                # Delivery is a safety prerequisite for a future forced start.
+                # Persist it immediately instead of waiting for the end of tick.
+                self._save_state(force=True)
+
+        decision = self.supervisor.step(
+            now,
+            observation,
+            exercise_owned_slot=exercise_decision.owned_slot,
+            exercise_desired_running=exercise_decision.desired_running,
+        )
+
+        # An outage session may explicitly adopt the already running exercise
+        # generator. Only after the Supervisor session exists do we release the
+        # Scheduler's stop ownership.
+        if (
+            self.exercise_scheduler.owned_slot is not None
+            and self.supervisor.session is not None
+            and self.supervisor.session.reason == SessionReason.GRID_OUTAGE
+            and self.supervisor.session.generator == self.exercise_scheduler.owned_slot
+            and hardware.grid_ready is False
+        ):
+            exercise_events.extend(
+                self.exercise_scheduler.handoff_to_outage(
+                    self.supervisor.session.generator,
+                    exercise_observation,
+                )
+            )
+            exercise_decision = ExerciseDecision(
+                owned_slot=None,
+                desired_running=False,
+                authorized_shutdown_slot=None,
+                warnings=(),
+                events=(),
+            )
+
+        # A manual session has priority. An exercise that has not physically
+        # started yet can be deferred without touching the engine.
+        if (
+            self.exercise_scheduler.owned_slot is not None
+            and self.supervisor.session is not None
+            and self.supervisor.session.reason != SessionReason.GRID_OUTAGE
+        ):
+            exercise_events.extend(
+                self.exercise_scheduler.cancel_unstarted(
+                    exercise_observation,
+                    "начата пользовательская managed-сессия",
+                )
+            )
+
+        # Если общая policy уже требует Recovery, Scheduler не имеет права
+        # потерять автоматически запущенный двигатель. Он переводит собственный
+        # attempt в FAILED/STOPPING и сохраняет обязанность безопасной остановки.
+        if (
+            self.supervisor.phase == SupervisorPhase.RECOVERY_REQUIRED
+            and self.exercise_scheduler.owned_slot is not None
+        ):
+            exercise_events.extend(
+                self.exercise_scheduler.fail_active(
+                    exercise_observation,
+                    "EnergyATS перешёл в RECOVERY_REQUIRED во время пробного запуска.",
+                )
+            )
+
         actions_allowed = self.armed and decision.actions_allowed
 
         generator_actions: list[GeneratorAction] = []
         shutdown_errors: list[str] = []
+        exercise_shutdown_slot = self.exercise_scheduler.authorized_shutdown_slot
         for slot, controller in self.generator_controllers.items():
             if slot in decision.stop_outage_generators and actions_allowed:
                 actions, error = controller.step_authorized_shutdown(
                     now, hardware.generators[slot]
+                )
+                generator_actions.extend(actions)
+                if error is not None:
+                    shutdown_errors.append(error)
+                continue
+
+            if slot == exercise_shutdown_slot and self.armed:
+                actions, error = controller.step_authorized_shutdown(
+                    now,
+                    hardware.generators[slot],
                 )
                 generator_actions.extend(actions)
                 if error is not None:
@@ -222,7 +356,10 @@ class EnergySupervisorApp:
                     hardware.generators[slot],
                     desired_running=decision.desired_generators[slot],
                     actions_allowed=actions_allowed,
-                    stable_managed_session=(decision.stable_managed_generator == slot),
+                    stable_managed_session=(
+                        decision.stable_managed_generator == slot
+                        or self.exercise_scheduler.owns(slot)
+                    ),
                 )
             )
 
@@ -239,7 +376,11 @@ class EnergySupervisorApp:
             actions_allowed=actions_allowed,
         )
         await self._execute_controller_actions(transfer_actions, generator_actions)
-        await self._finish_tick(now, hardware, decision.events)
+        await self._finish_tick(
+            now,
+            hardware,
+            tuple((*decision.events, *exercise_events)),
+        )
 
     def _apply_bus_model(self, hardware: HardwareSnapshot) -> HardwareSnapshot:
         session = self.supervisor.session
@@ -249,6 +390,7 @@ class EnergySupervisorApp:
             test_mode=hardware.test_mode,
             managed_slot=session.generator if session is not None else None,
             managed_outage=bool(session is not None and session.grid_was_unavailable),
+            internal_test_slots=self.exercise_scheduler.internal_test_slots,
         )
 
         generators = {}
@@ -345,13 +487,25 @@ class EnergySupervisorApp:
         return self.generator_controllers[slot].profile
 
     def _refresh_component_views(self, now: float, hardware: HardwareSnapshot) -> None:
+        exercise_slot = self.exercise_scheduler.owned_slot
         for slot, controller in self.generator_controllers.items():
+            exercise_wants_running = bool(
+                exercise_slot == slot
+                and self.exercise_scheduler.active_attempt is not None
+                and self.exercise_scheduler.active_attempt.phase.value != "stopping"
+            )
             controller.step(
                 now,
                 hardware.generators[slot],
-                desired_running=self.supervisor.desired_generators[slot],
+                desired_running=(
+                    self.supervisor.desired_generators[slot]
+                    or exercise_wants_running
+                ),
                 actions_allowed=False,
-                stable_managed_session=self.supervisor.manages_stable_generator(slot),
+                stable_managed_session=(
+                    self.supervisor.manages_stable_generator(slot)
+                    or self.exercise_scheduler.owns(slot)
+                ),
             )
         self.power_transfer.step(
             now,
@@ -377,6 +531,49 @@ class EnergySupervisorApp:
             },
             power_inputs_known=hardware.power_transfer.required_states_known,
             bus=self.generator_bus.status(),
+        )
+
+    def _exercise_observation(
+        self,
+        now: float,
+        hardware: HardwareSnapshot,
+        supervisor_observation: SupervisorObservation,
+    ) -> ExerciseObservation:
+        power = supervisor_observation.power
+        policy_busy = (
+            self.supervisor.session is not None
+            or self.supervisor.phase
+            not in {SupervisorPhase.NORMAL, SupervisorPhase.WAITING_FOR_DATA}
+            or self.supervisor.has_pending_session_request
+            or self.supervisor.recovery_reset_in_progress
+        )
+        return ExerciseObservation(
+            now=now,
+            local_now=datetime.fromtimestamp(now, self.local_time_zone),
+            grid_ready=hardware.grid_ready,
+            grid_path_stable=(
+                power.actual_path == PowerPath.GRID
+                and not power.transition_in_progress
+                and hardware.power_transfer.generator_selected is False
+                and hardware.power_transfer.house_on_generator is False
+            ),
+            family_present=hardware.family_present,
+            emergency_stop=hardware.emergency_stop,
+            required_states_known=supervisor_observation.required_states_known,
+            power_transition_in_progress=power.transition_in_progress,
+            policy_busy=policy_busy,
+            actions_enabled=self.armed,
+            generators={
+                slot: ExerciseGeneratorObservation(
+                    running=status.running,
+                    remote_on=status.remote_on,
+                    fault=status.fault,
+                )
+                for slot, status in supervisor_observation.generators.items()
+            },
+            generator_names={
+                slot: self._profile(slot).display_name for slot in GeneratorSlot
+            },
         )
 
     # Recovery --------------------------------------------------------
@@ -425,9 +622,16 @@ class EnergySupervisorApp:
             return
 
         managed_slot = self.supervisor.session.generator if self.supervisor.session else None
-        if managed_slot is not None:
-            actions, error = self.generator_controllers[managed_slot].step_authorized_shutdown(
-                now, hardware.generators[managed_slot]
+        scheduler_slot = self.exercise_scheduler.owned_slot
+        stop_slots = tuple(
+            dict.fromkeys(
+                slot for slot in (managed_slot, scheduler_slot) if slot is not None
+            )
+        )
+        for slot in stop_slots:
+            actions, error = self.generator_controllers[slot].step_authorized_shutdown(
+                now,
+                hardware.generators[slot],
             )
             if error is not None:
                 self.supervisor.fail_recovery_reset(error)
@@ -437,8 +641,8 @@ class EnergySupervisorApp:
                 await self._execute_controller_actions([], actions)
                 await self._finish_tick(now, hardware, self.supervisor.take_events())
                 return
-            managed = hardware.generators[managed_slot]
-            if managed.running is not False or managed.remote_on is not False:
+            item = hardware.generators[slot]
+            if item.running is not False or item.remote_on is not False:
                 await self._finish_tick(now, hardware, self.supervisor.take_events())
                 return
 
@@ -465,10 +669,12 @@ class EnergySupervisorApp:
             return "неизвестны обязательные состояния генераторов."
 
         managed = self.supervisor.session.generator if self.supervisor.session else None
+        scheduler = self.exercise_scheduler.owned_slot
         external = [
             slot
             for slot, item in hardware.generators.items()
-            if (item.running is True or item.remote_on is True) and slot != managed
+            if (item.running is True or item.remote_on is True)
+            and slot not in {managed, scheduler}
         ]
         if external:
             names = ", ".join(self._profile(slot).display_name for slot in external)
@@ -517,7 +723,8 @@ class EnergySupervisorApp:
                 return None, None
             if saved.get("schema_version") != STATE_SCHEMA_VERSION:
                 raise ValueError(
-                    "Неподдерживаемый формат состояния EnergyATS 0.4; миграция не выполняется."
+                    "Неподдерживаемый формат состояния EnergyATS 0.4/0.5; "
+                    "миграция не выполняется."
                 )
             return saved, None
         except Exception as exc:
@@ -527,16 +734,18 @@ class EnergySupervisorApp:
         self,
         saved: dict[str, Any] | None,
         load_error: str | None,
-    ) -> tuple[GeneratorBusTracker, EnergySupervisor]:
+        exercise_configs: dict[GeneratorSlot, ExerciseConfig],
+    ) -> tuple[GeneratorBusTracker, EnergySupervisor, ExerciseScheduler]:
         config = self._supervisor_config(GeneratorSlot.A)
+        fresh_scheduler = ExerciseScheduler(exercise_configs)
         if load_error is not None:
             supervisor = EnergySupervisor(config)
             supervisor.require_recovery(
                 f"Не удалось прочитать сохранённое состояние: {load_error}"
             )
-            return GeneratorBusTracker(), supervisor
+            return GeneratorBusTracker(), supervisor, fresh_scheduler
         if saved is None:
-            return GeneratorBusTracker(), EnergySupervisor(config)
+            return GeneratorBusTracker(), EnergySupervisor(config), fresh_scheduler
 
         try:
             bus_payload = saved.get("generator_bus")
@@ -547,17 +756,27 @@ class EnergySupervisorApp:
                 raise ValueError("отсутствует supervisor")
             bus = GeneratorBusTracker.from_dict(bus_payload)
             supervisor = EnergySupervisor.from_dict(supervisor_payload, config)
+
+            scheduler_payload = saved.get("exercise_scheduler")
+            scheduler = (
+                ExerciseScheduler.from_dict(scheduler_payload, exercise_configs)
+                if isinstance(scheduler_payload, dict)
+                else fresh_scheduler
+            )
+            if scheduler_payload is not None and not isinstance(scheduler_payload, dict):
+                raise ValueError("некорректный exercise_scheduler")
+
             if saved.get("pending_actions"):
                 supervisor.require_recovery(
                     "После restart обнаружены команды без подтверждения исполнения."
                 )
-            return bus, supervisor
+            return bus, supervisor, scheduler
         except Exception as exc:
             supervisor = EnergySupervisor(config)
             supervisor.require_recovery(
                 f"Не удалось восстановить persistent state: {exc}"
             )
-            return GeneratorBusTracker(), supervisor
+            return GeneratorBusTracker(), supervisor, fresh_scheduler
 
     def _save_state(self, *, force: bool = False) -> None:
         payload = {
@@ -565,6 +784,7 @@ class EnergySupervisorApp:
             "app_version": APP_VERSION,
             "supervisor": self.supervisor.to_dict(),
             "generator_bus": self.generator_bus.to_dict(),
+            "exercise_scheduler": self.exercise_scheduler.to_dict(),
             "pending_actions": list(self._pending_action_records),
         }
         signature = json.dumps(payload, ensure_ascii=False, sort_keys=True)
@@ -593,6 +813,34 @@ class EnergySupervisorApp:
             generator_a_enabled=_boolean_option(self.options, "generator_a_enabled"),
             generator_b_enabled=_boolean_option(self.options, "generator_b_enabled"),
         )
+
+    def _exercise_configs(self) -> dict[GeneratorSlot, ExerciseConfig]:
+        return {
+            GeneratorSlot.A: ExerciseConfig(
+                enabled=_boolean_option(
+                    self.options,
+                    "generator_a_exercise_enabled",
+                ),
+                interval_days=int(self.options["generator_a_exercise_interval_days"]),
+                start_time=str(self.options["generator_a_exercise_start_time"]),
+                run_minutes=int(self.options["generator_a_exercise_run_minutes"]),
+                presence_grace_days=int(
+                    self.options["generator_a_exercise_presence_grace_days"]
+                ),
+            ),
+            GeneratorSlot.B: ExerciseConfig(
+                enabled=_boolean_option(
+                    self.options,
+                    "generator_b_exercise_enabled",
+                ),
+                interval_days=int(self.options["generator_b_exercise_interval_days"]),
+                start_time=str(self.options["generator_b_exercise_start_time"]),
+                run_minutes=int(self.options["generator_b_exercise_run_minutes"]),
+                presence_grace_days=int(
+                    self.options["generator_b_exercise_presence_grace_days"]
+                ),
+            ),
+        }
 
     # Status / log ----------------------------------------------------
 
@@ -633,40 +881,47 @@ class EnergySupervisorApp:
         )
         managed_slot = self.supervisor.session.generator if self.supervisor.session else None
         primary = self.supervisor.config.primary_generator
+        attributes = {
+            "friendly_name": "Energy ATS Status",
+            "icon": "mdi:transfer-switch",
+            "source": observation.power.actual_source.value,
+            "phase": self.supervisor.phase.value,
+            "generator": (
+                self._profile(actual_slot).display_name if actual_slot else None
+            ),
+            "generator_model": self._profile(actual_slot).model if actual_slot else None,
+            "generator_slot": actual_slot.value if actual_slot else None,
+            "managed_generator": (
+                self._profile(managed_slot).display_name if managed_slot else None
+            ),
+            "bus_owner": self._format_bus_owner(),
+            "generator_a_run_context": bus.run_contexts[GeneratorSlot.A].value,
+            "generator_b_run_context": bus.run_contexts[GeneratorSlot.B].value,
+            "primary_generator": self._profile(primary).display_name,
+            "remaining_seconds": self._remaining_seconds(now, observation),
+            "session_reason": (
+                self.supervisor.session.reason.value
+                if self.supervisor.session
+                else None
+            ),
+            "fallback_used": bool(
+                self.supervisor.session and self.supervisor.session.fallback_used
+            ),
+            "armed": self.armed,
+        }
+        local_now = datetime.fromtimestamp(now, self.local_time_zone)
+        attributes.update(self.exercise_scheduler.status_attributes(local_now, now))
+        exercise_slot = self.exercise_scheduler.owned_slot
+        attributes["exercise_active_generator"] = (
+            self._profile(exercise_slot).display_name if exercise_slot else None
+        )
         return {
             "state": (
                 self.supervisor.status_text(observation)
                 if self.armed
                 else "DISARMED — только наблюдение"
             ),
-            "attributes": {
-                "friendly_name": "Energy ATS Status",
-                "icon": "mdi:transfer-switch",
-                "source": observation.power.actual_source.value,
-                "phase": self.supervisor.phase.value,
-                "generator": (
-                    self._profile(actual_slot).display_name if actual_slot else None
-                ),
-                "generator_model": self._profile(actual_slot).model if actual_slot else None,
-                "generator_slot": actual_slot.value if actual_slot else None,
-                "managed_generator": (
-                    self._profile(managed_slot).display_name if managed_slot else None
-                ),
-                "bus_owner": self._format_bus_owner(),
-                "generator_a_run_context": bus.run_contexts[GeneratorSlot.A].value,
-                "generator_b_run_context": bus.run_contexts[GeneratorSlot.B].value,
-                "primary_generator": self._profile(primary).display_name,
-                "remaining_seconds": self._remaining_seconds(now, observation),
-                "session_reason": (
-                    self.supervisor.session.reason.value
-                    if self.supervisor.session
-                    else None
-                ),
-                "fallback_used": bool(
-                    self.supervisor.session and self.supervisor.session.fallback_used
-                ),
-                "armed": self.armed,
-            },
+            "attributes": attributes,
         }
 
     def _remaining_seconds(
@@ -772,6 +1027,12 @@ class EnergySupervisorApp:
         transfer = self._format_transfer(observation)
         if transfer:
             parts.append(f"transfer={transfer}")
+        exercise_slot = self.exercise_scheduler.owned_slot
+        if exercise_slot is not None and self.exercise_scheduler.active_attempt is not None:
+            parts.append(
+                f"exercise={self._profile(exercise_slot).display_name}:"
+                f"{self.exercise_scheduler.active_attempt.phase.value}"
+            )
         parts.extend(
             f"{self._profile(slot).display_name}: "
             f"{self._format_generator_state(slot, observation)}"

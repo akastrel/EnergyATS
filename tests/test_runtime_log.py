@@ -1,4 +1,4 @@
-"""Человеко-читаемое runtime-состояние EnergyATS v0.4."""
+"""Человеко-читаемое runtime-состояние EnergyATS."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 from domain import GeneratorSlot, PowerPath, PowerSource
 from energy_supervisor import SupervisorObservation
+from exercise_scheduler import ExerciseConfig, ExerciseScheduler
 from generator_bus import GeneratorBusTracker
 from generator_controller import (
     GeneratorController,
@@ -80,6 +81,12 @@ def app_for_log() -> EnergySupervisorApp:
         slot: GeneratorController(profile)
         for slot, profile in profiles.items()
     }
+    app.exercise_scheduler = ExerciseScheduler(
+        {
+            GeneratorSlot.A: ExerciseConfig(False, 30, "15:00", 10, 7),
+            GeneratorSlot.B: ExerciseConfig(False, 45, "15:00", 10, 14),
+        }
+    )
     app.armed = True
     app._last_runtime_signature = None
     app.log = logging.getLogger("test_runtime_log")

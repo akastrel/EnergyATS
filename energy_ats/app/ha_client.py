@@ -198,6 +198,21 @@ class HomeAssistantClient:
             service_data=service_data or {},
         )
 
+    async def get_time_zone(self) -> str:
+        """Вернуть IANA timezone Home Assistant для локального scheduler-time."""
+        response = await self.request("get_config")
+        result = response.get("result")
+        if not isinstance(result, dict):
+            raise HomeAssistantConnectionError(
+                f"get_config вернул неожиданный результат: {response!r}"
+            )
+        value = result.get("time_zone")
+        if not isinstance(value, str) or not value.strip():
+            raise HomeAssistantConnectionError(
+                "Home Assistant не сообщил корректную time_zone."
+            )
+        return value.strip()
+
     async def set_state(
         self,
         entity_id: str,

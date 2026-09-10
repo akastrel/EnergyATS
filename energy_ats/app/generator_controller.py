@@ -202,13 +202,31 @@ class GeneratorController:
                 return self._remote_off(now), None
             return [], None
 
+        ensure_choke_run = self._choke_position_uncertain()
         if o.running is True:
             self.phase = GeneratorPhase.COOLING_DOWN
             self.deadline = now + self.profile.cooldown_seconds
             self.fault = None
+            if ensure_choke_run:
+                return [
+                    self._action(
+                        GeneratorActionKind.CHOKE_TO_RUN,
+                        f"{self.profile.display_name}: перед безопасной остановкой "
+                        "приводим заслонку в рабочее положение.",
+                    )
+                ], None
             return [], None
 
-        return self._remote_off(now), None
+        actions: list[GeneratorAction] = []
+        if ensure_choke_run:
+            actions.append(
+                self._action(
+                    GeneratorActionKind.CHOKE_TO_RUN,
+                    f"{self.profile.display_name}: перед остановкой открываем заслонку.",
+                )
+            )
+        actions.extend(self._remote_off(now))
+        return actions, None
 
     def step(
         self,
@@ -223,7 +241,7 @@ class GeneratorController:
             return []
 
         if not self.initialized:
-            self._initialize(o, stable_managed_session)
+            self._initialize(now, o, stable_managed_session)
             self.initialized = True
 
         if o.emergency_stop is True:
@@ -372,12 +390,29 @@ class GeneratorController:
 
     # State helpers ----------------------------------------------------
 
-    def _initialize(self, o: GeneratorObservation, stable_managed: bool) -> None:
+    def _initialize(
+        self,
+        now: float,
+        o: GeneratorObservation,
+        stable_managed: bool,
+    ) -> None:
         if o.emergency_stop is True:
             self._latch_fault("Активен Generators Emergency Stop")
         elif o.running is True:
             if stable_managed and o.remote_on is True:
-                self.phase = GeneratorPhase.READY_FOR_LOAD
+                if o.load_connected is False:
+                    # Stable managed session with no house load is the exercise
+                    # restart case. GC's exact transient phase was not persisted,
+                    # so do not pretend the choke/warmup state is known. We wait
+                    # one conservative choke-hold interval and then idempotently
+                    # command CHOKE_TO_RUN before continuing.
+                    self.start_temperature = o.ambient_temperature_external
+                    self.choke_used = True
+                    self.phase = GeneratorPhase.HOLDING_COLD_START_CHOKE
+                    self.deadline = now + self.profile.cold_start_choke_hold_seconds
+                    self.fault = None
+                else:
+                    self.phase = GeneratorPhase.READY_FOR_LOAD
             else:
                 self.phase = GeneratorPhase.EXTERNAL_RUNNING
         elif o.remote_on is True:
@@ -467,6 +502,17 @@ class GeneratorController:
         self.deadline = None
         self.fault = None
         self.choke_used = False
+
+    def _choke_position_uncertain(self) -> bool:
+        return self.phase in {
+            GeneratorPhase.WAITING_FOR_DATA,
+            GeneratorPhase.PREPARING,
+            GeneratorPhase.WAITING_FOR_RUNNING,
+            GeneratorPhase.HOLDING_COLD_START_CHOKE,
+            GeneratorPhase.WARMING_UP,
+            GeneratorPhase.EXTERNAL_RUNNING,
+            GeneratorPhase.FAULT,
+        }
 
     @staticmethod
     def _stopped(o: GeneratorObservation) -> bool:
