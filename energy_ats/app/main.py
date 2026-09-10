@@ -49,14 +49,14 @@ from ha_client import HomeAssistantClient, HomeAssistantConnectionError
 from power_transfer import PowerTransferController, TransferAction, TransferPhase
 from state_store import StateStore
 
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.5.1"
 STATE_SCHEMA_VERSION = 2
 
 DEFAULT_OPTIONS: dict[str, Any] = {
     "armed": False,
     "tick_seconds": 1.0,
     "log_level": "info",
-    "grid_failure_delay": 5,
+    "grid_failure_delay": 60,
     "grid_restore_stable_time": 60,
     "generator_a_enabled": True,
     "generator_b_enabled": True,
