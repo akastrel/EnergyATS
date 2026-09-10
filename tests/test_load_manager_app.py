@@ -13,7 +13,6 @@ import pytest
 
 from domain import GeneratorSlot
 from energy_supervisor import SupervisorPhase
-from generator_controller import GeneratorPhase
 from ha_adapter import ENTITIES
 from load_manager import LoadGroup, LoadManagerPhase
 from main import DEFAULT_OPTIONS, EnergySupervisorApp
@@ -283,11 +282,13 @@ async def test_app_grid_return_restores_only_owned_loads_after_grid_path(tmp_pat
             fake.states[ENTITIES["house_grid"]] == "on"
             and fake.states[ENTITIES["load_g1"]] == "on"
             and fake.states[ENTITIES["load_g2"]] == "on"
+            and app.load_manager.shed_by_energy_ats[LoadGroup.G1] is False
+            and app.load_manager.shed_by_energy_ats[LoadGroup.G2] is False
         ):
             break
         now += 1.0
     else:
-        raise AssertionError("Grid/load restore не завершился")
+        raise AssertionError("Grid/load restore не завершился и не был подтверждён")
 
     calls = switch_calls(fake)
     grid_on = calls.index(("turn_on", ENTITIES["grid_power"]))
