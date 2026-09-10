@@ -94,6 +94,9 @@ class HomeAssistantAdapter:
             if isinstance(family_presence_entity, str) and family_presence_entity.strip()
             else None
         )
+        # Presence — мягкий input только для Exercise Scheduler. Даже когда
+        # scheduled exercise включён, unknown/unavailable presence не должен
+        # блокировать запуск самого ATS: Scheduler просто отложит обычный test.
         self.require_family_presence = require_family_presence
 
     def snapshot(self) -> HardwareSnapshot:
@@ -205,11 +208,6 @@ class HomeAssistantAdapter:
             ENTITIES["grid_power"],
             ENTITIES["source_generator"],
         ]
-        if self.require_family_presence:
-            if self.family_presence_entity is None:
-                state_required.append("<family_presence_entity не настроен>")
-            else:
-                state_required.append(self.family_presence_entity)
 
         existence_only: list[str] = []
         if include_control_entities:
@@ -223,8 +221,7 @@ class HomeAssistantAdapter:
         missing = [
             entity_id
             for entity_id in state_required
-            if entity_id.startswith("<")
-            or self.client.get_state(entity_id) in (None, "unknown", "unavailable")
+            if self.client.get_state(entity_id) in (None, "unknown", "unavailable")
         ]
         missing.extend(
             entity_id
