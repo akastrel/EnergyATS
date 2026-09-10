@@ -144,6 +144,11 @@ class EnergySupervisor:
     def request_recovery_reset(self) -> None:
         self._recovery_reset_requested = True
 
+    @property
+    def has_pending_session_request(self) -> bool:
+        """Maintenance не должна обгонять пользовательскую команду."""
+        return self._manual_start_requested or self._manual_stop_requested
+
     def consume_recovery_reset_request(self) -> bool:
         requested = self._recovery_reset_requested
         self._recovery_reset_requested = False
@@ -199,14 +204,20 @@ class EnergySupervisor:
         )
 
     def take_events(self) -> tuple[SupervisorEvent, ...]:
-        """Забрать накопленные события без повторного шага policy FSM."""
         events = tuple(self._events)
         self._events.clear()
         return events
 
     # Main policy -----------------------------------------------------
 
-    def step(self, now: float, o: SupervisorObservation) -> SupervisorDecision:
+    def step(
+        self,
+        now: float,
+        o: SupervisorObservation,
+        *,
+        exercise_owned_slot: GeneratorSlot | None = None,
+        exercise_desired_running: bool = False,
+    ) -> SupervisorDecision:
         self._stop_outage_generators.clear()
         if not self.initialized:
             self._initialize(o)
@@ -215,20 +226,20 @@ class EnergySupervisor:
 
         if not o.required_states_known:
             self._discard_requests()
-            return self._decision(o)
+            return self._decision(o, exercise_owned_slot, exercise_desired_running)
         if self.phase == SupervisorPhase.RECOVERY_REQUIRED:
             self._discard_requests()
-            return self._decision(o)
+            return self._decision(o, exercise_owned_slot, False)
         if o.emergency_stop is True:
             self._discard_requests()
             self._require_recovery("Активен Generators Emergency Stop.")
-            return self._decision(o)
+            return self._decision(o, exercise_owned_slot, False)
         if o.power.recovery_required:
             self._discard_requests()
             self._require_recovery(
                 o.power.fault or "Power Transfer требует восстановления."
             )
-            return self._decision(o)
+            return self._decision(o, exercise_owned_slot, False)
 
         if self._manual_start_requested:
             self._manual_start_requested = False
@@ -238,10 +249,10 @@ class EnergySupervisor:
             self._manual_stop(o)
 
         if self.session is None:
-            self._without_session(now, o)
+            self._without_session(now, o, exercise_owned_slot)
         else:
             self._with_session(now, o)
-        return self._decision(o)
+        return self._decision(o, exercise_owned_slot, exercise_desired_running)
 
     def _initialize(self, o: SupervisorObservation) -> None:
         if self.phase == SupervisorPhase.RECOVERY_REQUIRED:
@@ -271,7 +282,12 @@ class EnergySupervisor:
         if self._owner(o) == self.session.generator:
             self.desired_generators[self.session.generator] = True
 
-    def _without_session(self, now: float, o: SupervisorObservation) -> None:
+    def _without_session(
+        self,
+        now: float,
+        o: SupervisorObservation,
+        exercise_owned_slot: GeneratorSlot | None,
+    ) -> None:
         self.desired_generators = _stopped_generators()
 
         outage_slots = self._outage_slots(o)
@@ -295,15 +311,45 @@ class EnergySupervisor:
         if o.grid_ready is not False or not o.automatic_transfer_enabled:
             self.phase = SupervisorPhase.NORMAL
             return
-        if self._active_slots(o):
+
+        active = self._active_slots(o)
+        foreign_active = tuple(
+            slot for slot in active if slot != exercise_owned_slot
+        )
+        if foreign_active:
             self.phase = SupervisorPhase.EXTERNAL_RUNNING
             return
 
         if self.grid_failed_since is None:
             self.grid_failed_since = now
             self.phase = SupervisorPhase.GRID_FAILURE_DELAY
-        elif now - self.grid_failed_since >= self.config.grid_failure_delay:
-            self._begin_session(o, SessionReason.GRID_OUTAGE)
+            return
+
+        if now - self.grid_failed_since < self.config.grid_failure_delay:
+            self.phase = SupervisorPhase.GRID_FAILURE_DELAY
+            return
+
+        if exercise_owned_slot is not None:
+            exercise_status = o.generators[exercise_owned_slot]
+            if (
+                exercise_status.running is True
+                and exercise_status.remote_on is True
+                and not _generator_failed(exercise_status)
+                and self.config.generator_enabled(exercise_owned_slot)
+            ):
+                self._begin_session_for_slot(
+                    o,
+                    SessionReason.GRID_OUTAGE,
+                    exercise_owned_slot,
+                    allow_active=True,
+                )
+            else:
+                # Scheduler владеет незавершённым запуском. Не создаём второй
+                # параллельный REMOTE START configured PRIMARY.
+                self.phase = SupervisorPhase.GRID_FAILURE_DELAY
+            return
+
+        self._begin_session(o, SessionReason.GRID_OUTAGE)
 
     def _with_session(self, now: float, o: SupervisorObservation) -> None:
         assert self.session is not None
@@ -393,7 +439,6 @@ class EnergySupervisor:
             return
 
         if owner is not None and o.generators[owner].running is True:
-            # Hardware already moved the common bus. External owner stays external.
             self.desired_generators[slot] = (
                 managed.running is True and managed.remote_on is True
             )
@@ -412,7 +457,6 @@ class EnergySupervisor:
         other_status = o.generators[other]
         self.desired_generators[failed] = False
 
-        # Once fallback was used, never ping-pong back to the previous slot.
         if self.session.fallback_used:
             self._require_recovery(f"Отказ SECONDARY после fallback: {reason}")
             return
@@ -532,13 +576,29 @@ class EnergySupervisor:
     def _begin_session(self, o: SupervisorObservation, reason: SessionReason) -> None:
         if self._active_slots(o):
             return
+        self._begin_session_for_slot(
+            o,
+            reason,
+            self.config.primary_generator,
+            allow_active=False,
+        )
 
-        slot = self.config.primary_generator
+    def _begin_session_for_slot(
+        self,
+        o: SupervisorObservation,
+        reason: SessionReason,
+        slot: GeneratorSlot,
+        *,
+        allow_active: bool,
+    ) -> None:
+        if self._active_slots(o) and not allow_active:
+            return
+
         status = o.generators[slot]
         if not self.config.generator_enabled(slot) or _generator_failed(status):
             self._event(
                 "warning",
-                f"PRIMARY {status.display_name} недоступен; новая managed-сессия не начата.",
+                f"Generator {status.display_name} недоступен; новая managed-сессия не начата.",
             )
             return
 
@@ -557,7 +617,7 @@ class EnergySupervisor:
         self.phase = SupervisorPhase.STARTING_GENERATOR
         self._event(
             "info",
-            f"Начата сессия {reason.value}; запрошен запуск {status.display_name}.",
+            f"Начата сессия {reason.value}; используется {status.display_name}.",
         )
 
     def _finish_session(self) -> None:
@@ -570,7 +630,12 @@ class EnergySupervisor:
 
     # Derived state / persistence ------------------------------------
 
-    def _decision(self, o: SupervisorObservation) -> SupervisorDecision:
+    def _decision(
+        self,
+        o: SupervisorObservation,
+        exercise_owned_slot: GeneratorSlot | None = None,
+        exercise_desired_running: bool = False,
+    ) -> SupervisorDecision:
         owner = self._owner(o)
         stable_managed = (
             self.session.generator
@@ -581,9 +646,18 @@ class EnergySupervisor:
             )
             else None
         )
+        desired = dict(self.desired_generators)
+        if (
+            self.session is None
+            and self.phase != SupervisorPhase.RECOVERY_REQUIRED
+            and exercise_owned_slot is not None
+            and exercise_desired_running
+        ):
+            desired[exercise_owned_slot] = True
+
         return SupervisorDecision(
             desired_source=self.desired_source,
-            desired_generators=dict(self.desired_generators),
+            desired_generators=desired,
             actions_allowed=(
                 o.required_states_known
                 and self.phase != SupervisorPhase.RECOVERY_REQUIRED
