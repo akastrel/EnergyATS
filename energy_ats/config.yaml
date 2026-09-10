@@ -1,5 +1,5 @@
 name: "Energy ATS"
-version: "0.5.1"
+version: "0.6.0"
 slug: "energy_ats"
 description: >-
   Energy Supervisor: политика источников, безопасная силовая коммутация и
@@ -31,6 +31,15 @@ options:
   generator_a_enabled: true
   generator_b_enabled: true
 
+  # Load Manager по умолчанию выключен. При включении управляет только двумя
+  # явно заданными группами G1/G2; его meter/load inputs остаются soft dependencies.
+  load_management_enabled: false
+  load_measurement_stabilization_time: 10
+  load_restore_margin_percent: 15
+  nominal_overload_time: 20
+  maximum_overload_confirmation_time: 4
+  load_restore_retry_interval: 300
+
   # Плановые пробные пуски по умолчанию выключены. После включения Scheduler
   # использует один общий HA entity присутствия семьи.
   family_presence_entity: "group.family"
@@ -58,6 +67,13 @@ schema:
 
   generator_a_enabled: bool
   generator_b_enabled: bool
+
+  load_management_enabled: bool
+  load_measurement_stabilization_time: "float(0,120)"
+  load_restore_margin_percent: "float(0,99)"
+  nominal_overload_time: "float(0,300)"
+  maximum_overload_confirmation_time: "float(0,60)"
+  load_restore_retry_interval: "float(0,3600)"
 
   family_presence_entity: str
 
