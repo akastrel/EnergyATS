@@ -48,6 +48,7 @@ class GeneratorSession:
     grid_was_unavailable: bool
     stop_requested: bool = False
     fallback_used: bool = False
+    external_takeover_observed: bool = False
 
     @classmethod
     def begin(
@@ -65,6 +66,7 @@ class GeneratorSession:
             "grid_was_unavailable": self.grid_was_unavailable,
             "stop_requested": self.stop_requested,
             "fallback_used": self.fallback_used,
+            "external_takeover_observed": self.external_takeover_observed,
         }
 
     @classmethod
@@ -75,6 +77,10 @@ class GeneratorSession:
             _strict_bool(data["grid_was_unavailable"], "session.grid_was_unavailable"),
             _strict_bool(data.get("stop_requested", False), "session.stop_requested"),
             _strict_bool(data.get("fallback_used", False), "session.fallback_used"),
+            _strict_bool(
+                data.get("external_takeover_observed", False),
+                "session.external_takeover_observed",
+            ),
         )
 
 
@@ -413,6 +419,7 @@ class EnergySupervisor:
                 f"Дом переведён на резервное питание от {generator.display_name}.",
             )
         else:
+            self.session.external_takeover_observed = True
             self.desired_generators[slot] = generator.running is True
             self._event(
                 "warning",
@@ -439,6 +446,7 @@ class EnergySupervisor:
             return
 
         if owner is not None and o.generators[owner].running is True:
+            self.session.external_takeover_observed = True
             self.desired_generators[slot] = (
                 managed.running is True and managed.remote_on is True
             )
@@ -446,6 +454,14 @@ class EnergySupervisor:
 
         if o.bus is not None and o.bus.owner == GeneratorBusOwner.UNKNOWN:
             self._require_recovery("Владелец работающей генераторной шины неизвестен.")
+            return
+
+        if self.session.external_takeover_observed:
+            self._require_recovery(
+                "Внешний генератор, принявший генераторную шину после отказа "
+                "управляемого генератора, остановился. Автоматический повторный "
+                "запуск запрещён."
+            )
             return
 
         self._managed_failure(o, "Потерян генераторный источник.")
@@ -462,6 +478,7 @@ class EnergySupervisor:
             return
 
         if other_status.running is True or other_status.remote_on is True:
+            self.session.external_takeover_observed = True
             self.desired_source = PowerSource.GENERATOR
             self.phase = SupervisorPhase.ON_GENERATOR
             self._event(
