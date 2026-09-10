@@ -35,3 +35,41 @@ configuration:
       Разрешить Energy Supervisor использовать физический слот B для новой
       managed-сессии. Это policy-флаг Energy ATS; имя, модель и primary
       читаются из Home Assistant.
+
+  family_presence_entity:
+    name: "HA entity присутствия семьи"
+    description: >-
+      Entity Home Assistant, по которому Scheduler определяет, находится ли
+      семья дома. Поддерживаются состояния home/not_home и on/off.
+
+  generator_a_exercise_enabled:
+    name: "Пробные пуски генератора A"
+    description: "Разрешить автоматический плановый exercise физического слота A."
+  generator_a_exercise_interval_days:
+    name: "A: интервал пробного пуска, дней"
+    description: "Максимальный период без qualifying run до наступления due."
+  generator_a_exercise_start_time:
+    name: "A: время пробного пуска"
+    description: "Ежедневное локальное окно Home Assistant в формате HH:MM."
+  generator_a_exercise_run_minutes:
+    name: "A: длительность пробного пуска, мин"
+    description: "Минимальная непрерывная работа RUNNING для успешного exercise."
+  generator_a_exercise_presence_grace_days:
+    name: "A: отсрочка по присутствию, дней"
+    description: "Сколько дней после due присутствие семьи может откладывать exercise."
+
+  generator_b_exercise_enabled:
+    name: "Пробные пуски генератора B"
+    description: "Разрешить автоматический плановый exercise физического слота B."
+  generator_b_exercise_interval_days:
+    name: "B: интервал пробного пуска, дней"
+    description: "Максимальный период без qualifying run до наступления due."
+  generator_b_exercise_start_time:
+    name: "B: время пробного пуска"
+    description: "Ежедневное локальное окно Home Assistant в формате HH:MM."
+  generator_b_exercise_run_minutes:
+    name: "B: длительность пробного пуска, мин"
+    description: "Минимальная непрерывная работа RUNNING для успешного exercise."
+  generator_b_exercise_presence_grace_days:
+    name: "B: отсрочка по присутствию, дней"
+    description: "Сколько дней после due присутствие семьи может откладывать exercise."
