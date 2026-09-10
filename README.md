@@ -2,7 +2,7 @@
 
 Home Assistant App для управления резервным электроснабжением дома с двумя генераторами и подтверждаемой коммутацией основных контакторов.
 
-Текущая версия: **0.5.0** (`experimental`).
+Текущая версия: **0.6.0** (`experimental`).
 
 ## Источники истины
 
@@ -22,8 +22,9 @@ generator_bus.py          FIFO-owner общей генераторной шин�
 generator_controller.py  жизненный цикл одного двигателя
 power_transfer.py         основные контакторы Grid / Generator
 exercise_scheduler.py     график и ownership пробных запусков
+load_manager.py           G1/G2, admission и overload LOAD_SHEDDING
 ha_adapter.py             HA states и service calls
-main.py                   единый tick, journal, status/log
+main.py                   единый tick, arbitration, journal, status/log
 ```
 
 Ключевые положения базовой ATS-логики:
@@ -39,11 +40,44 @@ main.py                   единый tick, journal, status/log
 - после стабильного восстановления Grid дом сначала возвращается на Grid, затем останавливаются разрешённые outage-related генераторы;
 - `armed: false` запрещает реальные аппаратные switch/button calls.
 
-A/B остаются стабильными машинными слотами. Пользовательские имя и модель читаются из Home Assistant.
+A/B остаются стабильными машинными слотами. Пользовательские имя, модель и паспортные мощности читаются из Home Assistant.
 
-## Scheduled generator exercise — 0.5
+## Load Manager — 0.6
 
-Версия 0.5 добавляет независимый плановый пробный запуск каждого генератора после длительного простоя.
+Load Manager — отдельная policy-функция для двух некритичных групп:
+
+```text
+G1 = switch.non_critical_loads_first_floor
+G2 = switch.non_critical_loads_basement_floor
+```
+
+При `load_management_enabled=true` он:
+
+- после прогрева managed generator, но до generator transfer, отключает доступные G1/G2, чтобы генератор принял дом с минимальной нагрузкой;
+- после transfer возвращает нагрузки по одной с отдельным measurement window: `G1 -> G2`;
+- использует `Nominal Power` фактического `GeneratorBusOwner` как рабочий предел;
+- непрерывно контролирует generator power во всё время питания дома от generator bus;
+- при устойчивой перегрузке выполняет `LOAD_SHEDDING` в порядке `G2 -> G1`;
+- использует отдельный короткий timeout для превышения `Maximum Power`;
+- сохраняет ownership только собственных OFF и после возврата Grid восстанавливает только такие группы;
+- при отказе meter, G1/G2 или power metadata деградирует локально и не переводит core ATS в `RECOVERY_REQUIRED`.
+
+Load Manager по умолчанию **выключен**. Поэтому обновление App не требует немедленного наличия его soft-dependency entities; они нужны перед фактическим включением функции.
+
+Generator Controller должен публиковать отдельные numeric sensors:
+
+```text
+sensor.generator_a_nominal_power
+sensor.generator_a_maximum_power
+sensor.generator_b_nominal_power
+sensor.generator_b_maximum_power
+```
+
+Счётчик общей generator bus используется через `binary_sensor.generator_meter_status` и `sensor.generator_power`; дополнительная электрическая телеметрия остаётся диагностической.
+
+## Scheduled generator exercise
+
+Независимый плановый пробный запуск каждого генератора после длительного простоя сохраняется.
 
 Scheduler:
 
@@ -56,25 +90,21 @@ Scheduler:
 - принимает любой достоверный достаточно длинный run как qualifying activity;
 - сохраняет active attempt, due/history и stop ownership между restart;
 - маркирует собственный RUNNING как `TEST_RUN`;
-- при реальном outage может явно передать уже работающий test-generator обычной outage-сессии без бессмысленного OFF/повторного cold start;
+- при реальном outage может явно передать уже работающий test-generator обычной outage-сессии;
 - если handoff не состоялся, остаётся ответственным за штатную остановку своего двигателя.
 
-Автоматические exercise по умолчанию **выключены**.
-
-Значения по умолчанию после включения:
+Автоматические exercise по умолчанию выключены.
 
 ```text
 Generator A: interval 30 дней, start 15:00, run 10 мин, presence grace 7 дней
 Generator B: interval 45 дней, start 15:00, run 10 мин, presence grace 14 дней
 ```
 
-Presence entity задаётся параметром `family_presence_entity` (по умолчанию `group.family`). Неизвестный/unavailable presence не блокирует основную ATS-логику: обычный exercise просто откладывается.
-
-Подробнее: [`docs/ARCHITECTURE_RU.md`](docs/ARCHITECTURE_RU.md) и [`docs/REQUIREMENTS_RU.md`](docs/REQUIREMENTS_RU.md).
+Presence entity задаётся параметром `family_presence_entity` (default `group.family`). Неизвестный/unavailable presence не блокирует основную ATS-логику: обычный exercise просто откладывается.
 
 ## Home Assistant contract
 
-Основные entities:
+Core entities включают:
 
 ```text
 input_boolean.automatic_generator_transfer
@@ -99,7 +129,18 @@ sensor.generator_b_model
 select.primary_generator
 ```
 
-`house_powered_by_grid` и `house_powered_by_generator` являются feedback цепей управления основных контакторов, а не независимым измерением напряжения после силовых контактов.
+Load Manager дополнительно использует soft dependencies:
+
+```text
+sensor.generator_a_nominal_power
+sensor.generator_a_maximum_power
+sensor.generator_b_nominal_power
+sensor.generator_b_maximum_power
+binary_sensor.generator_meter_status
+sensor.generator_power
+switch.non_critical_loads_first_floor
+switch.non_critical_loads_basement_floor
+```
 
 Полный контракт: [`docs/ENTITIES_RU.md`](docs/ENTITIES_RU.md).
 
@@ -118,7 +159,7 @@ input_boolean.automatic_generator_transfer
 input_boolean.generator_test_mode
 ```
 
-При обновлении с 0.3.x старый persistent journal не мигрируется: внутренняя модель 0.4 принципиально другая. Обновление 0.4 -> 0.5 сохраняет совместимый top-level journal schema и добавляет scheduler-state.
+При обновлении с 0.3.x старый persistent journal не мигрируется: внутренняя модель 0.4 принципиально другая. Обновления 0.4 -> 0.5 -> 0.6 используют совместимый top-level journal schema; новые policy-секции получают собственный state при отсутствии старых данных.
 
 Подробно: [`docs/INSTALL_RU.md`](docs/INSTALL_RU.md).
 
@@ -144,7 +185,7 @@ App публикует read-only:
 sensor.energy_ats_status
 ```
 
-К базовым attributes (`source`, `phase`, generator/bus owner, managed generator, run-context A/B, PRIMARY, fallback, timers, `armed`) в 0.5 добавлены exercise attributes для A/B: initial/qualifying reference, next due, overdue, forced date, warning time, active state, planned duration, last result/failure и active exercise timer.
+Кроме базового source/phase/generator/bus/managed/run-context/PRIMARY/fallback status содержит Exercise state и Load Manager: phase/degraded reason, generator power, active nominal/maximum, state/ownership G1/G2, overload timers и retry state.
 
 Status sensor не используется как управляющий вход.
 
@@ -155,6 +196,7 @@ Status sensor не используется как управляющий вхо
 - [Архитектура](docs/ARCHITECTURE_RU.md)
 - [Home Assistant entities](docs/ENTITIES_RU.md)
 - [Установка и обновление](docs/INSTALL_RU.md)
+- [Пользовательские физические тесты](docs/USER_TESTS_RU.md)
 - [Changelog](energy_ats/CHANGELOG.md)
 
 ## Разработка
@@ -166,6 +208,6 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-Тесты моделируют HA states, ES/TPC/GC, аппаратный FIFO-owner, scheduled exercise, restart/handoff и фактические service calls к fake Home Assistant.
+Тесты моделируют HA states, ES/TPC/GC, аппаратный FIFO-owner, scheduled exercise, Load Manager, restart/handoff и фактические service calls к fake Home Assistant.
 
-Зелёный CI подтверждает программную модель, но не заменяет commissioning на реальных контакторах, генераторах, DKG116 и MAP.
+Зелёный CI подтверждает программную модель, но не заменяет commissioning на реальных контакторах, generator-bus meter, G1/G2, генераторах, DKG116 и MAP.
