@@ -2,7 +2,7 @@
 
 Статус: **proposal / draft**.
 
-Этот документ фиксирует предлагаемое расширение EnergyATS для автоматического периодического пробного запуска каждого генератора после длительного простоя. До согласования он не заменяет `REQUIREMENTS_RU.md`; после ревью утверждённые пункты должны быть перенесены в основной нормативный документ.
+Этот документ фиксирует требования к автоматическому периодическому пробному запуску каждого генератора после длительного простоя. До согласования он не заменяет `REQUIREMENTS_RU.md`; после финального review согласованные требования должны быть перенесены в основной нормативный документ.
 
 ## 1. Цель
 
@@ -15,11 +15,13 @@ EnergyATS должен периодически проверять работо�
 3. не переводить дом с Grid на генератор только ради теста;
 4. использовать штатный Generator Controller для REMOTE, choke, подтверждения RUNNING и остановки;
 5. обеспечить непрерывную работу двигателя заданное время;
-6. завершиться контролируемой остановкой;
+6. гарантированно завершиться контролируемой остановкой, если другой явно разрешённый сценарий EnergyATS не принял этот генератор под управление;
 7. записать результат в журнал;
 8. при неуспехе уведомить пользователя.
 
 Generator A и Generator B имеют независимые настройки и независимую историю пробных запусков.
+
+---
 
 ## 2. Термины
 
@@ -29,33 +31,48 @@ Generator A и Generator B имеют независимые настройки 
 
 ### 2.2. Qualifying run / засчитываемый запуск
 
-Для определения длительного простоя учитывается не любая кратковременная попытка пуска, а **успешный засчитываемый запуск**.
+Для определения длительного простоя учитывается не любая попытка пуска, а **успешный засчитываемый запуск**.
 
-Предлагаемое правило: запуск считается засчитываемым, если:
+Запуск считается засчитываемым, если:
 
 - RUNNING был подтверждён;
-- двигатель непрерывно проработал не меньше настроенной длительности exercise для данного генератора;
+- двигатель непрерывно проработал не меньше настроенной `exercise_run_minutes` для данного генератора;
 - за этот период не возник неустранённый fault двигателя.
 
-Засчитываемым может быть не только плановый exercise, но и обычная реальная работа генератора при outage или ручной managed-запуск, если она удовлетворяет тем же условиям.
+Засчитываемым может быть:
 
-Неуспешная попытка exercise не должна сбрасывать счётчик длительного простоя.
+- успешный scheduled exercise;
+- реальная работа при outage;
+- ручной managed-запуск;
+- другой известный EnergyATS непрерывный run,
+
+если он удовлетворяет тем же критериям длительности и исправности.
+
+Неуспешная или слишком короткая попытка не сбрасывает счётчик длительного простоя.
 
 ### 2.3. Due date
 
-`due date` — момент, когда с последнего засчитываемого запуска прошло настроенное количество дней простоя.
+`due date` — дата, начиная с которой генератор должен быть проверен exercise при первом допустимом дневном окне.
 
-### 2.4. Grace period по присутствию
+### 2.4. Presence grace period
 
-После наступления due date EnergyATS может откладывать exercise на ограниченное количество дней, если дома присутствуют люди.
+После наступления due date EnergyATS может откладывать exercise ограниченное число дней, если дома присутствуют люди.
 
-По истечении grace period присутствие людей больше не является причиной откладывать test; остальные safety-условия продолжают действовать.
+После окончания grace period присутствие перестаёт блокировать запуск. Все остальные safety-условия остаются обязательными.
+
+### 2.5. Владелец автоматического запуска
+
+Каждый генератор, автоматически запущенный EnergyATS, должен в каждый момент иметь явную текущую policy-причину продолжения работы.
+
+Для scheduled exercise такой причиной является активный exercise. Если во время него реальный outage принимает генератор под управление, ownership передаётся outage-сессии явно.
+
+**Автоматически запущенный генератор не должен оставаться RUNNING без активной причины продолжения работы и ответственного сценария остановки.**
+
+---
 
 ## 3. Конфигурация
 
-Настройки задаются **отдельно для каждого генератора**.
-
-Минимальный набор:
+Настройки задаются **отдельно для каждого генератора**:
 
 ```text
 exercise_enabled
@@ -65,9 +82,7 @@ exercise_run_minutes
 exercise_presence_grace_days
 ```
 
-Для A и B значения независимы.
-
-Пример смысла:
+Пример:
 
 ```text
 Generator A:
@@ -85,66 +100,87 @@ Generator B:
 
 Время интерпретируется в локальной timezone Home Assistant.
 
-Общий вход присутствия семьи должен быть явно сконфигурирован как HA entity (далее `family_presence_entity`). Конкретный entity_id не должен быть жёстко зашит в доменную модель.
+Presence задаётся через HA-интерфейсный configurable parameter/entity (далее `family_presence_entity`). Конкретный `entity_id` не должен быть жёстко зашит в доменную модель EnergyATS.
 
-Предупреждение перед принудительным запуском: за **60 минут** до планового старта. Если позже потребуется, lead time можно сделать отдельным параметром; в первой версии достаточно фиксированного значения 60 минут.
+Предупреждение перед forced exercise фиксировано для первой версии: **за 60 минут** до запуска. Отдельный per-generator параметр для lead time не требуется.
 
-## 4. Вычисление момента следующего exercise
+---
+
+## 4. Вычисление следующего exercise
 
 ### REQ-EXERCISE-01. Независимый график
 
-Для каждого генератора EnergyATS независимо хранит время последнего засчитываемого запуска и вычисляет:
+Для каждого генератора EnergyATS независимо хранит исходную точку/время последнего qualifying run и вычисляет следующий due:
 
 ```text
-next_due = last_qualifying_run + exercise_interval_days
+next_due = reference_run_time + exercise_interval_days
 ```
 
 ### REQ-EXERCISE-02. Новый генератор / отсутствие истории
 
-Если достоверной истории последнего засчитываемого запуска нет, EnergyATS не должен угадывать дату. Такое состояние должно быть явно наблюдаемым и требовать либо начальной точки, либо первого контролируемого exercise.
+Если EnergyATS впервые обнаружил ранее не сконфигурированный генератор и достоверной истории его запусков нет, прошлую дату запусков угадывать нельзя.
+
+Начальной точкой scheduler-а считается момент, когда EnergyATS впервые успешно инициализировал этот генератор. Первый exercise становится due через `exercise_interval_days` от этой точки.
+
+После первого qualifying run обычной точкой отсчёта становится фактическое время этого run.
 
 ### REQ-EXERCISE-03. Только ежедневное окно
 
 После наступления due date EnergyATS рассматривает запуск один раз в сутки в настроенное `exercise_start_time`.
 
-Если App не работал в момент окна, он не должен неожиданно выполнять «догоняющий» запуск в произвольное время после старта App. Следующая попытка — в очередное разрешённое дневное окно.
+Если App не работал в момент окна, он не выполняет неожиданный catch-up запуск в произвольное время после старта. Следующая попытка — в следующее разрешённое дневное окно.
+
+---
 
 ## 5. Проверка присутствия
 
 ### REQ-EXERCISE-04. Обычный запуск — только без людей дома
 
-После due date, но до конца grace period, exercise разрешён только если `family_presence_entity` однозначно показывает отсутствие семьи дома.
+После due date, но до конца presence grace period, exercise разрешён только если `family_presence_entity` однозначно показывает отсутствие семьи дома.
 
 ### REQ-EXERCISE-05. Присутствие откладывает на сутки
 
-Если в момент дневного окна кто-то дома, exercise не запускается. EnergyATS записывает факт defer и повторяет проверку в следующее дневное окно.
+Если в момент дневного окна кто-то дома, exercise не запускается. EnergyATS записывает `DEFERRED` с причиной presence и повторяет проверку в следующее дневное окно.
 
 ### REQ-EXERCISE-06. Повторная проверка непосредственно перед запуском
 
-Если отсутствие было подтверждено заранее, перед реальной командой запуска присутствие проверяется ещё раз. Если до истечения grace period кто-то появился дома — запуск снова откладывается.
+Перед физической командой запуска presence проверяется ещё раз.
 
-### REQ-EXERCISE-07. Принудительный запуск после grace period
+Если grace period ещё не закончился и кто-то появился дома, запуск откладывается.
+
+### REQ-EXERCISE-07. Forced exercise после grace period
 
 Если за `exercise_presence_grace_days` не нашлось подходящего дня без людей дома, в следующем дневном окне exercise разрешается независимо от presence.
 
-Слово «принудительный» отменяет только ограничение по presence. Оно **не отменяет safety-блокировки**, Grid prerequisites, E-stop, recovery, неизвестные состояния или конфликт с другой активной операцией.
+Слово `forced` отменяет **только presence restriction**. Оно не отменяет Grid prerequisites, E-stop, recovery, неизвестные состояния, другой активный сценарий или любые safety-блокировки.
 
-### REQ-EXERCISE-08. Предупреждение перед принудительным запуском
+### REQ-EXERCISE-08. Предупреждение за 60 минут
 
-За 60 минут до принудительного запуска EnergyATS должен отправить пользователю предупреждающую notification с:
+За 60 минут до forced exercise EnergyATS отправляет человеку понятную notification.
 
-- именем генератора;
-- плановым временем запуска;
-- причиной: просроченный exercise после grace period;
-- указанием, что запуск будет выполнен даже при присутствии людей, если safety-условия останутся допустимыми.
+Notification должна содержать:
 
-Если в момент старта safety-условия не позволяют запуск, тест не выполняется и переносится на следующее дневное окно.
+- реальное имя генератора;
+- плановое время запуска;
+- понятное объяснение, что это регулярный автоматический пробный запуск;
+- плановую длительность работы;
+- явное указание, что генератор после теста будет автоматически остановлен.
+
+Пример:
+
+> Пробный запуск генератора Elemax состоится сегодня в 15:00. Это регулярный тестовый пуск для проверки работоспособности генератора. После автоматического запуска генератор будет автоматически остановлен через 10 минут.
+
+Не нужно объяснять пользователю внутреннюю механику presence/grace period.
+
+Если в момент старта safety-условия не позволяют запуск, exercise не выполняется и переносится на следующее дневное окно.
+
+---
 
 ## 6. Preconditions для физического запуска
 
 ### REQ-EXERCISE-09. Grid должна быть доступна
 
-Новый exercise можно начинать только при:
+Новый exercise начинается только при:
 
 ```text
 grid_input_ready = ON
@@ -152,11 +188,9 @@ grid_input_ready = ON
 
 и устойчивом штатном Grid path дома.
 
-Пробный запуск сам по себе не должен отключать Grid или переводить дом на generator bus.
-
 ### REQ-EXERCISE-10. Дом остаётся на Grid
 
-Во время обычного exercise:
+Во время обычного exercise целевым состоянием остаётся:
 
 ```text
 switch.grid_power = ON
@@ -165,11 +199,9 @@ house_powered_by_grid = ON
 house_powered_by_generator = OFF
 ```
 
-должны оставаться целевым состоянием.
+Exercise сам по себе не использует TPC для перевода дома на generator bus.
 
-EnergyATS не использует TPC для перевода нагрузки только ради exercise.
-
-### REQ-EXERCISE-11. Нет другой активной силовой операции
+### REQ-EXERCISE-11. Нет конфликтующей операции
 
 Exercise не запускается, если:
 
@@ -179,27 +211,29 @@ Exercise не запускается, если:
 - активен Generators Emergency Stop;
 - обязательные физические состояния неизвестны;
 - тестируемый генератор уже RUNNING или REMOTE ON;
-- другой генератор уже участвует в managed operation.
+- другой генератор участвует в managed operation;
+- уже выполняется другой scheduled exercise.
 
 ### REQ-EXERCISE-12. Не запускать два scheduled exercise одновременно
 
-Два плановых exercise не должны выполняться одновременно.
+Если дневные окна A и B конфликтуют, второй exercise переносится на следующее собственное дневное окно. Scheduler не сдвигает его на произвольное время в тот же день.
 
-Если окна A и B конфликтуют, второй exercise откладывается до следующего собственного дневного окна. Scheduler не должен самостоятельно сдвигать его на произвольное время в тот же день.
+---
 
 ## 7. Последовательность exercise
 
 ### REQ-EXERCISE-13. Использовать штатный GC
 
-Exercise должен использовать обычный Generator Controller конкретного слота:
+Exercise использует обычный Generator Controller конкретного слота:
 
 1. подготовка choke;
 2. один REMOTE START;
 3. ожидание RUNNING в штатный timeout;
 4. штатная обработка choke после запуска;
 5. контроль непрерывного RUNNING;
-6. штатная остановка через REMOTE OFF;
-7. подтверждение RUNNING OFF и REMOTE OFF.
+6. по окончании требуемого периода — штатная остановка;
+7. REMOTE OFF;
+8. подтверждение `RUNNING=OFF` и `REMOTE=OFF`.
 
 DKG116 по-прежнему отвечает за собственные crank retries; scheduler не создаёт цикл REMOTE ON/OFF.
 
@@ -207,162 +241,219 @@ DKG116 по-прежнему отвечает за собственные crank 
 
 `exercise_run_minutes` отсчитывается от первого подтверждённого RUNNING и означает минимальное требуемое время непрерывной работы двигателя.
 
-Warmup/choke входят в физическое время RUNNING, но тест не считается успешным, пока двигатель не проработал весь configured duration.
+Warmup/choke входят в физическое время RUNNING.
 
 ### REQ-EXERCISE-15. Никакого fallback
 
-Отказ одного генератора во время его exercise не должен автоматически запускать второй генератор.
+Failure exercise одного генератора не запускает второй генератор.
 
-Scheduled exercise проверяет именно конкретный generator slot. Его failure завершает только этот exercise попыткой безопасной остановки и пользовательской notification.
+Scheduled exercise проверяет конкретный physical slot. Failure завершает только этот exercise попыткой безопасной остановки и пользовательской notification.
+
+### REQ-EXERCISE-16. Обязательная остановка по завершении exercise
+
+Когда configured exercise duration закончилась, EnergyATS обязан начать штатную остановку генератора, если к этому моменту другой явно разрешённый сценарий EnergyATS **не принял данный генератор под управление**.
+
+Истечение exercise duration не может просто удалить scheduler-state и оставить двигатель RUNNING.
+
+---
 
 ## 8. Результат и журнал
 
-### REQ-EXERCISE-16. SUCCESS
+### REQ-EXERCISE-17. SUCCESS
 
 Exercise считается `SUCCESS`, если:
 
-- запуск подтверждён RUNNING;
+- RUNNING подтверждён;
 - двигатель непрерывно проработал не меньше configured duration;
-- не возникло fault, делающего результат недостоверным;
-- штатная остановка завершилась подтверждёнными `RUNNING=OFF` и `REMOTE=OFF`.
+- не возник fault, делающий результат недостоверным;
+- exercise сохранил ownership до штатной остановки;
+- остановка завершилась подтверждёнными `RUNNING=OFF` и `REMOTE=OFF`.
 
-После SUCCESS обновляется `last_qualifying_run` этого генератора и вычисляется следующий due date.
+После SUCCESS обновляется `last_qualifying_run` и вычисляется следующий due date.
 
-### REQ-EXERCISE-17. FAILED
+### REQ-EXERCISE-18. FAILED
 
-Реально начатый exercise считается `FAILED`, если, например:
+Физически начатый exercise считается `FAILED`, если, например:
 
 - RUNNING не подтвердился в start timeout;
-- двигатель неожиданно остановился до требуемой duration;
+- двигатель остановился раньше required duration;
 - GC получил fault;
 - штатная остановка не подтвердилась в stop timeout;
-- выполнение стало неоднозначным и потребовало recovery.
+- состояние стало неоднозначным и потребовало recovery.
 
 FAILED не обновляет `last_qualifying_run`.
 
-### REQ-EXERCISE-18. DEFERRED не является failure
+### REQ-EXERCISE-19. DEFERRED не является failure
 
 Exercise, который не был физически начат из-за presence или safety prerequisites, считается `DEFERRED`, а не `FAILED`.
 
-### REQ-EXERCISE-19. Журнал результата
+### REQ-EXERCISE-20. TAKEN_OVER_BY_OUTAGE
 
-Для каждой фактической попытки должны сохраняться как минимум:
+Если во время active exercise реальный Grid outage действительно принимает уже работающий генератор как managed source для питания дома, scheduled exercise прекращает владеть двигателем.
+
+Такой exercise фиксируется как `TAKEN_OVER_BY_OUTAGE` (или эквивалентное явно различимое состояние), а не как SUCCESS/FAILED.
+
+После handoff дальнейшая продолжительность работы и остановка принадлежат outage policy.
+
+### REQ-EXERCISE-21. Журнал результата
+
+Для каждой фактической попытки сохраняются как минимум:
 
 ```text
 generator
 scheduled_time
 actual_start_time
 actual_end_time
-result: SUCCESS | FAILED
+result: SUCCESS | FAILED | TAKEN_OVER_BY_OUTAGE
 required_run_minutes
 actual_run_seconds
 forced_after_presence_grace: true | false
 failure_reason (если есть)
 ```
 
-DEFERRED события также журналируются с причиной, но не считаются результатом физического теста.
+DEFERRED события журналируются отдельно с причиной.
 
-### REQ-EXERCISE-20. Notification при failure
+### REQ-EXERCISE-22. Notification при failure
 
-При `FAILED` EnergyATS должен отправить пользователю notification с реальным именем генератора и краткой причиной failure.
+При `FAILED` EnergyATS отправляет notification с реальным именем генератора и краткой человеко-читаемой причиной.
 
-SUCCESS достаточно записать в журнал; обязательная пользовательская notification при успехе не требуется.
+SUCCESS достаточно записать в журнал; обязательная notification при успехе не требуется.
+
+---
 
 ## 9. Взаимодействие с TEST_RUN
 
-### REQ-EXERCISE-21. Scheduled exercise является TEST_RUN по смыслу outage cleanup
+### REQ-EXERCISE-23. Scheduled exercise является TEST_RUN по смыслу outage cleanup
 
-Генератор, запущенный scheduler-ом для exercise, должен быть явно известен EnergyATS как тестовый запуск и не должен ошибочно классифицироваться как `OUTAGE_RELATED` только из-за последующих изменений Grid.
+GeneratorBusTracker должен знать, что непрерывный RUNNING, созданный scheduler-ом, является тестовым и не должен ошибочно стать `OUTAGE_RELATED` только из-за последующего исчезновения Grid.
 
-Для GeneratorBusTracker такой непрерывный RUNNING может использовать context `TEST_RUN`; отдельный новый bus run-context не требуется, если ownership exercise хранится в scheduler/session state.
+Для bus context достаточно существующего `TEST_RUN`; отдельный новый run-context не требуется.
 
-### REQ-EXERCISE-22. Helper `generator_test_mode` остаётся внешним маркером
+### REQ-EXERCISE-24. Helper `generator_test_mode` остаётся внешним маркером
 
-`input_boolean.generator_test_mode` продолжает означать: **пометить новый внешний OFF->ON RUNNING как TEST_RUN**.
+`input_boolean.generator_test_mode` продолжает означать: **пометить новый внешний OFF -> ON RUNNING как TEST_RUN**.
 
-Scheduled exercise не должен требовать включения этого helper-а: EnergyATS сам знает происхождение собственного запуска.
+Scheduled exercise не включает этот helper и не зависит от него: происхождение собственного запуска EnergyATS известно непосредственно scheduler-у.
+
+Существующее правило «TEST_RUN не останавливается outage-cleanup только из-за возврата Grid» не отменяет обязанность scheduler-а остановить **свой** exercise после configured duration.
+
+---
 
 ## 10. Потеря Grid во время exercise
 
-Этот сценарий требует явной policy, потому что Grid может исчезнуть в любой момент.
+### REQ-EXERCISE-25. Outage имеет приоритет
 
-### Предлагаемое правило для первой версии
+Если во время exercise `grid_input_ready` становится OFF, обычная outage policy получает приоритет в принятии решения о питании дома.
 
-### REQ-EXERCISE-23. Outage имеет приоритет
+Сам по себе факт исчезновения Grid ещё не означает автоматический handoff ownership двигателя от scheduler-а.
 
-Если `grid_input_ready` становится OFF во время exercise, scheduler прекращает быть главным владельцем policy. Обычная outage-логика EnergyATS получает приоритет.
+### REQ-EXERCISE-26. Явный handoff в outage session
 
-Поскольку работающий генератор был запущен самим EnergyATS и его происхождение известно, он **не должен считаться неизвестным внешним запуском**.
+Если outage policy реально принимает уже запущенный exercise-generator как managed source и начинает использовать его для outage-сессии, ownership двигателя явно переходит от exercise к outage session.
 
-Если генератор уже RUNNING/готов, предпочтительно использовать его как текущий managed generator для outage вместо бессмысленного `REMOTE OFF -> новый холодный запуск PRIMARY`.
+В этом случае:
 
-Если безопасно продолжить существующий запуск невозможно, система должна перейти в обычную outage/recovery policy без угадывания.
+- не выполняется бессмысленный `REMOTE OFF -> новый холодный запуск` того же генератора;
+- exercise фиксируется как `TAKEN_OVER_BY_OUTAGE`;
+- exercise timer больше не имеет права остановить двигатель;
+- дальнейшая остановка выполняется только по правилам outage session.
 
-Exercise в таком случае записывается как `INTERRUPTED_BY_OUTAGE`, а не SUCCESS/FAILED, и сам по себе не должен создавать failure notification.
+### REQ-EXERCISE-27. Если handoff не произошёл — exercise обязан остановить двигатель
 
-**Этот пункт предлагается отдельно подтвердить перед реализацией**, потому что он определяет переход между maintenance policy и аварийным ATS-сценарием.
+Если Grid исчезла, но outage policy **не приняла** exercise-generator под управление, scheduler сохраняет ответственность за него.
+
+Например, если Grid кратковременно исчезла и восстановилась до реального перевода дома на generator bus, exercise продолжает свой контролируемый цикл и по истечении configured duration обязан штатно остановить генератор.
+
+Не допускается состояние, при котором transient Grid event отменил exercise shutdown и оставил автоматически запущенный генератор работать без ограничения времени.
+
+### REQ-EXERCISE-28. Реальная outage policy важнее exercise deadline после handoff
+
+Если handoff уже произошёл и дом питается от этого генератора, окончание исходных `exercise_run_minutes` **не является основанием остановить генератор под нагрузкой**.
+
+---
 
 ## 11. Persistence и restart
 
-### REQ-EXERCISE-24. Scheduler state переживает restart
+### REQ-EXERCISE-29. Scheduler state переживает restart
 
-Должны сохраняться независимо для A/B:
+Для каждого generator slot сохраняются данные, достаточные для восстановления:
 
+- first-seen/reference time;
 - last qualifying run;
-- next due date либо данные, достаточные для её вычисления;
-- факт просрочки/grace period;
-- активная exercise attempt;
-- был ли уже отправлен forced-warning;
-- текущий result state.
+- next due date либо данные для её вычисления;
+- overdue/grace state;
+- active exercise attempt;
+- actual exercise start time;
+- planned minimum run-until time;
+- был ли отправлен forced warning;
+- текущий result/ownership state.
 
-### REQ-EXERCISE-25. Restart во время exercise
+### REQ-EXERCISE-30. Restart во время exercise
 
 После restart EnergyATS не должен повторно подавать REMOTE START вслепую.
 
-Если по persisted state и физическим сигналам можно однозначно восстановить активный exercise, он может быть безопасно продолжен/завершён. Если нет — `RECOVERY_REQUIRED`.
+Если persisted scheduler-state и физические сигналы однозначно подтверждают активный exercise, EnergyATS восстанавливает ownership и доводит его до штатной остановки либо корректного outage handoff.
 
-## 12. Минимальные сценарные тесты нового функционала
+Если ownership/следующее безопасное действие доказать нельзя — `RECOVERY_REQUIRED`.
 
-1. Generator A due, дома никого нет -> exercise SUCCESS.
-2. Generator B имеет другой independent schedule -> exercise по собственному времени.
-3. Presence ON в due day -> DEFERRED.
-4. Presence OFF на следующий день -> exercise выполняется.
-5. Presence ON все grace days -> warning за 60 минут -> forced exercise.
-6. Кто-то вернулся домой непосредственно перед обычным, не forced start -> DEFERRED.
-7. Forced start не отменяется одним лишь presence, но блокируется E-stop/recovery/неизвестными данными.
-8. PRIMARY/SECONDARY роли не влияют на individual exercise schedule.
-9. A exercise failure -> B автоматически не запускается.
-10. Неуспешный start -> FAILED + notification + due остаётся просроченным.
-11. Unexpected stop до duration -> FAILED.
-12. Stop timeout -> FAILED/recovery.
-13. Успешный normal outage run достаточной duration сбрасывает exercise due date.
-14. Короткая неуспешная попытка не сбрасывает due date.
-15. Два exercise windows конфликтуют -> не запускаются одновременно.
-16. App offline в scheduled time -> нет неожиданного catch-up вне окна.
-17. Restart до scheduled time сохраняет schedule/grace state.
-18. Restart во время active exercise не создаёт второй REMOTE START.
-19. Scheduled exercise не переключает дом с Grid на generator bus.
-20. Grid outage во время exercise -> поведение по REQ-EXERCISE-23.
+Restart не может приводить к бесконтрольной длительной работе автоматически запущенного генератора.
+
+---
+
+## 12. Минимальные сценарные тесты
+
+1. Новый Generator A впервые обнаружен -> first due = first-seen + interval.
+2. Generator A due, дома никого нет -> exercise SUCCESS.
+3. Generator B имеет независимый schedule -> запускается по собственному времени.
+4. Presence ON в due day -> DEFERRED.
+5. Presence OFF на следующий день -> exercise выполняется.
+6. Presence ON все grace days -> warning за 60 минут -> forced exercise.
+7. Warning содержит имя, время, назначение теста, длительность и обещание автоматической остановки.
+8. Кто-то вернулся непосредственно перед обычным не-forced start -> DEFERRED.
+9. Forced start игнорирует только presence, но блокируется E-stop/recovery/неизвестными данными.
+10. PRIMARY/SECONDARY роли не влияют на individual exercise schedule.
+11. A exercise failure -> B автоматически не запускается.
+12. Неуспешный start -> FAILED + notification + due остаётся просроченным.
+13. Unexpected stop до duration -> FAILED.
+14. Stop timeout -> FAILED/recovery.
+15. Успешный normal outage run достаточной duration сбрасывает exercise interval.
+16. Короткая попытка не сбрасывает interval.
+17. Два exercise windows конфликтуют -> не запускаются одновременно.
+18. App offline в scheduled time -> нет catch-up вне следующего дневного окна.
+19. Restart до scheduled time сохраняет schedule/grace state.
+20. Restart во время active exercise не создаёт второй REMOTE START и сохраняет обязательство остановки.
+21. Scheduled exercise при штатной Grid не переключает дом на generator bus.
+22. Краткий Grid outage без handoff -> exercise всё равно заканчивается штатной остановкой.
+23. Grid outage с реальным handoff -> exercise = TAKEN_OVER_BY_OUTAGE, двигатель продолжает работать по outage policy.
+24. После outage handoff exercise deadline не останавливает генератор под нагрузкой.
+25. TEST_RUN semantics не позволяют обычному outage cleanup преждевременно остановить active exercise.
+
+---
 
 ## 13. Изменения в существующем `REQUIREMENTS_RU.md` после согласования
 
-Физический документ `PHYSICAL_POWER_TOPOLOGY_RU.md` менять не требуется: новых контакторов, датчиков или силовых путей нет.
+`PHYSICAL_POWER_TOPOLOGY_RU.md` менять не требуется: новых физических устройств, датчиков и силовых путей нет.
 
 В основном requirements документе потребуется:
 
-1. в разделе логических уровней добавить ответственность за maintenance/exercise scheduling, не смешивая её с TPC;
+1. добавить maintenance/exercise scheduling как отдельную policy-ответственность, не смешивая её с TPC;
 2. расширить определение `TEST_RUN`: он может быть внешне помеченным helper-ом или внутренне созданным scheduled exercise;
-3. уточнить REQ-OUTRUN-04: запрет outage-cleanup для TEST_RUN не запрещает scheduler-у штатно остановить **свой** exercise после configured duration;
-4. добавить отдельный раздел `Плановый пробный запуск генераторов` с требованиями REQ-EXERCISE-*;
-5. явно установить, что exercise не является outage/manual managed power session и не должен переключать house source при нормальной Grid;
-6. добавить policy взаимодействия `exercise -> real Grid outage`;
-7. расширить persistence/restart требования состоянием scheduler-а;
-8. добавить новые status/log требования: last exercise result, last qualifying run, next due, overdue/forced state — точный внешний contract определить после согласования requirements;
-9. расширить минимальные сценарные тесты новым набором exercise cases.
+3. уточнить REQ-OUTRUN-04: outage cleanup не останавливает TEST_RUN только по причине возврата Grid, но scheduler обязан штатно завершить собственный exercise;
+4. добавить раздел `Плановый пробный запуск генераторов` с REQ-EXERCISE-*;
+5. явно установить, что обычный exercise не является power-transfer session и при штатной Grid не переключает house source;
+6. добавить явный ownership/handoff `exercise -> outage`;
+7. добавить инвариант: автоматически запущенный генератор не остаётся RUNNING без текущей policy-причины и ответственного сценария остановки;
+8. расширить persistence/restart scheduler-state;
+9. добавить status/log: last result, last qualifying run, next due, overdue/grace/active exercise state;
+10. расширить минимальные сценарные тесты exercise cases.
 
-## 14. Вопросы, которые стоит подтвердить до кодирования
+---
 
-1. **Что именно сбрасывает месячный таймер?** В этом draft принято: любой успешный непрерывный run длительностью не меньше configured exercise duration, независимо от причины запуска.
-2. **Grid outage во время exercise.** В draft предлагается не останавливать исправный уже запущенный двигатель только ради перехода в outage, а передать его обычной ATS policy как известный managed source.
-3. **Forced warning.** В draft 60 минут фиксированы; при необходимости можно сделать per-generator параметром.
-4. **Presence entity.** Предлагается общий configurable HA entity, а не жёстко заданный `group.*`.
+## 14. Зафиксированные решения после review
+
+1. **Inactivity timer.** Любой qualifying run достаточной длительности сбрасывает interval независимо от причины запуска.
+2. **Новый генератор без истории.** Начальная точка — first-seen/инициализация EnergyATS; первый due наступает через configured interval.
+3. **Grid outage во время exercise.** Уже запущенный генератор может быть явно передан outage session; если handoff не произошёл, scheduler обязан остановить его по завершении exercise.
+4. **Forced warning.** Lead time фиксирован: 60 минут.
+5. **Presence.** Источник presence задаётся через HA-интерфейсный configurable entity/parameter, concrete entity_id не зашивается в EnergyATS.
+6. **Notification text.** Пользователь получает простое объяснение назначения теста, времени, длительности и автоматической остановки без описания внутренней presence/grace логики.
