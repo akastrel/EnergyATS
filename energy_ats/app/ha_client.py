@@ -43,6 +43,11 @@ class HomeAssistantClient:
         self._buffered_state_events: list[dict[str, Any]] = []
 
         self.states: dict[str, dict[str, Any]] = {}
+        # Monotonic revision per entity lets policy distinguish a genuinely new
+        # HA sample from repeated reads of the same cached state. Load Manager
+        # uses this only for freshness/stabilization; it is not a physical value.
+        self._state_revision_counter = 0
+        self._state_revisions: dict[str, int] = {}
         self.connected = asyncio.Event()
 
     async def connect(self) -> None:
@@ -91,6 +96,10 @@ class HomeAssistantClient:
                 for item in result
                 if isinstance(item, dict) and "entity_id" in item
             }
+            self._state_revision_counter = 0
+            self._state_revisions = {}
+            for entity_id in self.states:
+                self._mark_state_observed(entity_id)
 
             while self._buffered_state_events:
                 buffered = self._buffered_state_events
@@ -154,6 +163,11 @@ class HomeAssistantClient:
             return None
         value = item.get("state")
         return value if isinstance(value, str) else None
+
+    def get_state_revision(self, entity_id: str) -> int | None:
+        """Revision последнего полученного HA state для проверки freshness."""
+
+        return self._state_revisions.get(entity_id)
 
     async def request(self, command_type: str, **payload: Any) -> dict[str, Any]:
         if self._ws is None or self._ws.closed:
@@ -309,8 +323,14 @@ class HomeAssistantClient:
         new_state = event_data.get("new_state")
         if isinstance(new_state, dict):
             self.states[entity_id] = new_state
+            self._mark_state_observed(entity_id)
         else:
             self.states.pop(entity_id, None)
+            self._state_revisions.pop(entity_id, None)
+
+    def _mark_state_observed(self, entity_id: str) -> None:
+        self._state_revision_counter += 1
+        self._state_revisions[entity_id] = self._state_revision_counter
 
     async def _receive_json_direct(self) -> dict[str, Any]:
         if self._ws is None:
