@@ -69,27 +69,42 @@ class ExercisePhysicalFake:
         self.state_writes.append((entity_id, state, attributes or {}))
 
 
-def make_app(tmp_path: Path) -> tuple[EnergySupervisorApp, ExercisePhysicalFake]:
-    app = EnergySupervisorApp(
-        {
-            **DEFAULT_OPTIONS,
-            "armed": True,
-            "state_file": str(tmp_path / "state.json"),
-            "family_presence_entity": "group.family",
-            "generator_a_exercise_enabled": True,
-            "generator_a_exercise_interval_days": 1,
-            "generator_a_exercise_start_time": "15:00",
-            "generator_a_exercise_run_minutes": 1,
-            "generator_a_exercise_presence_grace_days": 7,
-            "generator_b_exercise_enabled": False,
-        },
-        token="test",
-    )
+def app_options(tmp_path: Path) -> dict:
+    return {
+        **DEFAULT_OPTIONS,
+        "armed": True,
+        "state_file": str(tmp_path / "state.json"),
+        "family_presence_entity": "group.family",
+        "generator_a_exercise_enabled": True,
+        "generator_a_exercise_interval_days": 1,
+        "generator_a_exercise_start_time": "15:00",
+        "generator_a_exercise_run_minutes": 1,
+        "generator_a_exercise_presence_grace_days": 7,
+        "generator_b_exercise_enabled": False,
+    }
+
+
+def attach_fake(app: EnergySupervisorApp, fake: ExercisePhysicalFake) -> None:
     app.local_time_zone = timezone.utc
-    fake = ExercisePhysicalFake()
     app.client = fake
     app.adapter.client = fake
+
+
+def make_app(tmp_path: Path) -> tuple[EnergySupervisorApp, ExercisePhysicalFake]:
+    app = EnergySupervisorApp(app_options(tmp_path), token="test")
+    fake = ExercisePhysicalFake()
+    attach_fake(app, fake)
     return app, fake
+
+
+def count_remote_on(fake: ExercisePhysicalFake, entity_id: str) -> int:
+    return sum(
+        1
+        for domain, service, data in fake.calls
+        if domain == "switch"
+        and service == "turn_on"
+        and data.get("entity_id") == entity_id
+    )
 
 
 @pytest.mark.asyncio
@@ -130,4 +145,49 @@ async def test_scheduled_exercise_starts_runs_stops_without_touching_house_sourc
     assert not any(
         domain == "switch" and data.get("entity_id") in power_entities
         for domain, _service, data in fake.calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_restart_during_running_exercise_preserves_timer_and_never_restarts_engine(tmp_path):
+    app, fake = make_app(tmp_path)
+    start = datetime(2026, 3, 10, 15, 0, tzinfo=timezone.utc)
+    app.exercise_scheduler.states[GeneratorSlot.A].initial_reference_time = (
+        start - timedelta(days=2)
+    ).isoformat()
+
+    await app._tick(start.timestamp())
+    await app._tick((start + timedelta(seconds=2)).timestamp())
+    await app._tick((start + timedelta(seconds=3)).timestamp())
+    await app._tick((start + timedelta(seconds=4)).timestamp())
+
+    assert fake.states[ENTITIES["generator_a_running"]] == "on"
+    assert count_remote_on(fake, ENTITIES["generator_a_remote"]) == 1
+    original_run_until = app.exercise_scheduler.active_attempt.run_until
+    assert original_run_until is not None
+
+    # Новый process: Scheduler/Bus/Supervisor восстанавливаются из journal,
+    # а GC создаётся заново. Физические HA states остаются теми же.
+    restarted = EnergySupervisorApp(app_options(tmp_path), token="test")
+    attach_fake(restarted, fake)
+    assert restarted.exercise_scheduler.active_attempt is not None
+    assert restarted.exercise_scheduler.active_attempt.run_until == original_run_until
+
+    await restarted._tick((start + timedelta(seconds=5)).timestamp())
+    assert count_remote_on(fake, ENTITIES["generator_a_remote"]) == 1
+
+    # Консервативное восстановление GC может повторно дать CHOKE_TO_RUN,
+    # но не REMOTE START. Исходный exercise timer при этом не начинается заново.
+    await restarted._tick((start + timedelta(seconds=16)).timestamp())
+    assert count_remote_on(fake, ENTITIES["generator_a_remote"]) == 1
+
+    await restarted._tick((start + timedelta(seconds=64)).timestamp())
+    await restarted._tick((start + timedelta(seconds=125)).timestamp())
+    await restarted._tick((start + timedelta(seconds=126)).timestamp())
+
+    assert fake.states[ENTITIES["generator_a_running"]] == "off"
+    assert restarted.exercise_scheduler.active_attempt is None
+    assert (
+        restarted.exercise_scheduler.states[GeneratorSlot.A].last_result
+        == ExerciseResult.SUCCESS.value
     )
