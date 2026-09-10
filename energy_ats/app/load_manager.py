@@ -418,7 +418,7 @@ class LoadManager:
         self.phase = LoadManagerPhase.LOAD_SHEDDING
 
         unavailable: list[LoadGroup] = []
-        for group in self._RESTORE_ORDER:
+        for group in self._SHED_ORDER:
             state = o.groups.get(group)
             if state is None:
                 unavailable.append(group)
