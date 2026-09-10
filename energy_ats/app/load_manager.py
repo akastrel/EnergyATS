@@ -1,4 +1,4 @@
-"""Управление некритичными нагрузками G1/G2 на generator bus."""
+"""Policy управления некритичными нагрузками G1/G2 на generator bus."""
 
 from __future__ import annotations
 
@@ -28,19 +28,12 @@ class LoadAction:
 
 
 class LoadManagerPhase(str, Enum):
+    """Только крупные состояния; конкретная операция хранится отдельно."""
+
     DISABLED = "disabled"
     IDLE = "idle"
-    WAITING_FOR_GENERATOR = "waiting_for_generator"
     LOAD_SHEDDING = "load_shedding"
     MEASURING = "measuring"
-    # Backward-compatible aliases for draft 0.6 tests/journal.
-    MEASURING_BASE_LOAD = "measuring"
-    RESTORING_G1 = "measuring"
-    MEASURING_AFTER_G1 = "measuring"
-    RESTORING_G2 = "measuring"
-    MEASURING_AFTER_G2 = "measuring"
-    OVERLOAD_CONTROL = "stable"
-    RESTORING_ON_GRID = "idle"
     STABLE = "stable"
     DEGRADED = "degraded"
 
@@ -57,13 +50,12 @@ class LoadManagerConfig:
     def __post_init__(self) -> None:
         if type(self.enabled) is not bool:
             raise ValueError("load_management_enabled должен быть boolean")
-        values = {
-            "load_measurement_stabilization_time": self.measurement_stabilization_time,
-            "nominal_overload_time": self.nominal_overload_time,
-            "maximum_overload_confirmation_time": self.maximum_overload_confirmation_time,
-            "load_restore_retry_interval": self.restore_retry_interval,
-        }
-        for name, value in values.items():
+        for name, value in (
+            ("load_measurement_stabilization_time", self.measurement_stabilization_time),
+            ("nominal_overload_time", self.nominal_overload_time),
+            ("maximum_overload_confirmation_time", self.maximum_overload_confirmation_time),
+            ("load_restore_retry_interval", self.restore_retry_interval),
+        ):
             if value < 0:
                 raise ValueError(f"{name} не может быть < 0")
         if not 0 <= self.restore_margin_percent < 100:
@@ -122,21 +114,17 @@ class _PendingAction:
         if type(target) is not bool:
             raise ValueError("load_manager.pending_action.target_on должен быть boolean")
         return cls(
-            group=LoadGroup(str(data["group"])),
-            target_on=target,
-            deadline=float(data["deadline"]),
-            reason=str(data.get("reason", "")),
-            block_transfer=bool(data.get("block_transfer", False)),
-            measurement_after=(
-                str(data["measurement_after"])
-                if data.get("measurement_after") is not None
-                else None
-            ),
+            LoadGroup(str(data["group"])),
+            target,
+            float(data["deadline"]),
+            str(data.get("reason", "")),
+            bool(data.get("block_transfer", False)),
+            str(data["measurement_after"]) if data.get("measurement_after") is not None else None,
         )
 
 
 class LoadManager:
-    """Небольшая policy-машина: command feedback, измерение и overload control."""
+    """Одна простая FSM + operation/data вместо отдельной фазы на каждый шаг."""
 
     _RESTORE_ORDER = (LoadGroup.G1, LoadGroup.G2)
     _SHED_ORDER = (LoadGroup.G2, LoadGroup.G1)
@@ -158,7 +146,8 @@ class LoadManager:
 
         self._measurement_reason: str | None = None
         self._measurement_started_at: float | None = None
-        self._samples: list[tuple[float, float]] = []
+        self._measurement_count = 0
+        self._measurement_max: float | None = None
         self._last_sample_id: Hashable | None = None
         self._last_new_sample_at: float | None = None
         self._nominal_overload_since: float | None = None
@@ -171,44 +160,44 @@ class LoadManager:
         actions: list[LoadAction] = []
         events: list[SupervisorEvent] = []
         notifications: list[str] = []
-        self._remember_observation(o)
+        self._remember(o)
 
         if not self.config.enabled:
-            self._set_disabled()
-            return self._decision(actions, events, notifications, True)
+            self.pending_action = None
+            self._reset_runtime()
+            self._set_phase(LoadManagerPhase.DISABLED)
+            return self._decision(actions, events, notifications)
 
-        self._reconcile_user_override(o)
-        if self.pending_action is not None:
-            waiting, transfer_permitted = self._reconcile_pending(o, events, notifications)
+        self._reconcile_manual_on(o)
+        if self.pending_action:
+            waiting, permit = self._reconcile_pending(o, events, notifications)
             if waiting:
-                return self._decision(actions, events, notifications, transfer_permitted)
+                return self._decision(actions, events, notifications, permit)
 
         if not o.actions_enabled:
             self.pending_action = None
             self._reset_runtime()
             if o.house_on_generator is True:
-                reason = self._dependency_error(o)
+                error = self._dependency_error(o)
                 self._set_phase(
-                    LoadManagerPhase.DEGRADED if reason else LoadManagerPhase.STABLE,
+                    LoadManagerPhase.DEGRADED if error else LoadManagerPhase.STABLE,
                     "observe_generator",
-                    reason,
+                    error,
                 )
-            elif o.desired_generator_supply:
-                self._set_phase(LoadManagerPhase.WAITING_FOR_GENERATOR, "waiting_for_generator")
             else:
-                self._set_phase(LoadManagerPhase.IDLE, None)
-            return self._decision(actions, events, notifications, True)
+                self._set_phase(LoadManagerPhase.IDLE, "waiting_for_generator" if o.desired_generator_supply else None)
+            return self._decision(actions, events, notifications)
 
         if self._pretransfer_required(o):
-            return self._step_pretransfer(o, actions, events, notifications)
+            return self._pretransfer(o, actions, events, notifications)
 
-        if self._grid_confirmed(o):
+        if o.house_on_grid is True and o.house_on_generator is False:
             self._reset_runtime()
             self._last_owner = None
-            return self._step_grid_restore(o, actions, events, notifications)
+            return self._restore_on_grid(o, actions, events, notifications)
 
         if o.house_on_generator is True:
-            return self._step_generator(o, actions, events, notifications)
+            return self._on_generator(o, actions, events, notifications)
 
         self._last_owner = None
         self._reset_runtime()
@@ -218,16 +207,12 @@ class LoadManager:
                 events,
                 notifications,
             )
-        elif o.desired_generator_supply:
-            self._set_phase(LoadManagerPhase.WAITING_FOR_GENERATOR, "waiting_for_generator")
         else:
-            self._set_phase(LoadManagerPhase.IDLE, None)
-        return self._decision(actions, events, notifications, True)
+            self._set_phase(LoadManagerPhase.IDLE, "waiting_for_generator" if o.desired_generator_supply else None)
+        return self._decision(actions, events, notifications)
 
-    def report_execution_failure(
-        self, action: LoadAction, error: str
-    ) -> tuple[SupervisorEvent, str]:
-        if self.pending_action is not None and self.pending_action.group == action.group:
+    def report_execution_failure(self, action: LoadAction, error: str) -> tuple[SupervisorEvent, str]:
+        if self.pending_action and self.pending_action.group == action.group:
             self.pending_action = None
         self._blocked_groups.add(action.group)
         reason = f"Не удалось выполнить {action.kind.value} для {action.group.value.upper()}: {error}"
@@ -236,6 +221,7 @@ class LoadManager:
         return SupervisorEvent("warning", reason), reason
 
     def status_attributes(self) -> dict[str, object]:
+        state = lambda value: "on" if value is True else "off" if value is False else "unknown"
         return {
             "load_management_enabled": self.config.enabled,
             "load_manager_phase": self.phase.value,
@@ -244,9 +230,9 @@ class LoadManager:
             "generator_power": self.last_generator_power,
             "active_generator_nominal_power": self.active_nominal_power,
             "active_generator_maximum_power": self.active_maximum_power,
-            "load_g1_state": self._state_text(self.last_group_states[LoadGroup.G1]),
+            "load_g1_state": state(self.last_group_states[LoadGroup.G1]),
             "load_g1_shed_by_energy_ats": self.shed_by_energy_ats[LoadGroup.G1],
-            "load_g2_state": self._state_text(self.last_group_states[LoadGroup.G2]),
+            "load_g2_state": state(self.last_group_states[LoadGroup.G2]),
             "load_g2_shed_by_energy_ats": self.shed_by_energy_ats[LoadGroup.G2],
             "load_nominal_overload_since": self._nominal_overload_since,
             "load_maximum_overload_since": self._maximum_overload_since,
@@ -258,7 +244,7 @@ class LoadManager:
         return {
             "phase": self.phase.value,
             "operation": self.operation,
-            "shed_by_energy_ats": {g.value: v for g, v in self.shed_by_energy_ats.items()},
+            "shed_by_energy_ats": {group.value: owned for group, owned in self.shed_by_energy_ats.items()},
             "pending_action": self.pending_action.to_dict() if self.pending_action else None,
             "degraded_reason": self.degraded_reason,
             "last_reason": self.last_reason,
@@ -269,8 +255,8 @@ class LoadManager:
     def from_dict(cls, data: Mapping[str, Any], config: LoadManagerConfig) -> "LoadManager":
         manager = cls(config)
         phase = str(data.get("phase", manager.phase.value))
-        # Compatibility with pre-refactor 0.6 draft journal.
-        phase_aliases = {
+        old_phases = {
+            "waiting_for_generator": "idle",
             "measuring_base_load": "measuring",
             "restoring_g1": "measuring",
             "measuring_after_g1": "measuring",
@@ -279,18 +265,17 @@ class LoadManager:
             "overload_control": "stable",
             "restoring_on_grid": "idle",
         }
-        manager.phase = LoadManagerPhase(phase_aliases.get(phase, phase))
-        operation = data.get("operation")
-        manager.operation = str(operation) if operation is not None else None
+        manager.phase = LoadManagerPhase(old_phases.get(phase, phase))
+        manager.operation = str(data["operation"]) if data.get("operation") is not None else None
 
         ownership = data.get("shed_by_energy_ats", {})
         if not isinstance(ownership, Mapping):
             raise ValueError("load_manager.shed_by_energy_ats должен быть object")
         for group in cls._RESTORE_ORDER:
-            value = ownership.get(group.value, False)
-            if type(value) is not bool:
+            owned = ownership.get(group.value, False)
+            if type(owned) is not bool:
                 raise ValueError(f"load_manager.shed_by_energy_ats.{group.value} должен быть boolean")
-            manager.shed_by_energy_ats[group] = value
+            manager.shed_by_energy_ats[group] = owned
 
         pending = data.get("pending_action")
         if pending is not None:
@@ -300,8 +285,8 @@ class LoadManager:
                 pending = {**pending, "block_transfer": True}
             manager.pending_action = _PendingAction.from_dict(pending)
 
-        manager.degraded_reason = cls._optional_text(data.get("degraded_reason"))
-        manager.last_reason = cls._optional_text(data.get("last_reason"))
+        manager.degraded_reason = str(data["degraded_reason"]) if data.get("degraded_reason") is not None else None
+        manager.last_reason = str(data["last_reason"]) if data.get("last_reason") is not None else None
         retry = data.get("next_restore_retry")
         manager.next_restore_retry = float(retry) if retry is not None else None
         manager._reset_measurement()
@@ -310,7 +295,7 @@ class LoadManager:
         manager._reset_overload_timers()
         return manager
 
-    def _step_pretransfer(self, o, actions, events, notifications) -> LoadManagerDecision:
+    def _pretransfer(self, o, actions, events, notifications) -> LoadManagerDecision:
         self._set_phase(LoadManagerPhase.LOAD_SHEDDING, "pretransfer")
         unavailable: list[LoadGroup] = []
         for group in self._SHED_ORDER:
@@ -318,7 +303,7 @@ class LoadManager:
             if state is None:
                 unavailable.append(group)
             elif state is True and group not in self._blocked_groups:
-                self._queue_action(
+                self._queue(
                     o,
                     actions,
                     group,
@@ -329,18 +314,17 @@ class LoadManager:
                 )
                 return self._decision(actions, events, notifications, False)
 
-        if unavailable or self._blocked_groups:
-            failed = unavailable + [g for g in self._SHED_ORDER if g in self._blocked_groups]
+        failed = unavailable + [group for group in self._SHED_ORDER if group in self._blocked_groups]
+        if failed:
+            names = ", ".join(dict.fromkeys(group.value.upper() for group in failed))
             self._degrade(
-                "Pre-transfer LOAD_SHEDDING выполнен не полностью: "
-                + ", ".join(dict.fromkeys(g.value.upper() for g in failed))
-                + ". Core ATS не блокируется.",
+                f"Pre-transfer LOAD_SHEDDING выполнен не полностью: {names}. Core ATS не блокируется.",
                 events,
                 notifications,
             )
-        return self._decision(actions, events, notifications, True)
+        return self._decision(actions, events, notifications)
 
-    def _step_grid_restore(self, o, actions, events, notifications) -> LoadManagerDecision:
+    def _restore_on_grid(self, o, actions, events, notifications) -> LoadManagerDecision:
         self.next_restore_retry = None
         self._blocked_groups.clear()
         for group in self._RESTORE_ORDER:
@@ -357,53 +341,45 @@ class LoadManager:
                     events,
                     notifications,
                 )
-                return self._decision(actions, events, notifications, True)
+                return self._decision(actions, events, notifications)
             if state is False:
                 self._set_phase(LoadManagerPhase.IDLE, "grid_restore")
-                self._queue_action(
-                    o,
-                    actions,
-                    group,
-                    True,
-                    "grid_restore",
-                    f"Grid подтверждена: восстанавливаем {group.value.upper()}.",
-                )
-                return self._decision(actions, events, notifications, True)
+                self._queue(o, actions, group, True, "grid_restore", f"Grid подтверждена: восстанавливаем {group.value.upper()}.")
+                return self._decision(actions, events, notifications)
 
-        self._set_phase(LoadManagerPhase.IDLE, None)
+        self._set_phase(LoadManagerPhase.IDLE)
         self._last_alert_key = None
-        return self._decision(actions, events, notifications, True)
+        return self._decision(actions, events, notifications)
 
-    def _step_generator(self, o, actions, events, notifications) -> LoadManagerDecision:
-        owner_changed = o.bus_owner != self._last_owner
-        dependency_error = self._dependency_error(o)
-        if dependency_error is not None:
-            self._degrade(dependency_error, events, notifications)
-            return self._decision(actions, events, notifications, True)
+    def _on_generator(self, o, actions, events, notifications) -> LoadManagerDecision:
+        error = self._dependency_error(o)
+        if error:
+            self._degrade(error, events, notifications)
+            return self._decision(actions, events, notifications)
 
-        if owner_changed or self.phase == LoadManagerPhase.DEGRADED:
+        if o.bus_owner != self._last_owner or self.phase == LoadManagerPhase.DEGRADED:
             self._last_owner = o.bus_owner
             self._start_measurement(o.now, "base")
             self._reset_overload_timers()
 
-        sample_is_new = self._accept_sample(o)
+        new_sample = self._accept_sample(o)
         if self._samples_stale(o.now):
             self._degrade(
                 "Нет нескольких свежих generator-power samples; power-based действия приостановлены.",
                 events,
                 notifications,
             )
-            return self._decision(actions, events, notifications, True)
+            return self._decision(actions, events, notifications)
 
         if self.phase == LoadManagerPhase.MEASURING:
             if not self._measurement_ready(o.now):
-                return self._decision(actions, events, notifications, True)
+                return self._decision(actions, events, notifications)
             return self._finish_measurement(o, actions, events, notifications)
 
-        if sample_is_new:
-            overload = self._evaluate_overload(o, actions, events, notifications)
-            if overload is not None:
-                return overload
+        if new_sample:
+            decision = self._overload(o, actions, events, notifications)
+            if decision:
+                return decision
 
         if (
             self.next_restore_retry is not None
@@ -412,23 +388,23 @@ class LoadManager:
         ):
             self._start_measurement(o.now, "retry")
             self._accept_sample(o, force=True)
-            return self._decision(actions, events, notifications, True)
+            return self._decision(actions, events, notifications)
 
         self._set_phase(LoadManagerPhase.STABLE, "monitoring")
-        return self._decision(actions, events, notifications, True)
+        return self._decision(actions, events, notifications)
 
     def _finish_measurement(self, o, actions, events, notifications) -> LoadManagerDecision:
-        power = self._measurement_power()
+        power = self._measurement_max
         assert power is not None
         reason = self._measurement_reason or "base"
         self._reset_measurement()
-        nominal = self._required_nominal(o)
+        nominal = self._nominal(o)
 
         if reason.startswith("admission:"):
             group = LoadGroup(reason.split(":", 1)[1])
             if power > nominal and o.groups.get(group) is True:
                 self.next_restore_retry = o.now + self.config.restore_retry_interval
-                self._queue_action(
+                self._queue(
                     o,
                     actions,
                     group,
@@ -437,71 +413,67 @@ class LoadManager:
                     f"{group.value.upper()} не прошла admission: {power:.0f} W > nominal {nominal:.0f} W.",
                     measurement_after="after_shed",
                 )
-                return self._decision(actions, events, notifications, True)
+                return self._decision(actions, events, notifications)
 
         if power > nominal:
             self._set_phase(LoadManagerPhase.STABLE, "monitoring")
             self._nominal_overload_since = o.now
-            self._maximum_overload_since = o.now if power > self._required_maximum(o) else None
-            return self._decision(actions, events, notifications, True)
+            self._maximum_overload_since = o.now if power > self._maximum(o) else None
+            return self._decision(actions, events, notifications)
 
-        return self._maybe_restore_group(o, power, actions, events, notifications)
+        return self._maybe_restore(o, power, actions, events, notifications)
 
-    def _maybe_restore_group(self, o, power, actions, events, notifications) -> LoadManagerDecision:
-        candidate = next((g for g in self._RESTORE_ORDER if self.shed_by_energy_ats[g]), None)
+    def _maybe_restore(self, o, power, actions, events, notifications) -> LoadManagerDecision:
+        candidate = next((group for group in self._RESTORE_ORDER if self.shed_by_energy_ats[group]), None)
         if candidate is None:
             self.next_restore_retry = None
             self._set_phase(LoadManagerPhase.STABLE, "monitoring")
-            return self._decision(actions, events, notifications, True)
+            return self._decision(actions, events, notifications)
 
         state = o.groups.get(candidate)
         if state is True:
             self.shed_by_energy_ats[candidate] = False
-            return self._maybe_restore_group(o, power, actions, events, notifications)
+            return self._maybe_restore(o, power, actions, events, notifications)
         if state is None:
-            self._degrade(
-                f"{candidate.value.upper()} недоступна; automatic restore приостановлен.",
-                events,
-                notifications,
-            )
-            return self._decision(actions, events, notifications, True)
+            self._degrade(f"{candidate.value.upper()} недоступна; automatic restore приостановлен.", events, notifications)
+            return self._decision(actions, events, notifications)
         if self.next_restore_retry is not None and o.now < self.next_restore_retry:
             self._set_phase(LoadManagerPhase.STABLE, "restore_wait")
-            return self._decision(actions, events, notifications, True)
+            return self._decision(actions, events, notifications)
 
-        limit = self._required_nominal(o) * (1 - self.config.restore_margin_percent / 100)
-        if power > limit:
+        threshold = self._nominal(o) * (1 - self.config.restore_margin_percent / 100)
+        if power > threshold:
             self.next_restore_retry = o.now + self.config.restore_retry_interval
-            self.last_reason = f"{candidate.value.upper()} не добавлена: {power:.0f} W > restore threshold {limit:.0f} W."
+            self.last_reason = f"{candidate.value.upper()} не добавлена: {power:.0f} W > restore threshold {threshold:.0f} W."
             self._set_phase(LoadManagerPhase.STABLE, "restore_wait")
-            return self._decision(actions, events, notifications, True)
+            return self._decision(actions, events, notifications)
 
-        self._queue_action(
+        self._queue(
             o,
             actions,
             candidate,
             True,
             "admission",
-            f"Добавляем {candidate.value.upper()}: {power:.0f} W <= restore threshold {limit:.0f} W.",
+            f"Добавляем {candidate.value.upper()}: {power:.0f} W <= restore threshold {threshold:.0f} W.",
             measurement_after=f"admission:{candidate.value}",
         )
-        return self._decision(actions, events, notifications, True)
+        return self._decision(actions, events, notifications)
 
-    def _evaluate_overload(self, o, actions, events, notifications) -> LoadManagerDecision | None:
-        power = self._finite_number(o.generator_power)
+    def _overload(self, o, actions, events, notifications) -> LoadManagerDecision | None:
+        power = self._number(o.generator_power)
         if power is None:
             return None
-        nominal = self._required_nominal(o)
-        maximum = self._required_maximum(o)
-
+        nominal, maximum = self._nominal(o), self._maximum(o)
         if power <= nominal:
             self._reset_overload_timers()
             self._last_alert_key = None
             return None
 
-        self._nominal_overload_since = self._nominal_overload_since or o.now
+        if self._nominal_overload_since is None:
+            self._nominal_overload_since = o.now
         if power > maximum:
-            self._maximum_overload_since = self._maximum_overload_since or o.now
+            if self._maximum_overload_since is None:
+                self._maximum_overload_since = o.now
             if o.now - self._maximum_overload_since >= self.config.maximum_overload_confirmation_time:
                 return self._shed_one(o, power, True, actions, events, notifications)
             return None
@@ -513,43 +485,43 @@ class LoadManager:
 
     def _shed_one(self, o, power, maximum, actions, events, notifications) -> LoadManagerDecision:
         candidate = next(
-            (g for g in self._SHED_ORDER if o.groups.get(g) is True and g not in self._blocked_groups),
+            (group for group in self._SHED_ORDER if o.groups.get(group) is True and group not in self._blocked_groups),
             None,
         )
-        nominal = self._required_nominal(o)
-        max_power = self._required_maximum(o)
+        threshold = self._maximum(o) if maximum else self._nominal(o)
         if candidate is None:
             level = "critical" if maximum else "warning"
             key = f"{level}:{o.bus_owner}"
             name = o.generator_name or "генератор"
-            threshold_name = "maximum" if maximum else "nominal"
-            threshold = max_power if maximum else nominal
+            kind = "maximum" if maximum else "nominal"
             message = (
                 f"{'Критическая перегрузка' if maximum else 'Перегрузка'} {name}: "
-                f"{power:.0f} W > {threshold_name} {threshold:.0f} W; "
-                "все управляемые некритичные группы уже отключены."
+                f"{power:.0f} W > {kind} {threshold:.0f} W; все управляемые некритичные группы уже отключены."
             )
-            self._emit_once(key, level, message, events, notifications, notify=not maximum)
+            if self._last_alert_key != key:
+                self._last_alert_key = key
+                self.last_reason = message
+                events.append(SupervisorEvent(level, message))
+                if not maximum:
+                    notifications.append(message)
             self._set_phase(LoadManagerPhase.STABLE, "overload_no_more_groups")
-            return self._decision(actions, events, notifications, True)
+            return self._decision(actions, events, notifications)
 
-        threshold = max_power if maximum else nominal
         self.next_restore_retry = o.now + self.config.restore_retry_interval
-        self._queue_action(
+        self._queue(
             o,
             actions,
             candidate,
             False,
             "maximum_overload" if maximum else "nominal_overload",
-            f"LOAD_SHEDDING {candidate.value.upper()}: {power:.0f} W > "
-            f"{'maximum' if maximum else 'nominal'} {threshold:.0f} W.",
+            f"LOAD_SHEDDING {candidate.value.upper()}: {power:.0f} W > {'maximum' if maximum else 'nominal'} {threshold:.0f} W.",
             measurement_after="after_shed",
         )
         self._reset_overload_timers()
         self._last_alert_key = None
-        return self._decision(actions, events, notifications, True)
+        return self._decision(actions, events, notifications)
 
-    def _queue_action(
+    def _queue(
         self,
         o: LoadManagerObservation,
         actions: list[LoadAction],
@@ -562,18 +534,16 @@ class LoadManager:
         measurement_after: str | None = None,
     ) -> None:
         self.pending_action = _PendingAction(
-            group=group,
-            target_on=target_on,
-            deadline=o.now + self._action_timeout(),
-            reason=reason,
-            block_transfer=block_transfer,
-            measurement_after=measurement_after,
+            group,
+            target_on,
+            o.now + max(2.0, self.config.measurement_stabilization_time),
+            reason,
+            block_transfer,
+            measurement_after,
         )
         self.operation = reason
         self.last_reason = message
-        actions.append(
-            LoadAction(group, LoadActionKind.TURN_ON if target_on else LoadActionKind.TURN_OFF, message)
-        )
+        actions.append(LoadAction(group, LoadActionKind.TURN_ON if target_on else LoadActionKind.TURN_OFF, message))
 
     def _reconcile_pending(self, o, events, notifications) -> tuple[bool, bool]:
         pending = self.pending_action
@@ -584,23 +554,18 @@ class LoadManager:
             self.pending_action = None
             self._blocked_groups.discard(pending.group)
             self.degraded_reason = None
-            self.last_reason = (
-                f"{pending.group.value.upper()} подтверждена "
-                f"{'ON' if pending.target_on else 'OFF'} ({pending.reason})."
-            )
-            events.append(SupervisorEvent("info", self.last_reason))
+            self.last_reason = f"{pending.group.value.upper()} подтверждена {'ON' if pending.target_on else 'OFF'} ({pending.reason})."
             if pending.measurement_after:
                 self._start_measurement(o.now, pending.measurement_after)
             return False, True
-
         if o.now < pending.deadline:
             return True, not pending.block_transfer
 
         self.pending_action = None
         self._blocked_groups.add(pending.group)
+        timeout = max(2.0, self.config.measurement_stabilization_time)
         self._degrade(
-            f"Не подтверждено {'включение' if pending.target_on else 'отключение'} "
-            f"{pending.group.value.upper()} за {self._action_timeout():.0f} с; core ATS продолжает работу.",
+            f"Не подтверждено {'включение' if pending.target_on else 'отключение'} {pending.group.value.upper()} за {timeout:.0f} с; core ATS продолжает работу.",
             events,
             notifications,
         )
@@ -611,127 +576,90 @@ class LoadManager:
         self.operation = reason
         self._measurement_reason = reason
         self._measurement_started_at = now
-        self._samples = []
+        self._measurement_count = 0
+        self._measurement_max = None
         self._last_sample_id = None
         self._last_new_sample_at = None
 
     def _accept_sample(self, o: LoadManagerObservation, *, force: bool = False) -> bool:
-        power = self._finite_number(o.generator_power)
+        power = self._number(o.generator_power)
         if power is None or power < 0 or o.power_sample_id is None:
             return False
         if not force and o.power_sample_id == self._last_sample_id:
             return False
         self._last_sample_id = o.power_sample_id
         self._last_new_sample_at = o.now
-        self._samples.append((o.now, power))
-        self._samples = self._samples[-128:]
+        self._measurement_count += 1
+        self._measurement_max = power if self._measurement_max is None else max(self._measurement_max, power)
         return True
 
     def _measurement_ready(self, now: float) -> bool:
         return (
             self._measurement_started_at is not None
             and now - self._measurement_started_at >= self.config.measurement_stabilization_time
-            and len(self._samples) >= 2
+            and self._measurement_count >= 2
         )
-
-    def _measurement_power(self) -> float | None:
-        return max((p for _t, p in self._samples), default=None)
 
     def _samples_stale(self, now: float) -> bool:
         if self._measurement_started_at is None:
             return False
-        timeout = max(5.0, self.config.measurement_stabilization_time * 2 + 1)
-        reference = self._last_new_sample_at or self._measurement_started_at
-        return now - reference >= timeout
+        reference = self._last_new_sample_at if self._last_new_sample_at is not None else self._measurement_started_at
+        return now - reference >= max(5.0, self.config.measurement_stabilization_time * 2 + 1)
 
     def _reset_measurement(self) -> None:
         self._measurement_reason = None
         self._measurement_started_at = None
-        self._samples = []
+        self._measurement_count = 0
+        self._measurement_max = None
         self._last_sample_id = None
         self._last_new_sample_at = None
-
-    def _remember_observation(self, o: LoadManagerObservation) -> None:
-        self.last_group_states = {g: o.groups.get(g) for g in self._RESTORE_ORDER}
-        self.last_generator_power = self._finite_number(o.generator_power)
-        self.active_nominal_power = self._finite_positive(o.nominal_power)
-        self.active_maximum_power = self._finite_positive(o.maximum_power)
 
     def _dependency_error(self, o: LoadManagerObservation) -> str | None:
         if o.bus_owner is None:
             return "Generator bus owner неизвестен; паспортные пределы нельзя выбрать достоверно."
-        nominal = self._finite_positive(o.nominal_power)
-        maximum = self._finite_positive(o.maximum_power)
+        nominal, maximum = self._positive(o.nominal_power), self._positive(o.maximum_power)
         if nominal is None or maximum is None or nominal > maximum:
             return "Nominal/Maximum Power текущего bus owner отсутствуют или некорректны."
         if o.meter_ready is not True:
             return "Generator meter недоступен; power-based Load Management приостановлен."
-        power = self._finite_number(o.generator_power)
+        power = self._number(o.generator_power)
         if power is None or power < 0 or o.power_sample_id is None:
             return "Generator Power отсутствует, некорректен или не имеет свежего sample."
-        if any(o.groups.get(g) is None for g in self._RESTORE_ORDER):
+        if any(o.groups.get(group) is None for group in self._RESTORE_ORDER):
             return "Состояние одной из групп G1/G2 неизвестно; автоматическое переключение приостановлено."
         return None
 
-    def _reconcile_user_override(self, o: LoadManagerObservation) -> None:
+    def _reconcile_manual_on(self, o: LoadManagerObservation) -> None:
         pending_group = self.pending_action.group if self.pending_action else None
         for group in self._RESTORE_ORDER:
             if self.shed_by_energy_ats[group] and o.groups.get(group) is True and group != pending_group:
                 self.shed_by_energy_ats[group] = False
 
-    def _set_disabled(self) -> None:
-        self.pending_action = None
-        self._reset_runtime()
-        self._set_phase(LoadManagerPhase.DISABLED, None)
+    def _remember(self, o: LoadManagerObservation) -> None:
+        self.last_group_states = {group: o.groups.get(group) for group in self._RESTORE_ORDER}
+        self.last_generator_power = self._number(o.generator_power)
+        self.active_nominal_power = self._positive(o.nominal_power)
+        self.active_maximum_power = self._positive(o.maximum_power)
 
     def _reset_runtime(self) -> None:
         self._reset_measurement()
         self._reset_overload_timers()
         self._blocked_groups.clear()
 
-    def _set_phase(self, phase: LoadManagerPhase, operation: str | None, reason: str | None = None) -> None:
-        self.phase = phase
-        self.operation = operation
-        self.degraded_reason = reason
+    def _set_phase(self, phase: LoadManagerPhase, operation: str | None = None, reason: str | None = None) -> None:
+        self.phase, self.operation, self.degraded_reason = phase, operation, reason
         if reason:
             self.last_reason = reason
 
-    def _degrade(self, reason, events, notifications) -> None:
+    def _degrade(self, reason: str, events, notifications) -> None:
         changed = self.degraded_reason != reason
         self._set_phase(LoadManagerPhase.DEGRADED, "degraded", reason)
         if changed:
             events.append(SupervisorEvent("warning", f"Load Manager: {reason}"))
             notifications.append(f"Load Manager: {reason}")
 
-    def _emit_once(self, key, level, message, events, notifications, *, notify: bool) -> None:
-        if self._last_alert_key == key:
-            return
-        self._last_alert_key = key
-        self.last_reason = message
-        events.append(SupervisorEvent(level, message))
-        if notify:
-            notifications.append(message)
-
     def _reset_overload_timers(self) -> None:
-        self._nominal_overload_since = None
-        self._maximum_overload_since = None
-
-    def _required_nominal(self, o: LoadManagerObservation) -> float:
-        value = self._finite_positive(o.nominal_power)
-        assert value is not None
-        return value
-
-    def _required_maximum(self, o: LoadManagerObservation) -> float:
-        value = self._finite_positive(o.maximum_power)
-        assert value is not None
-        return value
-
-    def _action_timeout(self) -> float:
-        return max(2.0, self.config.measurement_stabilization_time)
-
-    @staticmethod
-    def _grid_confirmed(o: LoadManagerObservation) -> bool:
-        return o.house_on_grid is True and o.house_on_generator is False
+        self._nominal_overload_since = self._maximum_overload_since = None
 
     @staticmethod
     def _pretransfer_required(o: LoadManagerObservation) -> bool:
@@ -743,28 +671,28 @@ class LoadManager:
         )
 
     @staticmethod
-    def _finite_number(value: float | None) -> float | None:
-        if value is None:
-            return None
+    def _number(value: float | None) -> float | None:
         try:
-            number = float(value)
+            number = float(value) if value is not None else None
         except (TypeError, ValueError):
             return None
-        return number if math.isfinite(number) else None
+        return number if number is not None and math.isfinite(number) else None
 
     @classmethod
-    def _finite_positive(cls, value: float | None) -> float | None:
-        number = cls._finite_number(value)
+    def _positive(cls, value: float | None) -> float | None:
+        number = cls._number(value)
         return number if number is not None and number > 0 else None
 
-    @staticmethod
-    def _optional_text(value: Any) -> str | None:
-        return str(value) if value is not None else None
+    def _nominal(self, o: LoadManagerObservation) -> float:
+        value = self._positive(o.nominal_power)
+        assert value is not None
+        return value
+
+    def _maximum(self, o: LoadManagerObservation) -> float:
+        value = self._positive(o.maximum_power)
+        assert value is not None
+        return value
 
     @staticmethod
-    def _state_text(value: bool | None) -> str:
-        return "on" if value is True else "off" if value is False else "unknown"
-
-    @staticmethod
-    def _decision(actions, events, notifications, transfer_permitted) -> LoadManagerDecision:
+    def _decision(actions, events, notifications, transfer_permitted: bool = True) -> LoadManagerDecision:
         return LoadManagerDecision(tuple(actions), tuple(events), tuple(notifications), transfer_permitted)
