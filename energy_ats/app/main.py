@@ -262,6 +262,8 @@ class EnergySupervisorApp:
                         sent_at,
                     )
                 )
+                # Delivery is a safety prerequisite for a future forced start.
+                # Persist it immediately instead of waiting for the end of tick.
                 self._save_state(force=True)
 
         decision = self.supervisor.step(
@@ -271,6 +273,9 @@ class EnergySupervisorApp:
             exercise_desired_running=exercise_decision.desired_running,
         )
 
+        # An outage session may explicitly adopt the already running exercise
+        # generator. Only after the Supervisor session exists do we release the
+        # Scheduler's stop ownership.
         if (
             self.exercise_scheduler.owned_slot is not None
             and self.supervisor.session is not None
@@ -292,6 +297,8 @@ class EnergySupervisorApp:
                 events=(),
             )
 
+        # A manual session has priority. An exercise that has not physically
+        # started yet can be deferred without touching the engine.
         if (
             self.exercise_scheduler.owned_slot is not None
             and self.supervisor.session is not None
@@ -304,6 +311,9 @@ class EnergySupervisorApp:
                 )
             )
 
+        # Если общая policy уже требует Recovery, Scheduler не имеет права
+        # потерять автоматически запущенный двигатель. Он переводит собственный
+        # attempt в FAILED/STOPPING и сохраняет обязанность безопасной остановки.
         if (
             self.supervisor.phase == SupervisorPhase.RECOVERY_REQUIRED
             and self.exercise_scheduler.owned_slot is not None
@@ -423,7 +433,7 @@ class EnergySupervisorApp:
         if any(metadata[slot] is None for slot in GeneratorSlot):
             raise ValueError("Не удалось прочитать имя или модель генераторов из HA.")
 
-        names = [metadata[slot].name for slot in GeneratorSlot]
+        names = [metadata[slot].name for slot in GeneratorSlot]  # type: ignore[union-attr]
         if not all(names) or len(set(names)) != len(names):
             raise ValueError("Имена Generator A/B должны быть непустыми и различаться.")
         if hardware.primary_generator is None:
@@ -435,8 +445,8 @@ class EnergySupervisorApp:
             value
             for slot in GeneratorSlot
             for value in (
-                metadata[slot].name,
-                metadata[slot].model,
+                metadata[slot].name,  # type: ignore[union-attr]
+                metadata[slot].model,  # type: ignore[union-attr]
             )
         ) + (hardware.primary_generator,)
         if signature == self._last_generator_config_signature:
