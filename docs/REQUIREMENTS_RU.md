@@ -1,7 +1,5 @@
 # Требования к реализации EnergyATS
 
-Текущая целевая версия требований: **EnergyATS 0.6.0**.
-
 ## 1. Назначение документа
 
 Этот документ определяет требуемое поведение EnergyATS для фактически существующей электрической схемы дома.
@@ -103,9 +101,9 @@ Scheduler не является дополнительным силовым ко
 
 Load Manager отвечает только за управление явно заданными некритичными группами нагрузки при работе дома от генераторной шины.
 
-Он выполняет предварительный `LOAD_SHEDDING`, поэтапный возврат нагрузок после перехода дома на генератор, непрерывный контроль перегрузки во всё время питания от генератора и восстановление собственных отключений после возврата Grid.
+Когда Load Manager разрешён конфигурацией, он выполняет предварительный `LOAD_SHEDDING`, поэтапный возврат нагрузок после перехода дома на генератор, непрерывный контроль перегрузки во всё время питания от генератора и восстановление собственных отключений после возврата Grid.
 
-Load Manager не выбирает A/B, не запускает и не останавливает генераторы и не управляет основными контакторами. Неисправность Load Manager или счётчика генераторной шины не должна останавливать основную ATS-логику.
+Load Manager не выбирает A/B, не запускает и не останавливает генераторы и не управляет основными контакторами. Неисправность Load Manager, его входных данных или счётчика генераторной шины не должна останавливать основную ATS-логику.
 
 ---
 
@@ -168,7 +166,7 @@ select.primary_generator
 
 `RUNNING` является физическим подтверждением работы/наличия выходного напряжения генератора. `REMOTE` является управляющим сигналом и сам по себе не доказывает успешный запуск.
 
-`Name`, `Model`, `Nominal Power` и `Maximum Power` являются read-only паспортными metadata Generator Controller. Поле `Model` содержит только модель и не должно использоваться как строковый контейнер для мощности.
+`Name`, `Model`, `Nominal Power` и `Maximum Power` являются read-only паспортными metadata Generator Controller.
 
 Паспортные мощности публикуются отдельными числовыми sensors в ваттах. Для установленных генераторов:
 
@@ -181,6 +179,8 @@ Elemax SH7600EX:
   nominal_power = 5500 W
   maximum_power = 6000 W
 ```
+
+`Nominal Power` и `Maximum Power` нужны для power-based решений Load Manager, но не относятся к обязательным входам основной ATS-логики. Их отсутствие или некорректность не должны мешать запуску App, запуску/остановке генератора, transfer или возврату Grid.
 
 ### 4.5. UPS / МАП
 
@@ -198,7 +198,7 @@ Exercise Scheduler использует один конфигурируемый 
 
 ### 4.7. Load Management
 
-Некритичные группы нагрузки первой версии:
+Управляемые некритичные группы нагрузки:
 
 ```text
 G1 = switch.non_critical_loads_first_floor
@@ -220,7 +220,7 @@ sensor.generator_power_factor
 sensor.generator_frequency
 ```
 
-В версии 0.6 управляющим критерием Load Manager является активная мощность `sensor.generator_power` в ваттах. Остальные параметры счётчика сохраняют диагностическую ценность и могут использоваться последующими версиями policy.
+Управляющим критерием Load Manager является активная мощность `sensor.generator_power` в ваттах. Остальные параметры счётчика сохраняют диагностическую ценность; отдельные пороги по ним этими требованиями не задаются.
 
 Счётчик генераторной шины является **мягкой зависимостью**: его отсутствие, отказ, `unknown/unavailable` или устаревшие данные не должны блокировать запуск EnergyATS, запуск генератора, силовой transfer, возврат Grid или переводить основную ATS-логику в `RECOVERY_REQUIRED`.
 
@@ -299,7 +299,7 @@ EnergyATS не учитывает и не управляет отдельной 
 
 До получения обязательных физических и конфигурационных входов аппаратные команды не выдаются.
 
-Load Management inputs из раздела 4.7 не относятся к обязательным входам основной ATS-логики.
+Load Management inputs из раздела 4.7 и паспортные мощности из раздела 4.4 не относятся к обязательным входам основной ATS-логики.
 
 ### REQ-START-02. Устойчивая сессия переживает restart
 
@@ -393,7 +393,7 @@ EnergyATS подаёт один уровневый REMOTE START выбранно
 
 До подтверждённого RUNNING и готовности управляемого генератора дом не переводится на генераторную шину.
 
-Если включён Load Management, после подтверждённой готовности генератора и до подключения дома к generator bus выполняется pre-transfer `LOAD_SHEDDING` согласно разделу 23. Это намеренно поздний этап: некритичные группы не отключаются на всё время запуска и прогрева без необходимости.
+Если Load Manager включён, после подтверждённой готовности генератора и до подключения дома к generator bus выполняется pre-transfer `LOAD_SHEDDING` согласно разделу 23. Это намеренно поздний этап: некритичные группы не отключаются на всё время запуска и прогрева без необходимости.
 
 ### REQ-AUTO-06
 
@@ -422,7 +422,7 @@ EnergyATS подаёт один уровневый REMOTE START выбранно
 
 Дом переводится на генератор только после успешного запуска и готовности управляемого генератора.
 
-Если Load Management включён, к ручному managed transfer применяются те же pre-transfer `LOAD_SHEDDING` и последующий admission control, что и к автоматическому outage.
+Если Load Manager включён, к ручному managed transfer применяются те же pre-transfer `LOAD_SHEDDING` и последующий admission control, что и к автоматическому outage.
 
 ### REQ-MANUAL-04
 
@@ -618,7 +618,7 @@ Scheduled exercise не должен включать этот helper и не з
 
 ### REQ-FAULT-07. Неисправность Load Management локальна
 
-Неисправность счётчика генераторной шины либо недоступность G1/G2 не являются сами по себе причиной `RECOVERY_REQUIRED` основной ATS-логики. Load Manager переходит в локальный degraded state и сообщает причину пользователю.
+Неисправность счётчика генераторной шины, паспортных power metadata либо недоступность G1/G2 не являются сами по себе причиной `RECOVERY_REQUIRED` основной ATS-логики. Load Manager переходит в локальный degraded state и сообщает причину пользователю.
 
 ---
 
@@ -987,6 +987,7 @@ last exercise failure reason (если есть)
 Для Load Management должны быть доступны как минимум:
 
 ```text
+load_management_enabled
 load_manager_phase
 load_manager_degraded_reason
 generator_power
@@ -1107,7 +1108,9 @@ Load Manager также не создаёт нового силового пут
 72. Grid возвращается после LOAD_SHEDDING, но до generator transfer -> собственные отключения восстанавливаются на подтверждённой Grid;
 73. generator bus owner аппаратно меняется A->B или B->A -> Load Manager использует nominal/maximum нового owner и повторно оценивает текущую нагрузку;
 74. дом уже находится на generator bus длительное время -> новая перегрузка всё равно обнаруживается и обрабатывается; Load Manager не является только startup-процедурой;
-75. отсутствующий/unavailable load switch или meter не переводит Supervisor/TPC/GC в `RECOVERY_REQUIRED` и не блокирует возврат Grid.
+75. отсутствующий/unavailable load switch или meter не переводит Supervisor/TPC/GC в `RECOVERY_REQUIRED` и не блокирует возврат Grid;
+76. `load_management_enabled = false` -> EnergyATS не выдаёт команды G1/G2, а core ATS выполняет обычный запуск/transfer/return без зависимости от Load Manager;
+77. Nominal/Maximum текущего bus owner отсутствуют или некорректны -> Load Manager переходит в DEGRADED, не выполняет power-based admission/shedding, а core ATS продолжает работу.
 
 ---
 
@@ -1115,9 +1118,9 @@ Load Manager также не создаёт нового силового пут
 
 ### 23.1. Цель и область ответственности
 
-Load Management версии 0.6 предназначен для того, чтобы генератор принимал дом с минимально необходимой нагрузкой, после чего некритичные группы поочерёдно возвращались только при достаточном запасе мощности. После завершения startup-последовательности Load Manager продолжает работать всё время, пока дом питается от генераторной шины, и выполняет `LOAD_SHEDDING` при последующей перегрузке.
+Load Management предназначен для того, чтобы генератор принимал дом с минимально необходимой нагрузкой, после чего некритичные группы поочерёдно возвращались только при достаточном запасе мощности. После завершения startup-последовательности Load Manager продолжает работать всё время, пока дом питается от генераторной шины, и выполняет `LOAD_SHEDDING` при последующей перегрузке.
 
-В первой версии управляются только:
+Управляются только:
 
 ```text
 G1 = switch.non_critical_loads_first_floor
@@ -1149,13 +1152,11 @@ Nominal/Maximum Power выбираются по фактическому `Genera
 
 Если физическая схема передала bus второму уже работающему generator, Load Manager должен использовать паспортные пределы нового owner.
 
-### REQ-LOAD-04. Паспортные параметры не парсятся из Model
+### REQ-LOAD-04. Отдельные паспортные параметры мощности
 
 Generator Controller должен публиковать отдельные числовые read-only sensors Nominal Power и Maximum Power в W для A и B.
 
-`Model` содержит только название модели. EnergyATS не должен извлекать мощность парсингом строки `Model`.
-
-### REQ-LOAD-05. Значения установленных генераторов
+### REQ-LOAD-05. Значения и допустимость паспортных параметров
 
 Для текущего оборудования используются:
 
@@ -1165,6 +1166,16 @@ Elemax SH7600EX: nominal 5600 W, maximum 6500 W
 ```
 
 `Nominal Power` означает допустимый рабочий предел непрерывной нагрузки для policy. `Maximum Power` означает верхний кратковременный предел; он не является нормальной рабочей целью.
+
+Для автоматических power-based решений оба значения текущего bus owner должны быть конечными положительными числовыми значениями в W и удовлетворять условию:
+
+```text
+0 < nominal_power <= maximum_power
+```
+
+Если Nominal/Maximum Power отсутствуют, `unknown/unavailable`, нечисловые, неположительные либо противоречат этому условию, Load Manager переходит в локальный `DEGRADED` и сообщает причину. Это не блокирует запуск App, GC/TPC/Supervisor, запуск генератора, generator transfer или возврат Grid и само по себе не создаёт `RECOVERY_REQUIRED`.
+
+Pre-transfer `LOAD_SHEDDING`, для которого power limits не нужны, по-прежнему может быть выполнен. Пока корректные limits недоступны, Load Manager не выполняет power-based admission и не включает ранее shed-группы на generator bus вслепую. Если limits стали некорректными уже во время устойчивой работы, текущее состояние G1/G2 не меняется только по этой причине; power-based admission/shedding возобновляется после восстановления корректных limits и нового stabilization window.
 
 ### 23.2. Ownership состояния G1/G2
 
@@ -1216,11 +1227,11 @@ Pre-transfer `LOAD_SHEDDING` не зависит от показаний generat
 
 ### 23.4. Измерение generator load
 
-### REQ-LOAD-13. Основной критерий версии 0.6 — active power
+### REQ-LOAD-13. Основной критерий — active power
 
 Для admission, overload и LOAD_SHEDDING используется `sensor.generator_power` в W.
 
-`Current`, `Voltage`, `Apparent Power`, `Reactive Power`, `Power Factor` и `Frequency` журналируются/отображаются как полезная телеметрия, но отдельные пороги по ним не вводятся в 0.6.
+`Current`, `Voltage`, `Apparent Power`, `Reactive Power`, `Power Factor` и `Frequency` журналируются/отображаются как полезная телеметрия, но отдельные пороги по ним этими требованиями не задаются.
 
 ### REQ-LOAD-14. Условия валидного измерения
 
@@ -1228,6 +1239,7 @@ Pre-transfer `LOAD_SHEDDING` не зависит от показаний generat
 
 - `house_powered_by_generator = ON`;
 - `GeneratorBusOwner` достоверно известен;
+- Nominal/Maximum Power текущего owner корректны согласно REQ-LOAD-05;
 - `binary_sensor.generator_meter_status = ON`;
 - `sensor.generator_power` содержит валидное свежее числовое значение;
 - после последнего изменения управляемой нагрузки выдержан `load_measurement_stabilization_time`.
@@ -1415,7 +1427,7 @@ Generator **не останавливается автоматически то�
 
 Если при продолжающемся `house_powered_by_generator = ON` аппаратный owner меняется A<->B, Load Manager немедленно перестаёт использовать старые nominal/maximum limits.
 
-До получения стабильных измерений с limits нового owner новая нагрузка не добавляется. После stabilization текущая нагрузка повторно оценивается по параметрам нового generator; при необходимости применяется обычный overload algorithm.
+До получения стабильных измерений с корректными limits нового owner новая нагрузка не добавляется. После stabilization текущая нагрузка повторно оценивается по параметрам нового generator; при необходимости применяется обычный overload algorithm.
 
 ### REQ-LOAD-36. UNKNOWN bus owner
 
@@ -1463,12 +1475,10 @@ restore retry state/deadline, если применимо
 
 После restart при уже работающем generator Load Manager сначала восстанавливает наблюдаемое состояние, bus owner и meter validity. До нового stabilization window он не добавляет consumer groups и не выполняет shedding по старому измерению.
 
-### 23.11. Конфигурация версии 0.6
-
-Первая реализация должна иметь как минимум следующие параметры:
+### 23.11. Начальная конфигурация
 
 ```text
-load_management_enabled = true
+load_management_enabled = false
 load_measurement_stabilization_time = 10 s
 load_restore_margin_percent = 15 %
 nominal_overload_time = 20 s
@@ -1476,29 +1486,20 @@ maximum_overload_confirmation_time = 4 s
 load_restore_retry_interval = 300 s
 ```
 
-### REQ-LOAD-42. Конфигурация не содержит паспортные мощности
+### REQ-LOAD-42. Разрешение Load Manager и источник паспортных мощностей
+
+`load_management_enabled` является общим разрешателем Load Manager. При `false` Load Manager не выдаёт команды G1/G2, не задерживает и не блокирует запуск generator, transfer или возврат Grid и не переводит себя в DEGRADED из-за отсутствующих meter/load/power inputs. Основная ATS-логика работает независимо.
+
+При `true` действуют требования этого раздела. Выключение Load Manager не должно само по себе стирать persisted ownership ранее выполненных `shed_by_energy_ats`; пока Load Manager выключен, он не использует это ownership для новых ON/OFF-команд.
 
 Nominal/Maximum Power не дублируются в EnergyATS options: они принадлежат Generator Controller metadata конкретного физического generator slot.
-
-### REQ-LOAD-43. Scope версии 0.6
-
-В Load Management 0.6 не входят:
-
-- UPS Battery SoC;
-- delayed/night generator start;
-- battery/generator cycling для длительной автономии;
-- прогноз TTG как критерий load admission;
-- temperature/season policy;
-- обучение/предсказание реальной мощности G1/G2;
-- автоматический shutdown generator только по измеренной перегрузке.
-
-Эти функции могут использовать Load Manager позднее, но не должны усложнять первую реализацию.
 
 ### 23.12. Минимальная наблюдаемая state machine
 
 Реализация может выбирать внутренние детали, но пользовательская/диагностическая логика должна однозначно различать как минимум состояния со следующим смыслом:
 
 ```text
+DISABLED
 IDLE
 WAITING_FOR_GENERATOR
 LOAD_SHEDDING
