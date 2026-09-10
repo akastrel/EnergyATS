@@ -588,6 +588,24 @@ exercise_run_minutes
 exercise_presence_grace_days
 ```
 
+Значения по умолчанию:
+
+```text
+Generator A:
+  exercise_interval_days = 30
+  exercise_start_time = 15:00
+  exercise_run_minutes = 10
+  exercise_presence_grace_days = 7
+
+Generator B:
+  exercise_interval_days = 45
+  exercise_start_time = 15:00
+  exercise_run_minutes = 10
+  exercise_presence_grace_days = 14
+```
+
+Автоматические scheduled exercise по умолчанию выключены (`exercise_enabled = false`) до явного включения пользователем.
+
 Время `exercise_start_time` интерпретируется в локальной timezone Home Assistant.
 
 Предупреждение перед forced exercise фиксировано: **60 минут** до планового запуска. Отдельный per-generator lead-time в первой версии не требуется.
@@ -990,4 +1008,4 @@ REQUIREMENTS_RU.md
 физические испытания
 ```
 
-Если меняется только политика автоматики, `PHYSICAL_POWER_TOPOLOGY_RU.md` не переписывается. Scheduled exercise относится именно к изменению policy: новых физических исполнительных устройств или силовых путей он не добавляет.
+Если меняется только политика автоматики, физическая схема не переписывается.
