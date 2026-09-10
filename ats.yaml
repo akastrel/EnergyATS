@@ -1,4 +1,4 @@
-# Home Assistant package для Energy ATS 0.4.x.
+# Home Assistant package для Energy ATS 0.6.x.
 #
 # A/B — стабильные аппаратные слоты. Человеко-читаемые имя, модель и PRIMARY
 # поступают из Generator Controller через Home Assistant.
@@ -7,7 +7,7 @@
 #   docs/PHYSICAL_POWER_TOPOLOGY_RU.md
 #   docs/REQUIREMENTS_RU.md
 #
-# Обязательные внешние entities:
+# Обязательные внешние entities core ATS:
 # binary_sensor.grid_input_ready
 # binary_sensor.house_powered_by_grid
 # binary_sensor.house_powered_by_generator
@@ -27,6 +27,16 @@
 # switch.generators_emergency_stop
 # switch.grid_power
 # switch.use_generator_as_power_source
+#
+# Soft dependencies Load Manager (нужны только при load_management_enabled=true):
+# sensor.generator_a_nominal_power
+# sensor.generator_a_maximum_power
+# sensor.generator_b_nominal_power
+# sensor.generator_b_maximum_power
+# binary_sensor.generator_meter_status
+# sensor.generator_power
+# switch.non_critical_loads_first_floor
+# switch.non_critical_loads_basement_floor
 #
 # Необязательная температура:
 # sensor.garage_temperature

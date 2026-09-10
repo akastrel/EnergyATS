@@ -26,6 +26,7 @@ from domain import (
 from energy_supervisor import (
     EnergySupervisor,
     SupervisorConfig,
+    SupervisorDecision,
     SupervisorObservation,
     SupervisorPhase,
 )
@@ -46,10 +47,15 @@ from generator_controller import (
 )
 from ha_adapter import HardwareSnapshot, HomeAssistantAdapter
 from ha_client import HomeAssistantClient, HomeAssistantConnectionError
+from load_manager import (
+    LoadManager,
+    LoadManagerConfig,
+    LoadManagerObservation,
+)
 from power_transfer import PowerTransferController, TransferAction, TransferPhase
 from state_store import StateStore
 
-APP_VERSION = "0.5.1"
+APP_VERSION = "0.6.0"
 STATE_SCHEMA_VERSION = 2
 
 DEFAULT_OPTIONS: dict[str, Any] = {
@@ -61,6 +67,12 @@ DEFAULT_OPTIONS: dict[str, Any] = {
     "generator_a_enabled": True,
     "generator_b_enabled": True,
     "transfer_confirmation_timeout": 60,
+    "load_management_enabled": False,
+    "load_measurement_stabilization_time": 10,
+    "load_restore_margin_percent": 15,
+    "nominal_overload_time": 20,
+    "maximum_overload_confirmation_time": 4,
+    "load_restore_retry_interval": 300,
     "family_presence_entity": "group.family",
     "generator_a_exercise_enabled": False,
     "generator_a_exercise_interval_days": 30,
@@ -103,6 +115,7 @@ class EnergySupervisorApp:
         self.log = logging.getLogger("energy_supervisor")
         self.client = HomeAssistantClient(token, logger=self.log)
         exercise_configs = self._exercise_configs()
+        load_manager_config = self._load_manager_config()
         self.adapter = HomeAssistantAdapter(
             self.client,
             armed=self.armed,
@@ -123,7 +136,13 @@ class EnergySupervisorApp:
             self.generator_bus,
             self.supervisor,
             self.exercise_scheduler,
-        ) = self._restore_state(saved, load_error, exercise_configs)
+            self.load_manager,
+        ) = self._restore_state(
+            saved,
+            load_error,
+            exercise_configs,
+            load_manager_config,
+        )
 
         self._pending_action_records: list[dict[str, str]] = []
         self._saved_state_signature: str | None = None
@@ -326,6 +345,32 @@ class EnergySupervisorApp:
             )
 
         actions_allowed = self.armed and decision.actions_allowed
+        load_decision = self.load_manager.step(
+            self._load_manager_observation(
+                now,
+                hardware,
+                decision,
+                actions_enabled=actions_allowed,
+            )
+        )
+        load_events = list(load_decision.events)
+        for message in load_decision.notifications:
+            await self.adapter.publish_user_notification(message)
+
+        # Load Manager commands are local soft-dependency actions. Its pending
+        # transaction is persisted in load_manager state, but never placed into
+        # the core pending_actions journal that would force system Recovery.
+        if load_decision.actions and actions_allowed:
+            self._save_state(force=True)
+            failures = await self.adapter.execute_load_actions(list(load_decision.actions))
+            for action, error in failures:
+                event, notification = self.load_manager.report_execution_failure(
+                    action, error
+                )
+                load_events.append(event)
+                await self.adapter.publish_user_notification(notification)
+            if failures:
+                self._save_state(force=True)
 
         generator_actions: list[GeneratorAction] = []
         shutdown_errors: list[str] = []
@@ -366,10 +411,19 @@ class EnergySupervisorApp:
         if shutdown_errors:
             self.supervisor.require_recovery("; ".join(shutdown_errors))
 
+        transfer_desired_source = decision.desired_source
+        if (
+            transfer_desired_source == PowerSource.GENERATOR
+            and not load_decision.transfer_permitted
+        ):
+            # Generator is ready, but available managed consumer groups have not
+            # yet confirmed pre-transfer OFF. TPC simply waits; no core fault.
+            transfer_desired_source = None
+
         transfer_actions = self.power_transfer.step(
             now,
             hardware.power_transfer,
-            decision.desired_source,
+            transfer_desired_source,
             desired_generator_ready=self._desired_generator_ready(
                 decision.desired_source, hardware
             ),
@@ -379,7 +433,7 @@ class EnergySupervisorApp:
         await self._finish_tick(
             now,
             hardware,
-            tuple((*decision.events, *exercise_events)),
+            tuple((*decision.events, *exercise_events, *load_events)),
         )
 
     def _apply_bus_model(self, hardware: HardwareSnapshot) -> HardwareSnapshot:
@@ -447,6 +501,8 @@ class EnergySupervisorApp:
             for value in (
                 metadata[slot].name,  # type: ignore[union-attr]
                 metadata[slot].model,  # type: ignore[union-attr]
+                metadata[slot].nominal_power,  # type: ignore[union-attr]
+                metadata[slot].maximum_power,  # type: ignore[union-attr]
             )
         ) + (hardware.primary_generator,)
         if signature == self._last_generator_config_signature:
@@ -473,13 +529,21 @@ class EnergySupervisorApp:
 
         for slot in GeneratorSlot:
             profile = self._profile(slot)
+            item = metadata[slot]
+            assert item is not None
             marker = "PRIMARY" if slot == hardware.primary_generator else "SECONDARY"
+            power_text = (
+                f"nominal={item.nominal_power:.0f} W, maximum={item.maximum_power:.0f} W"
+                if item.nominal_power is not None and item.maximum_power is not None
+                else "power metadata unavailable"
+            )
             self.log.info(
-                "Generator %s: %s; модель: %s; %s; choke: %s.",
+                "Generator %s: %s; модель: %s; %s; %s; choke: %s.",
                 slot.value,
                 profile.display_name,
                 profile.model,
                 marker,
+                power_text,
                 profile.choke_strategy.value,
             )
 
@@ -574,6 +638,52 @@ class EnergySupervisorApp:
             generator_names={
                 slot: self._profile(slot).display_name for slot in GeneratorSlot
             },
+        )
+
+    def _load_manager_observation(
+        self,
+        now: float,
+        hardware: HardwareSnapshot,
+        decision: SupervisorDecision,
+        *,
+        actions_enabled: bool,
+    ) -> LoadManagerObservation:
+        bus_owner = self.generator_bus.status().owner_slot
+        session_slot = self.supervisor.session.generator if self.supervisor.session else None
+        limit_slot = bus_owner if hardware.power_transfer.house_on_generator is True else session_slot
+        metadata = (
+            hardware.generator_metadata.get(limit_slot)
+            if limit_slot is not None
+            else None
+        )
+        managed_ready = False
+        if session_slot is not None:
+            managed_ready = self.generator_controllers[session_slot].status(
+                hardware.generators[session_slot]
+            ).ready_for_load
+
+        load = hardware.load_management
+        return LoadManagerObservation(
+            now=now,
+            house_on_generator=hardware.power_transfer.house_on_generator,
+            house_on_grid=hardware.power_transfer.house_on_grid,
+            desired_generator_supply=(
+                decision.desired_source == PowerSource.GENERATOR
+                and self.supervisor.session is not None
+            ),
+            managed_generator_ready=managed_ready,
+            power_transition_in_progress=self.power_transfer.status().transition_in_progress,
+            bus_owner=bus_owner,
+            nominal_power=metadata.nominal_power if metadata is not None else None,
+            maximum_power=metadata.maximum_power if metadata is not None else None,
+            meter_ready=load.meter_ready,
+            generator_power=load.generator_power,
+            power_sample_id=load.power_sample_id,
+            groups=load.groups,
+            generator_name=(
+                self._profile(limit_slot).display_name if limit_slot is not None else None
+            ),
+            actions_enabled=actions_enabled,
         )
 
     # Recovery --------------------------------------------------------
@@ -735,17 +845,34 @@ class EnergySupervisorApp:
         saved: dict[str, Any] | None,
         load_error: str | None,
         exercise_configs: dict[GeneratorSlot, ExerciseConfig],
-    ) -> tuple[GeneratorBusTracker, EnergySupervisor, ExerciseScheduler]:
+        load_manager_config: LoadManagerConfig,
+    ) -> tuple[
+        GeneratorBusTracker,
+        EnergySupervisor,
+        ExerciseScheduler,
+        LoadManager,
+    ]:
         config = self._supervisor_config(GeneratorSlot.A)
         fresh_scheduler = ExerciseScheduler(exercise_configs)
+        fresh_load_manager = LoadManager(load_manager_config)
         if load_error is not None:
             supervisor = EnergySupervisor(config)
             supervisor.require_recovery(
                 f"Не удалось прочитать сохранённое состояние: {load_error}"
             )
-            return GeneratorBusTracker(), supervisor, fresh_scheduler
+            return (
+                GeneratorBusTracker(),
+                supervisor,
+                fresh_scheduler,
+                fresh_load_manager,
+            )
         if saved is None:
-            return GeneratorBusTracker(), EnergySupervisor(config), fresh_scheduler
+            return (
+                GeneratorBusTracker(),
+                EnergySupervisor(config),
+                fresh_scheduler,
+                fresh_load_manager,
+            )
 
         try:
             bus_payload = saved.get("generator_bus")
@@ -770,13 +897,38 @@ class EnergySupervisorApp:
                 supervisor.require_recovery(
                     "После restart обнаружены команды без подтверждения исполнения."
                 )
-            return bus, supervisor, scheduler
         except Exception as exc:
             supervisor = EnergySupervisor(config)
             supervisor.require_recovery(
                 f"Не удалось восстановить persistent state: {exc}"
             )
-            return GeneratorBusTracker(), supervisor, fresh_scheduler
+            return (
+                GeneratorBusTracker(),
+                supervisor,
+                fresh_scheduler,
+                fresh_load_manager,
+            )
+
+        # Load Manager persistent state is deliberately isolated from core ATS.
+        # Corruption here must never make Supervisor/TPC/GC unrecoverable. Losing
+        # OFF ownership is conservative: EnergyATS then simply will not turn an
+        # already-OFF group back ON automatically.
+        manager = fresh_load_manager
+        manager_payload = saved.get("load_manager")
+        if manager_payload is not None:
+            try:
+                if not isinstance(manager_payload, dict):
+                    raise ValueError("load_manager должен быть object")
+                manager = LoadManager.from_dict(manager_payload, load_manager_config)
+            except Exception as exc:
+                self.log.warning(
+                    "Не удалось восстановить Load Manager state; используем безопасное "
+                    "пустое ownership: %s",
+                    exc,
+                )
+                manager = fresh_load_manager
+
+        return bus, supervisor, scheduler, manager
 
     def _save_state(self, *, force: bool = False) -> None:
         payload = {
@@ -785,6 +937,7 @@ class EnergySupervisorApp:
             "supervisor": self.supervisor.to_dict(),
             "generator_bus": self.generator_bus.to_dict(),
             "exercise_scheduler": self.exercise_scheduler.to_dict(),
+            "load_manager": self.load_manager.to_dict(),
             "pending_actions": list(self._pending_action_records),
         }
         signature = json.dumps(payload, ensure_ascii=False, sort_keys=True)
@@ -812,6 +965,20 @@ class EnergySupervisorApp:
             primary_generator=primary,
             generator_a_enabled=_boolean_option(self.options, "generator_a_enabled"),
             generator_b_enabled=_boolean_option(self.options, "generator_b_enabled"),
+        )
+
+    def _load_manager_config(self) -> LoadManagerConfig:
+        return LoadManagerConfig(
+            enabled=_boolean_option(self.options, "load_management_enabled"),
+            measurement_stabilization_time=float(
+                self.options["load_measurement_stabilization_time"]
+            ),
+            restore_margin_percent=float(self.options["load_restore_margin_percent"]),
+            nominal_overload_time=float(self.options["nominal_overload_time"]),
+            maximum_overload_confirmation_time=float(
+                self.options["maximum_overload_confirmation_time"]
+            ),
+            restore_retry_interval=float(self.options["load_restore_retry_interval"]),
         )
 
     def _exercise_configs(self) -> dict[GeneratorSlot, ExerciseConfig]:
@@ -911,6 +1078,7 @@ class EnergySupervisorApp:
         }
         local_now = datetime.fromtimestamp(now, self.local_time_zone)
         attributes.update(self.exercise_scheduler.status_attributes(local_now, now))
+        attributes.update(self.load_manager.status_attributes())
         exercise_slot = self.exercise_scheduler.owned_slot
         attributes["exercise_active_generator"] = (
             self._profile(exercise_slot).display_name if exercise_slot else None
@@ -1027,6 +1195,8 @@ class EnergySupervisorApp:
         transfer = self._format_transfer(observation)
         if transfer:
             parts.append(f"transfer={transfer}")
+        if self.load_manager.config.enabled:
+            parts.append(f"load_manager={self.load_manager.phase.value}")
         exercise_slot = self.exercise_scheduler.owned_slot
         if exercise_slot is not None and self.exercise_scheduler.active_attempt is not None:
             parts.append(

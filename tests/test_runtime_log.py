@@ -16,6 +16,7 @@ from generator_controller import (
     GeneratorStatus,
     default_generator_profiles,
 )
+from load_manager import LoadManager, LoadManagerConfig
 from main import EnergySupervisorApp
 from power_transfer import PowerTransferStatus, TransferPhase
 
@@ -87,6 +88,7 @@ def app_for_log() -> EnergySupervisorApp:
             GeneratorSlot.B: ExerciseConfig(False, 45, "15:00", 10, 14),
         }
     )
+    app.load_manager = LoadManager(LoadManagerConfig(enabled=False))
     app.armed = True
     app._last_runtime_signature = None
     app.log = logging.getLogger("test_runtime_log")

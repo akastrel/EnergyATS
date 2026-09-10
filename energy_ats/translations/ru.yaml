@@ -36,6 +36,27 @@ configuration:
       managed-сессии. Это policy-флаг Energy ATS; имя, модель и primary
       читаются из Home Assistant.
 
+  load_management_enabled:
+    name: "Включить Load Manager"
+    description: >-
+      Управлять некритичными группами G1/G2 при питании от генератора.
+      При выключении Load Manager не влияет на запуск, transfer и возврат Grid.
+  load_measurement_stabilization_time:
+    name: "Load Manager: стабилизация измерения, с"
+    description: "Сколько ждать после изменения нагрузки до оценки новой устойчивой мощности генератора."
+  load_restore_margin_percent:
+    name: "Load Manager: запас до номинала, %"
+    description: "Какой запас относительно номинальной мощности должен оставаться перед включением следующей некритичной группы."
+  nominal_overload_time:
+    name: "Load Manager: превышение номинала, с"
+    description: "Сколько должна непрерывно сохраняться нагрузка выше Nominal Power до LOAD_SHEDDING."
+  maximum_overload_confirmation_time:
+    name: "Load Manager: подтверждение Maximum, с"
+    description: "Короткое подтверждение нагрузки выше Maximum Power перед ускоренным LOAD_SHEDDING."
+  load_restore_retry_interval:
+    name: "Load Manager: повтор восстановления, с"
+    description: "Минимальный интервал до повторной попытки включить группу, снятую из-за перегрузки или не прошедшую admission."
+
   family_presence_entity:
     name: "HA entity присутствия семьи"
     description: >-

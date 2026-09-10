@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.6.0
+
+Добавлен отдельный Load Manager для управления некритичными нагрузками при питании дома от общей генераторной шины.
+
+- Добавлены группы `G1 = switch.non_critical_loads_first_floor` и `G2 = switch.non_critical_loads_basement_floor`; восстановление выполняется `G1 -> G2`, overload `LOAD_SHEDDING` — `G2 -> G1`.
+- Перед managed transfer Load Manager после прогрева генератора поочерёдно отключает доступные некритичные группы и только затем разрешает TPC подключить дом к generator bus.
+- После transfer нагрузки возвращаются по одной с отдельным stabilization window и проверкой запаса относительно Nominal Power.
+- Load Manager непрерывно контролирует generator power во всё время питания дома от generator bus; sustained nominal overload и подтверждённое превышение Maximum Power вызывают поэтапный `LOAD_SHEDDING`.
+- Generator meter, G1/G2 и паспортные power metadata являются soft dependencies: их отказ переводит только Load Manager в `DEGRADED` и не создаёт `RECOVERY_REQUIRED` основной ATS-логики.
+- Добавлены per-generator numeric metadata `Nominal Power` / `Maximum Power`; фактические limits выбираются по текущему `GeneratorBusOwner`.
+- Добавлен hysteresis/retry для повторного admission, persistence собственного `shed_by_energy_ats` ownership и восстановление только собственных отключений после подтверждённого возврата Grid.
+- `sensor.energy_ats_status` дополнен фазой Load Manager, measured power, active limits, состоянием/ownership G1/G2, overload timers и retry state.
+- Добавлены конфигурационные параметры Load Manager; функция по умолчанию выключена (`load_management_enabled = false`).
+- Добавлены unit и app-level integration tests Load Manager, включая pre-transfer shedding, soft-dependency failures, continuous overload и Grid restore.
+- Версия App и add-on поднята до `0.6.0`.
+
+---
+
 ## 0.5.1
 
 Исправления по результатам первого физического прогона `USER_TESTS_RU.md`.

@@ -26,6 +26,25 @@ configuration:
     name: "Enable generator B"
     description: "Allow the Energy Supervisor to use physical slot B for a new managed session. This is Energy ATS policy; name, model and primary are read from Home Assistant."
 
+  load_management_enabled:
+    name: "Enable Load Manager"
+    description: "Manage the configured non-critical G1/G2 loads while the house is supplied by the generator bus. Disabled Load Manager does not affect generator start, transfer or Grid return."
+  load_measurement_stabilization_time:
+    name: "Load Manager measurement stabilization, s"
+    description: "Wait after a managed load change before evaluating the new stable generator power."
+  load_restore_margin_percent:
+    name: "Load Manager nominal reserve, %"
+    description: "Required reserve below Nominal Power before another non-critical group may be admitted."
+  nominal_overload_time:
+    name: "Load Manager nominal overload, s"
+    description: "How long power may remain above Nominal Power before LOAD_SHEDDING begins."
+  maximum_overload_confirmation_time:
+    name: "Load Manager maximum confirmation, s"
+    description: "Short confirmation time above Maximum Power before accelerated LOAD_SHEDDING."
+  load_restore_retry_interval:
+    name: "Load Manager restore retry, s"
+    description: "Minimum delay before retrying a group shed by overload or rejected during admission."
+
   family_presence_entity:
     name: "Family presence HA entity"
     description: "Home Assistant entity used by the exercise scheduler to determine family presence. home/not_home and on/off are supported."

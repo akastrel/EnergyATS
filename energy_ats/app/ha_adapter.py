@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Hashable
 
 from domain import GeneratorSlot, SupervisorEvent
 from generator_controller import (
@@ -17,6 +17,7 @@ from generator_controller import (
     GeneratorObservation,
 )
 from ha_client import HomeAssistantClient
+from load_manager import LoadAction, LoadActionKind, LoadGroup
 from power_transfer import (
     PowerTransferObservation,
     TransferAction,
@@ -42,11 +43,25 @@ ENTITIES = {
     "generator_b_name": "sensor.generator_b_name",
     "generator_a_model": "sensor.generator_a_model",
     "generator_b_model": "sensor.generator_b_model",
+    "generator_a_nominal_power": "sensor.generator_a_nominal_power",
+    "generator_a_maximum_power": "sensor.generator_a_maximum_power",
+    "generator_b_nominal_power": "sensor.generator_b_nominal_power",
+    "generator_b_maximum_power": "sensor.generator_b_maximum_power",
     "primary_generator": "select.primary_generator",
     "emergency_stop": "switch.generators_emergency_stop",
     "ambient_temperature_external": "sensor.garage_temperature",
     "grid_power": "switch.grid_power",
     "source_generator": "switch.use_generator_as_power_source",
+    "generator_meter_status": "binary_sensor.generator_meter_status",
+    "generator_power": "sensor.generator_power",
+    "generator_current": "sensor.generator_current",
+    "generator_voltage": "sensor.generator_voltage",
+    "generator_apparent_power": "sensor.generator_apparent_power",
+    "generator_reactive_power": "sensor.generator_reactive_power",
+    "generator_power_factor": "sensor.generator_power_factor",
+    "generator_frequency": "sensor.generator_frequency",
+    "load_g1": "switch.non_critical_loads_first_floor",
+    "load_g2": "switch.non_critical_loads_basement_floor",
 }
 
 ENERGY_ATS_LOG_ENTITY = "update.energy_ats_update"
@@ -57,6 +72,22 @@ ENERGY_ATS_STATUS_ENTITY = "sensor.energy_ats_status"
 class GeneratorMetadata:
     name: str
     model: str
+    nominal_power: float | None = None
+    maximum_power: float | None = None
+
+
+@dataclass(frozen=True)
+class LoadManagementSnapshot:
+    meter_ready: bool | None
+    generator_power: float | None
+    power_sample_id: Hashable | None
+    generator_current: float | None
+    generator_voltage: float | None
+    generator_apparent_power: float | None
+    generator_reactive_power: float | None
+    generator_power_factor: float | None
+    generator_frequency: float | None
+    groups: dict[LoadGroup, bool | None]
 
 
 @dataclass(frozen=True)
@@ -70,6 +101,7 @@ class HardwareSnapshot:
     generator_metadata: dict[GeneratorSlot, GeneratorMetadata | None]
     primary_generator: GeneratorSlot | None
     power_transfer: PowerTransferObservation
+    load_management: LoadManagementSnapshot
 
 
 class UnsafeHardwareCommand(RuntimeError):
@@ -120,9 +152,22 @@ class HomeAssistantAdapter:
             GeneratorSlot.A: self.text_state(ENTITIES["generator_a_model"]),
             GeneratorSlot.B: self.text_state(ENTITIES["generator_b_model"]),
         }
+        nominal_powers = {
+            GeneratorSlot.A: self.float_state(ENTITIES["generator_a_nominal_power"]),
+            GeneratorSlot.B: self.float_state(ENTITIES["generator_b_nominal_power"]),
+        }
+        maximum_powers = {
+            GeneratorSlot.A: self.float_state(ENTITIES["generator_a_maximum_power"]),
+            GeneratorSlot.B: self.float_state(ENTITIES["generator_b_maximum_power"]),
+        }
         metadata = {
             slot: (
-                GeneratorMetadata(name=names[slot], model=models[slot])
+                GeneratorMetadata(
+                    name=names[slot],
+                    model=models[slot],
+                    nominal_power=nominal_powers[slot],
+                    maximum_power=maximum_powers[slot],
+                )
                 if names[slot] is not None and models[slot] is not None
                 else None
             )
@@ -171,6 +216,26 @@ class HomeAssistantAdapter:
             ),
         }
 
+        load_management = LoadManagementSnapshot(
+            meter_ready=self.bool_state(ENTITIES["generator_meter_status"]),
+            generator_power=self.float_state(ENTITIES["generator_power"]),
+            power_sample_id=self.state_revision(ENTITIES["generator_power"]),
+            generator_current=self.float_state(ENTITIES["generator_current"]),
+            generator_voltage=self.float_state(ENTITIES["generator_voltage"]),
+            generator_apparent_power=self.float_state(
+                ENTITIES["generator_apparent_power"]
+            ),
+            generator_reactive_power=self.float_state(
+                ENTITIES["generator_reactive_power"]
+            ),
+            generator_power_factor=self.float_state(ENTITIES["generator_power_factor"]),
+            generator_frequency=self.float_state(ENTITIES["generator_frequency"]),
+            groups={
+                LoadGroup.G1: self.bool_state(ENTITIES["load_g1"]),
+                LoadGroup.G2: self.bool_state(ENTITIES["load_g2"]),
+            },
+        )
+
         return HardwareSnapshot(
             grid_ready=grid_ready,
             automatic_transfer_enabled=(
@@ -194,6 +259,7 @@ class HomeAssistantAdapter:
                 generator_selected=self.bool_state(ENTITIES["source_generator"]),
                 emergency_stop=emergency_stop,
             ),
+            load_management=load_management,
         )
 
     def missing_required_entities(
@@ -201,6 +267,8 @@ class HomeAssistantAdapter:
         *,
         include_control_entities: bool = True,
     ) -> list[str]:
+        # Load Manager entities and Nominal/Maximum metadata намеренно не входят
+        # сюда: это soft dependencies и они не могут блокировать старт core ATS.
         state_required = [
             ENTITIES["automatic_transfer"],
             ENTITIES["grid_ready"],
@@ -276,6 +344,51 @@ class HomeAssistantAdapter:
             log_entries.append((action.message, entity_id))
 
         await self._publish_log_entries(log_entries)
+
+    async def execute_load_actions(
+        self,
+        actions: list[LoadAction],
+    ) -> list[tuple[LoadAction, str]]:
+        """Выполнить G1/G2-команды как soft dependency.
+
+        Ошибка consumer switch не должна ронять рабочий цикл и превращаться в
+        системный Recovery. Поэтому failures возвращаются Load Manager-у как
+        локальные ошибки вместо исключения наружу.
+        """
+
+        failures: list[tuple[LoadAction, str]] = []
+        log_entries: list[tuple[str, str]] = []
+        for action in actions:
+            if not self.armed:
+                self.log.info("DISARMED: подавлена команда Load Manager %s", action)
+                continue
+            entity_id = (
+                ENTITIES["load_g1"]
+                if action.group == LoadGroup.G1
+                else ENTITIES["load_g2"]
+            )
+            service = (
+                "turn_on" if action.kind == LoadActionKind.TURN_ON else "turn_off"
+            )
+            try:
+                await self.client.call_service(
+                    "switch",
+                    service,
+                    service_data={"entity_id": entity_id},
+                )
+            except Exception as exc:
+                self.log.warning(
+                    "Load Manager не выполнил %s для %s: %s",
+                    service,
+                    entity_id,
+                    exc,
+                )
+                failures.append((action, str(exc)))
+                continue
+            log_entries.append((action.message, entity_id))
+
+        await self._publish_log_entries(log_entries)
+        return failures
 
     async def publish_events(self, events: tuple[SupervisorEvent, ...]) -> None:
         for event in events:
@@ -362,6 +475,20 @@ class HomeAssistantAdapter:
         if state in (None, "unknown", "unavailable"):
             return None
         return str(state)
+
+    def state_revision(self, entity_id: str) -> Hashable | None:
+        """Вернуть признак нового HA sample без привязки domain к HA internals."""
+
+        getter = getattr(self.client, "get_state_revision", None)
+        if callable(getter):
+            revision = getter(entity_id)
+            if revision is not None:
+                return revision
+
+        # Простые test/fake clients не имеют revision counter. Изменение самого
+        # state всё же считается новым sample; одинаковое повторное чтение — нет.
+        state = self.client.get_state(entity_id)
+        return state if state not in (None, "unknown", "unavailable") else None
 
     @staticmethod
     def _generator_service(
