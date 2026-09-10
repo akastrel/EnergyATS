@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.5.0
+
+Плановый автоматический пробный запуск генераторов после длительного простоя без изменения физической силовой топологии.
+
+### Exercise Scheduler
+
+- Добавлен отдельный `ExerciseScheduler`: maintenance-policy не смешивается с TPC и не дублирует Generator Controller.
+- Generator A и B имеют независимые interval/start-time/run-duration/presence-grace настройки.
+- Defaults после включения:
+  - A: 30 дней, 15:00, 10 минут, grace 7 дней;
+  - B: 45 дней, 15:00, 10 минут, grace 14 дней.
+- Scheduled exercise по умолчанию выключен для обоих генераторов.
+- Новый slot получает initial reference при первом наблюдении; первый exercise не запускается сразу после обновления.
+- Любой достоверный непрерывный run достаточной длительности может стать qualifying run и перенести следующий due.
+- Пропущенное дневное окно не создаёт произвольный catch-up запуск.
+
+### Presence / forced exercise
+
+- Presence читается из конфигурируемого `family_presence_entity` (default `group.family`).
+- До forced-date обычный exercise запускается только при подтверждённом отсутствии семьи; `unknown/unavailable` приводит к `DEFERRED`.
+- Presence является мягким Scheduler-input и не блокирует запуск/работу основной ATS-логики.
+- После configured grace presence перестаёт блокировать test, но все остальные safety-preconditions сохраняются.
+- Forced exercise требует реально доставленного предупреждения не менее чем за 60 минут; пропущенное warning-window не создаёт неожиданного forced catch-up.
+
+### Lifecycle / ownership
+
+- Exercise запускает и останавливает двигатель только через существующий GC; DKG116 по-прежнему отвечает за crank retries.
+- Дом при штатном exercise остаётся на Grid; TPC не переключает нагрузку на generator bus.
+- Maintenance-test не имеет fallback на второй генератор.
+- Scheduler-owned RUNNING классифицируется существующим run-context `TEST_RUN` без зависимости от внешнего `input_boolean.generator_test_mode`.
+- Результаты: `SUCCESS`, `FAILED`, `DEFERRED`, `INTERRUPTED_BY_OUTAGE`.
+- Автоматически запущенный двигатель сохраняет явного policy-owner до подтверждённой остановки либо явного handoff.
+- При реальной потере Grid уже работающий подходящий exercise-generator может быть принят обычной outage-сессией без `REMOTE OFF -> cold start PRIMARY`.
+- Если handoff не состоялся, Scheduler сохраняет обязанность штатно остановить собственный generator.
+- Restart сохраняет active attempt, исходный run timer и stop ownership; повторный REMOTE START не выдаётся.
+- GC после restart scheduler-owned unloaded generator консервативно восстанавливает рабочее положение choke, не угадывая потерянную transient phase.
+
+### Persistence / UI / notifications
+
+- Top-level journal остаётся schema 2 и дополняется `exercise_scheduler`; старый 0.4 journal без scheduler-state безопасно получает новый Scheduler state.
+- В journal сохраняются scheduler references, due/grace/warning state, active attempt и ограниченная history результатов.
+- `sensor.energy_ats_status` дополнен per-generator exercise attributes и active exercise timer.
+- FAILED создаёт critical event/notification с фактическим именем generator; SUCCESS достаточно журналируется.
+- Время расписания интерпретируется в timezone Home Assistant.
+
+### Tests
+
+- Добавлены чистые unit/scenario tests Scheduler-а, Supervisor handoff, TEST_RUN/bus classification, presence/notification/timezone и end-to-end execution через fake Home Assistant.
+- Проверены due/grace/forced warning, missed windows, safety blockers, independent A/B schedules, no-fallback, qualifying history, restart ownership, outage handoff и штатная остановка без переключения дома с Grid.
+
+---
+
 ## 0.4.0
 
 Полная переработка EnergyATS вокруг фактической физической топологии.
