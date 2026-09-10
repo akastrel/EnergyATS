@@ -103,13 +103,11 @@ class EnergySupervisorApp:
         self.log = logging.getLogger("energy_supervisor")
         self.client = HomeAssistantClient(token, logger=self.log)
         exercise_configs = self._exercise_configs()
-        require_presence = any(config.enabled for config in exercise_configs.values())
         self.adapter = HomeAssistantAdapter(
             self.client,
             armed=self.armed,
             logger=self.log,
             family_presence_entity=str(self.options["family_presence_entity"]),
-            require_family_presence=require_presence,
         )
         self.generator_controllers = {
             slot: GeneratorController(profile)
@@ -255,11 +253,13 @@ class EnergySupervisorApp:
 
         for warning in exercise_decision.warnings:
             if await self.adapter.publish_user_notification(warning.message):
+                sent_at = datetime.fromtimestamp(now, self.local_time_zone)
                 exercise_events.append(
                     self.exercise_scheduler.confirm_warning(
                         warning.slot,
                         warning.window_date,
                         self._profile(warning.slot).display_name,
+                        sent_at,
                     )
                 )
                 # Delivery is a safety prerequisite for a future forced start.
@@ -311,11 +311,25 @@ class EnergySupervisorApp:
                 )
             )
 
+        # Если общая policy уже требует Recovery, Scheduler не имеет права
+        # потерять автоматически запущенный двигатель. Он переводит собственный
+        # attempt в FAILED/STOPPING и сохраняет обязанность безопасной остановки.
+        if (
+            self.supervisor.phase == SupervisorPhase.RECOVERY_REQUIRED
+            and self.exercise_scheduler.owned_slot is not None
+        ):
+            exercise_events.extend(
+                self.exercise_scheduler.fail_active(
+                    exercise_observation,
+                    "EnergyATS перешёл в RECOVERY_REQUIRED во время пробного запуска.",
+                )
+            )
+
         actions_allowed = self.armed and decision.actions_allowed
 
         generator_actions: list[GeneratorAction] = []
         shutdown_errors: list[str] = []
-        exercise_shutdown_slot = exercise_decision.authorized_shutdown_slot
+        exercise_shutdown_slot = self.exercise_scheduler.authorized_shutdown_slot
         for slot, controller in self.generator_controllers.items():
             if slot in decision.stop_outage_generators and actions_allowed:
                 actions, error = controller.step_authorized_shutdown(
