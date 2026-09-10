@@ -139,6 +139,17 @@ class HomeAssistantAdapter:
             primary_matches[0] if len(primary_matches) == 1 else None
         )
 
+        # generator_test_mode — только положительный маркер внешнего TEST_RUN.
+        # Если helper вообще не установлен, это эквивалентно OFF: запуск не был
+        # явно помечен тестовым. Но если существующий helper временно
+        # unknown/unavailable, сохраняем None и не угадываем его состояние.
+        test_mode_entity = ENTITIES["test_mode"]
+        test_mode = (
+            self.bool_state(test_mode_entity)
+            if self.client.has_entity(test_mode_entity)
+            else False
+        )
+
         # По RUNNING нельзя определять владельца общей генераторной шины, когда
         # работают оба двигателя. До GeneratorBusTracker здесь известен только
         # факт, что при снятой генераторной ветви нагрузки точно нет.
@@ -165,7 +176,7 @@ class HomeAssistantAdapter:
             automatic_transfer_enabled=(
                 self.bool_state(ENTITIES["automatic_transfer"]) is True
             ),
-            test_mode=self.bool_state(ENTITIES["test_mode"]),
+            test_mode=test_mode,
             emergency_stop=emergency_stop,
             family_present=(
                 self.presence_state(self.family_presence_entity)
