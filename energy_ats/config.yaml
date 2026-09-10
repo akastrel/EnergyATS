@@ -21,7 +21,7 @@ options:
   tick_seconds: 1.0
   log_level: "info"
 
-  grid_failure_delay: 5
+  grid_failure_delay: 60
   grid_restore_stable_time: 60
   transfer_confirmation_timeout: 60
 
