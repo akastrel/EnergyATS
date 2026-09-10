@@ -46,25 +46,19 @@ def test_presence_entity_supports_group_and_binary_sensor_states(state, expected
     assert adapter.presence_state("group.family") is expected
 
 
-def test_presence_entity_is_required_only_when_exercise_is_enabled():
+def test_presence_entity_never_blocks_core_ats_readiness():
     fake = FakeClient()
-    required = HomeAssistantAdapter(
+    adapter = HomeAssistantAdapter(
         fake,
         armed=True,
         family_presence_entity="group.family",
         require_family_presence=True,
     )
-    optional = HomeAssistantAdapter(
-        fake,
-        armed=True,
-        family_presence_entity="group.family",
-        require_family_presence=False,
-    )
 
-    assert "group.family" in required.missing_required_entities(
-        include_control_entities=False
-    )
-    assert "group.family" not in optional.missing_required_entities(
+    # Presence is a soft scheduler input. If it is unavailable, ordinary
+    # exercise is deferred by ExerciseScheduler, but the ATS itself must still
+    # be allowed to start and handle a real Grid outage.
+    assert "group.family" not in adapter.missing_required_entities(
         include_control_entities=False
     )
 
