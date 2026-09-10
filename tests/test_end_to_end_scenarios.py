@@ -764,3 +764,84 @@ async def test_22_1_23_pending_transaction_restart_can_recover_on_confirmed_safe
     assert restored.supervisor.phase == SupervisorPhase.NORMAL
     assert restored.supervisor.recovery_reset_in_progress is False
     assert ("turn_off", ENTITIES["grid_power"]) not in switch_calls(fake)
+
+
+@pytest.mark.asyncio
+async def test_user_m9_external_takeover_then_manual_stop_requires_recovery(tmp_path):
+    """После отказа managed PRIMARY внешний SECONDARY может принять шину, но остаётся внешним. Если пользователь затем останавливает и его, EnergyATS не имеет права сам запускать SECONDARY заново: требуется recovery."""
+
+    app, fake = make_app(
+        tmp_path,
+        grid_failure_delay=0,
+        grid_restore_stable_time=60,
+    )
+    accelerate_generators(app)
+    now = await drive_primary_a_to_house(app, fake)
+
+    fake.states[ENTITIES["generator_b_remote"]] = "on"
+    fake.states[ENTITIES["generator_b_running"]] = "on"
+    await app._tick(now)
+    now += 1.0
+
+    fake.states[ENTITIES["generator_a_running"]] = "off"
+    await app._tick(now)
+    now += 1.0
+    assert app.generator_bus.status().owner_slot == GeneratorSlot.B
+    assert app.supervisor.session is not None
+    assert app.supervisor.session.generator == GeneratorSlot.A
+    assert app.supervisor.session.external_takeover_observed is True
+
+    fake.states[ENTITIES["generator_b_running"]] = "off"
+    fake.states[ENTITIES["generator_b_remote"]] = "off"
+    fake.calls.clear()
+    await app._tick(now)
+
+    assert app.supervisor.phase == SupervisorPhase.RECOVERY_REQUIRED
+    assert ("turn_on", ENTITIES["generator_b_remote"]) not in switch_calls(fake)
+
+
+@pytest.mark.asyncio
+async def test_user_m10_missing_test_mode_helper_still_cleans_up_external_outage_run(tmp_path):
+    """Если optional helper `generator_test_mode` вообще не установлен, новый внешний запуск во время outage не считается неопределённым TEST_RUN. Он классифицируется как outage-related и после возврата Grid должен быть штатно остановлен."""
+
+    app, fake = make_app(
+        tmp_path,
+        grid_failure_delay=0,
+        grid_restore_stable_time=0,
+    )
+    accelerate_generators(app)
+    now = await drive_primary_a_to_house(app, fake)
+
+    del fake.states[ENTITIES["test_mode"]]
+    fake.states[ENTITIES["generator_b_remote"]] = "on"
+    fake.states[ENTITIES["generator_b_running"]] = "on"
+    await app._tick(now)
+    now += 1.0
+
+    assert (
+        app.generator_bus.status().run_contexts[GeneratorSlot.B]
+        == GeneratorRunContext.OUTAGE_RELATED
+    )
+
+    fake.calls.clear()
+    fake.states[ENTITIES["grid_ready"]] = "on"
+    for _ in range(30):
+        await app._tick(now)
+        for remote_key, running_key in (
+            ("generator_a_remote", "generator_a_running"),
+            ("generator_b_remote", "generator_b_running"),
+        ):
+            if fake.states[ENTITIES[remote_key]] == "off":
+                fake.states[ENTITIES[running_key]] = "off"
+        if (
+            app.supervisor.session is None
+            and fake.states[ENTITIES["house_grid"]] == "on"
+            and fake.states[ENTITIES["generator_a_running"]] == "off"
+            and fake.states[ENTITIES["generator_b_running"]] == "off"
+        ):
+            break
+        now += 1.0
+    else:
+        raise AssertionError("M10: оба outage-related генератора не были остановлены")
+
+    assert ("turn_off", ENTITIES["generator_b_remote"]) in switch_calls(fake)
