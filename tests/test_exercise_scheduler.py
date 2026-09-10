@@ -157,13 +157,13 @@ def test_presence_deferred_exercise_runs_in_next_daily_window_when_family_leaves
     assert decision.owned_slot == GeneratorSlot.A
 
 
-def test_forced_exercise_requires_successful_warning_from_previous_hour():
+def test_forced_exercise_requires_successful_warning_at_least_60_minutes_before():
     scheduler = ExerciseScheduler(configs(b=False))
     scheduler.step(
         observation(datetime(2026, 1, 1, 14, 0, tzinfo=timezone.utc))
     )
 
-    warning_time = datetime(2026, 2, 7, 14, 0, tzinfo=timezone.utc)
+    warning_time = datetime(2026, 2, 7, 13, 59, tzinfo=timezone.utc)
     warning_decision = scheduler.step(observation(warning_time, present=True))
     assert len(warning_decision.warnings) == 1
 
@@ -171,10 +171,30 @@ def test_forced_exercise_requires_successful_warning_from_previous_hour():
         GeneratorSlot.A,
         warning_decision.warnings[0].window_date,
         "Elemax",
+        warning_time,
     )
-    start = warning_time + timedelta(hours=1)
+    start = datetime(2026, 2, 7, 15, 0, tzinfo=timezone.utc)
     decision = scheduler.step(observation(start, present=True))
     assert decision.owned_slot == GeneratorSlot.A
+
+
+def test_forced_exercise_rejects_warning_sent_less_than_60_minutes_before():
+    scheduler = ExerciseScheduler(configs(b=False))
+    scheduler.step(
+        observation(datetime(2026, 1, 1, 14, 0, tzinfo=timezone.utc))
+    )
+    sent_too_late = datetime(2026, 2, 7, 14, 0, 1, tzinfo=timezone.utc)
+    scheduler.confirm_warning(
+        GeneratorSlot.A,
+        "2026-02-07",
+        "Elemax",
+        sent_too_late,
+    )
+
+    start = datetime(2026, 2, 7, 15, 0, tzinfo=timezone.utc)
+    decision = scheduler.step(observation(start, present=True))
+    assert decision.owned_slot is None
+    assert "менее чем за 60 минут" in scheduler.history[-1]["failure_reason"]
 
 
 def test_forced_exercise_ignores_unknown_presence_after_confirmed_warning():
@@ -182,12 +202,17 @@ def test_forced_exercise_ignores_unknown_presence_after_confirmed_warning():
     scheduler.step(
         observation(datetime(2026, 1, 1, 14, 0, tzinfo=timezone.utc))
     )
-    warning_time = datetime(2026, 2, 7, 14, 0, tzinfo=timezone.utc)
+    warning_time = datetime(2026, 2, 7, 13, 59, tzinfo=timezone.utc)
     warning = scheduler.step(observation(warning_time, present=None)).warnings[0]
-    scheduler.confirm_warning(GeneratorSlot.A, warning.window_date, "Elemax")
+    scheduler.confirm_warning(
+        GeneratorSlot.A,
+        warning.window_date,
+        "Elemax",
+        warning_time,
+    )
 
     decision = scheduler.step(
-        observation(warning_time + timedelta(hours=1), present=None)
+        observation(datetime(2026, 2, 7, 15, 0, tzinfo=timezone.utc), present=None)
     )
     assert decision.owned_slot == GeneratorSlot.A
 
@@ -208,13 +233,18 @@ def test_forced_exercise_never_bypasses_safety_prerequisites(overrides):
     scheduler.step(
         observation(datetime(2026, 1, 1, 14, 0, tzinfo=timezone.utc))
     )
-    warning_time = datetime(2026, 2, 7, 14, 0, tzinfo=timezone.utc)
+    warning_time = datetime(2026, 2, 7, 13, 59, tzinfo=timezone.utc)
     warning = scheduler.step(observation(warning_time, present=True)).warnings[0]
-    scheduler.confirm_warning(GeneratorSlot.A, warning.window_date, "Elemax")
+    scheduler.confirm_warning(
+        GeneratorSlot.A,
+        warning.window_date,
+        "Elemax",
+        warning_time,
+    )
 
     decision = scheduler.step(
         observation(
-            warning_time + timedelta(hours=1),
+            datetime(2026, 2, 7, 15, 0, tzinfo=timezone.utc),
             present=True,
             **overrides,
         )
@@ -322,6 +352,30 @@ def test_exercise_failure_does_not_request_second_generator():
     assert decision.authorized_shutdown_slot == GeneratorSlot.A
     assert all("Вепрь" not in event.message for event in decision.events)
     assert any(event.level == "critical" for event in decision.events)
+
+
+def test_recovery_failure_keeps_scheduler_ownership_until_safe_stop():
+    scheduler = ExerciseScheduler(configs(b=False))
+    scheduler.step(
+        observation(datetime(2026, 1, 1, 14, 0, tzinfo=timezone.utc))
+    )
+    start_window = datetime(2026, 1, 31, 15, 0, tzinfo=timezone.utc)
+    scheduler.step(observation(start_window))
+    running = start_window + timedelta(seconds=5)
+    current = observation(running, a_running=True, a_remote=True)
+    scheduler.step(current)
+
+    events = scheduler.fail_active(current, "system recovery")
+
+    assert any(event.level == "critical" for event in events)
+    assert scheduler.owned_slot == GeneratorSlot.A
+    assert scheduler.authorized_shutdown_slot == GeneratorSlot.A
+    assert scheduler.active_attempt.result == ExerciseResult.FAILED
+
+    stopped = running + timedelta(seconds=30)
+    scheduler.step(observation(stopped, a_running=False, a_remote=False))
+    assert scheduler.active_attempt is None
+    assert scheduler.states[GeneratorSlot.A].last_result == ExerciseResult.FAILED.value
 
 
 def test_failed_attempt_does_not_clear_overdue_state():
