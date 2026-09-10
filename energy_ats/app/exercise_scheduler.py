@@ -11,7 +11,10 @@ from domain import GeneratorSlot, SupervisorEvent
 
 SLOTS = (GeneratorSlot.A, GeneratorSlot.B)
 _HISTORY_LIMIT = 50
-_WARNING_LEAD = timedelta(minutes=60)
+_WARNING_MIN_LEAD = timedelta(minutes=60)
+# Scheduler опрашивается по tick, поэтому warning запрашиваем на минуту раньше:
+# даже последний tick этой минуты всё ещё гарантирует не менее 60 минут lead time.
+_WARNING_DISPATCH_LEAD = timedelta(minutes=61)
 
 
 class ExerciseAttemptPhase(str, Enum):
@@ -103,6 +106,7 @@ class ExerciseSlotState:
     last_qualifying_run: str | None = None
     last_window_date: str | None = None
     warning_sent_for_date: str | None = None
+    warning_sent_at: str | None = None
     last_result: str | None = None
     last_failure_reason: str | None = None
 
@@ -112,6 +116,7 @@ class ExerciseSlotState:
             "last_qualifying_run": self.last_qualifying_run,
             "last_window_date": self.last_window_date,
             "warning_sent_for_date": self.warning_sent_for_date,
+            "warning_sent_at": self.warning_sent_at,
             "last_result": self.last_result,
             "last_failure_reason": self.last_failure_reason,
         }
@@ -126,6 +131,7 @@ class ExerciseSlotState:
             last_qualifying_run=_optional_str(data.get("last_qualifying_run")),
             last_window_date=_optional_str(data.get("last_window_date")),
             warning_sent_for_date=_optional_str(data.get("warning_sent_for_date")),
+            warning_sent_at=_optional_str(data.get("warning_sent_at")),
             last_result=_optional_str(result),
             last_failure_reason=_optional_str(data.get("last_failure_reason")),
         )
@@ -142,7 +148,7 @@ class ExerciseAttempt:
     run_until: float | None = None
     result: ExerciseResult | None = None
     failure_reason: str | None = None
-    failure_notified: bool = False
+    failure_event_emitted: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -155,7 +161,7 @@ class ExerciseAttempt:
             "run_until": self.run_until,
             "result": self.result.value if self.result else None,
             "failure_reason": self.failure_reason,
-            "failure_notified": self.failure_notified,
+            "failure_event_emitted": self.failure_event_emitted,
         }
 
     @classmethod
@@ -174,9 +180,12 @@ class ExerciseAttempt:
                 else None
             ),
             failure_reason=_optional_str(data.get("failure_reason")),
-            failure_notified=_strict_bool(
-                data.get("failure_notified", False),
-                "exercise.attempt.failure_notified",
+            failure_event_emitted=_strict_bool(
+                data.get(
+                    "failure_event_emitted",
+                    data.get("failure_notified", False),
+                ),
+                "exercise.attempt.failure_event_emitted",
             ),
         )
 
@@ -215,6 +224,13 @@ class ExerciseScheduler:
         return self.active_attempt.slot if self.active_attempt else None
 
     @property
+    def authorized_shutdown_slot(self) -> GeneratorSlot | None:
+        attempt = self.active_attempt
+        if attempt is not None and attempt.phase == ExerciseAttemptPhase.STOPPING:
+            return attempt.slot
+        return None
+
+    @property
     def internal_test_slots(self) -> frozenset[GeneratorSlot]:
         return (
             frozenset({self.active_attempt.slot})
@@ -242,16 +258,10 @@ class ExerciseScheduler:
         desired_running = bool(
             attempt is not None and attempt.phase != ExerciseAttemptPhase.STOPPING
         )
-        shutdown_slot = (
-            attempt.slot
-            if attempt is not None
-            and attempt.phase == ExerciseAttemptPhase.STOPPING
-            else None
-        )
         return ExerciseDecision(
             owned_slot=attempt.slot if attempt else None,
             desired_running=desired_running,
-            authorized_shutdown_slot=shutdown_slot,
+            authorized_shutdown_slot=self.authorized_shutdown_slot,
             warnings=tuple(warnings),
             events=tuple(events),
         )
@@ -261,14 +271,27 @@ class ExerciseScheduler:
         slot: GeneratorSlot,
         window_date: str,
         generator_name: str,
+        sent_at: datetime,
     ) -> SupervisorEvent:
         date.fromisoformat(window_date)
-        self.states[slot].warning_sent_for_date = window_date
+        if sent_at.tzinfo is None:
+            raise ValueError("Время отправки exercise-warning должно содержать timezone")
+        state = self.states[slot]
+        state.warning_sent_for_date = window_date
+        state.warning_sent_at = sent_at.isoformat()
         return SupervisorEvent(
             "info",
             f"Предупреждение о пробном запуске {generator_name} "
             "успешно отправлено заранее.",
         )
+
+    def fail_active(
+        self,
+        o: ExerciseObservation,
+        reason: str,
+    ) -> tuple[SupervisorEvent, ...]:
+        """Завершить собственный auto-run как FAILED, сохранив обязанность stop."""
+        return tuple(self._fail_active(o, reason))
 
     def handoff_to_outage(
         self,
@@ -338,6 +361,7 @@ class ExerciseScheduler:
                     f"{prefix}_forced_date": (
                         forced_date.isoformat() if forced_date else None
                     ),
+                    f"{prefix}_warning_sent_at": state.warning_sent_at,
                     f"{prefix}_active": self.owns(slot),
                     f"{prefix}_run_minutes": self.configs[slot].run_minutes,
                     f"{prefix}_last_result": state.last_result,
@@ -526,9 +550,9 @@ class ExerciseScheduler:
             attempt.result = ExerciseResult.FAILED
             attempt.phase = ExerciseAttemptPhase.STOPPING
 
-        if attempt.failure_notified:
+        if attempt.failure_event_emitted:
             return []
-        attempt.failure_notified = True
+        attempt.failure_event_emitted = True
         return [
             SupervisorEvent(
                 "critical",
@@ -594,7 +618,7 @@ class ExerciseScheduler:
                     config.local_start_time,
                     tzinfo=o.local_now.tzinfo,
                 )
-                warning_at = window - _WARNING_LEAD
+                warning_at = window - _WARNING_DISPATCH_LEAD
                 if not _same_minute(o.local_now, warning_at):
                     continue
                 if (
@@ -643,16 +667,21 @@ class ExerciseScheduler:
                 o.local_now.date(),
                 config.local_start_time,
                 tzinfo=o.local_now.tzinfo,
-            ).isoformat()
+            )
             forced_date = self._forced_date(slot)
             forced = (
                 forced_date is not None
                 and o.local_now.date() >= forced_date
             )
 
-            reason = self._start_blocker(slot, o, forced)
+            reason = self._start_blocker(slot, o, forced, scheduled)
             if reason is not None:
-                self._record_deferred(slot, scheduled, forced, reason)
+                self._record_deferred(
+                    slot,
+                    scheduled.isoformat(),
+                    forced,
+                    reason,
+                )
                 events.append(
                     SupervisorEvent(
                         "info",
@@ -664,7 +693,7 @@ class ExerciseScheduler:
 
             self.active_attempt = ExerciseAttempt(
                 slot=slot,
-                scheduled_time=scheduled,
+                scheduled_time=scheduled.isoformat(),
                 forced=forced,
             )
             events.append(
@@ -684,6 +713,7 @@ class ExerciseScheduler:
         slot: GeneratorSlot,
         o: ExerciseObservation,
         forced: bool,
+        scheduled: datetime,
     ) -> str | None:
         if not o.actions_enabled:
             return "EnergyATS находится в DISARMED режиме"
@@ -703,11 +733,19 @@ class ExerciseScheduler:
             return "тестируемый генератор уже RUNNING или REMOTE ON"
 
         if forced:
-            if (
-                self.states[slot].warning_sent_for_date
-                != o.local_now.date().isoformat()
-            ):
+            state = self.states[slot]
+            if state.warning_sent_for_date != scheduled.date().isoformat():
                 return "не было подтверждённого предупреждения за 60 минут"
+            if state.warning_sent_at is None:
+                return "неизвестно фактическое время предупреждения"
+            try:
+                warning_sent_at = datetime.fromisoformat(state.warning_sent_at)
+            except ValueError:
+                return "некорректно сохранено время предупреждения"
+            if warning_sent_at.tzinfo is None:
+                return "время предупреждения не содержит timezone"
+            if warning_sent_at > scheduled - _WARNING_MIN_LEAD:
+                return "предупреждение было отправлено менее чем за 60 минут"
         elif o.family_present is not False:
             return "отсутствие семьи дома не подтверждено"
 
