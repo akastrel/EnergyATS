@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from domain import GeneratorSlot
 from exercise_scheduler import (
     ExerciseAttemptPhase,
@@ -87,6 +89,20 @@ def test_due_generator_starts_only_in_its_daily_window_when_family_is_away():
     assert decision.desired_running is True
 
 
+def test_generator_b_uses_its_independent_schedule():
+    scheduler = ExerciseScheduler(configs())
+    initial = datetime(2026, 1, 1, 14, 0, tzinfo=timezone.utc)
+    scheduler.step(observation(initial))
+
+    a_window = datetime(2026, 1, 31, 15, 0, tzinfo=timezone.utc)
+    assert scheduler.step(observation(a_window)).owned_slot == GeneratorSlot.A
+    scheduler.cancel_unstarted(observation(a_window), "test cleanup")
+
+    b_window = datetime(2026, 2, 15, 15, 0, tzinfo=timezone.utc)
+    decision = scheduler.step(observation(b_window))
+    assert decision.owned_slot == GeneratorSlot.B
+
+
 def test_presence_defers_without_creating_failed_result():
     scheduler = ExerciseScheduler(configs(b=False))
     scheduler.step(
@@ -120,6 +136,27 @@ def test_presence_unknown_also_defers_normal_exercise():
     assert "не подтверждено" in scheduler.history[-1]["failure_reason"]
 
 
+def test_presence_deferred_exercise_runs_in_next_daily_window_when_family_leaves():
+    scheduler = ExerciseScheduler(configs(b=False))
+    scheduler.step(
+        observation(datetime(2026, 1, 1, 14, 0, tzinfo=timezone.utc))
+    )
+    scheduler.step(
+        observation(
+            datetime(2026, 1, 31, 15, 0, tzinfo=timezone.utc),
+            present=True,
+        )
+    )
+
+    decision = scheduler.step(
+        observation(
+            datetime(2026, 2, 1, 15, 0, tzinfo=timezone.utc),
+            present=False,
+        )
+    )
+    assert decision.owned_slot == GeneratorSlot.A
+
+
 def test_forced_exercise_requires_successful_warning_from_previous_hour():
     scheduler = ExerciseScheduler(configs(b=False))
     scheduler.step(
@@ -140,6 +177,52 @@ def test_forced_exercise_requires_successful_warning_from_previous_hour():
     assert decision.owned_slot == GeneratorSlot.A
 
 
+def test_forced_exercise_ignores_unknown_presence_after_confirmed_warning():
+    scheduler = ExerciseScheduler(configs(b=False))
+    scheduler.step(
+        observation(datetime(2026, 1, 1, 14, 0, tzinfo=timezone.utc))
+    )
+    warning_time = datetime(2026, 2, 7, 14, 0, tzinfo=timezone.utc)
+    warning = scheduler.step(observation(warning_time, present=None)).warnings[0]
+    scheduler.confirm_warning(GeneratorSlot.A, warning.window_date, "Elemax")
+
+    decision = scheduler.step(
+        observation(warning_time + timedelta(hours=1), present=None)
+    )
+    assert decision.owned_slot == GeneratorSlot.A
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"emergency": True},
+        {"known": False},
+        {"grid": False, "grid_path": False},
+        {"busy": True},
+        {"transition": True},
+        {"actions": False},
+    ],
+)
+def test_forced_exercise_never_bypasses_safety_prerequisites(overrides):
+    scheduler = ExerciseScheduler(configs(b=False))
+    scheduler.step(
+        observation(datetime(2026, 1, 1, 14, 0, tzinfo=timezone.utc))
+    )
+    warning_time = datetime(2026, 2, 7, 14, 0, tzinfo=timezone.utc)
+    warning = scheduler.step(observation(warning_time, present=True)).warnings[0]
+    scheduler.confirm_warning(GeneratorSlot.A, warning.window_date, "Elemax")
+
+    decision = scheduler.step(
+        observation(
+            warning_time + timedelta(hours=1),
+            present=True,
+            **overrides,
+        )
+    )
+    assert decision.owned_slot is None
+    assert scheduler.history[-1]["result"] == ExerciseResult.DEFERRED.value
+
+
 def test_missed_forced_warning_prevents_start_and_does_not_catch_up():
     scheduler = ExerciseScheduler(configs(b=False))
     scheduler.step(
@@ -153,6 +236,20 @@ def test_missed_forced_warning_prevents_start_and_does_not_catch_up():
 
     later = forced_window + timedelta(hours=2)
     assert scheduler.step(observation(later, present=True)).owned_slot is None
+
+
+def test_missed_ordinary_window_does_not_create_late_catch_up_start():
+    scheduler = ExerciseScheduler(configs(b=False))
+    scheduler.step(
+        observation(datetime(2026, 1, 1, 14, 0, tzinfo=timezone.utc))
+    )
+
+    late = datetime(2026, 1, 31, 17, 0, tzinfo=timezone.utc)
+    assert scheduler.step(observation(late)).owned_slot is None
+    assert scheduler.history == []
+
+    next_window = datetime(2026, 2, 1, 15, 0, tzinfo=timezone.utc)
+    assert scheduler.step(observation(next_window)).owned_slot == GeneratorSlot.A
 
 
 def test_two_conflicting_exercise_windows_do_not_start_together():
@@ -227,6 +324,29 @@ def test_exercise_failure_does_not_request_second_generator():
     assert any(event.level == "critical" for event in decision.events)
 
 
+def test_failed_attempt_does_not_clear_overdue_state():
+    scheduler = ExerciseScheduler(configs(b=False))
+    scheduler.step(
+        observation(datetime(2026, 1, 1, 14, 0, tzinfo=timezone.utc))
+    )
+    start_window = datetime(2026, 1, 31, 15, 0, tzinfo=timezone.utc)
+    scheduler.step(observation(start_window))
+    scheduler.step(
+        observation(
+            start_window + timedelta(seconds=5),
+            a_running=True,
+            a_remote=True,
+            a_fault="fault",
+        )
+    )
+    stopped = start_window + timedelta(seconds=10)
+    scheduler.step(observation(stopped))
+
+    attrs = scheduler.status_attributes(stopped, stopped.timestamp())
+    assert scheduler.states[GeneratorSlot.A].last_qualifying_run is None
+    assert attrs["generator_a_exercise_overdue"] is True
+
+
 def test_handoff_to_outage_releases_scheduler_ownership():
     scheduler = ExerciseScheduler(configs(b=False))
     scheduler.step(
@@ -243,6 +363,38 @@ def test_handoff_to_outage_releases_scheduler_ownership():
     assert events
     assert scheduler.active_attempt is None
     assert scheduler.history[-1]["result"] == ExerciseResult.INTERRUPTED_BY_OUTAGE.value
+    assert all(event.level != "critical" for event in events)
+
+
+def test_brief_grid_outage_without_handoff_does_not_cancel_shutdown_obligation():
+    scheduler = ExerciseScheduler(configs(b=False))
+    scheduler.step(
+        observation(datetime(2026, 1, 1, 14, 0, tzinfo=timezone.utc))
+    )
+    start_window = datetime(2026, 1, 31, 15, 0, tzinfo=timezone.utc)
+    scheduler.step(observation(start_window))
+    running = start_window + timedelta(seconds=5)
+    scheduler.step(observation(running, a_running=True, a_remote=True))
+
+    scheduler.step(
+        observation(
+            running + timedelta(minutes=1),
+            grid=False,
+            grid_path=False,
+            a_running=True,
+            a_remote=True,
+        )
+    )
+    decision = scheduler.step(
+        observation(
+            running + timedelta(minutes=10),
+            grid=True,
+            grid_path=True,
+            a_running=True,
+            a_remote=True,
+        )
+    )
+    assert decision.authorized_shutdown_slot == GeneratorSlot.A
 
 
 def test_qualifying_outage_run_updates_next_due_without_scheduled_exercise():
@@ -262,6 +414,24 @@ def test_qualifying_outage_run_updates_next_due_without_scheduled_exercise():
     assert scheduler.states[GeneratorSlot.A].last_qualifying_run is not None
     attrs = scheduler.status_attributes(qualified, qualified.timestamp())
     assert attrs["generator_a_exercise_next_due"].startswith("2026-02-09")
+
+
+def test_short_observed_run_does_not_update_qualifying_history():
+    scheduler = ExerciseScheduler(configs(b=False))
+    initial = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    scheduler.step(observation(initial))
+
+    started = datetime(2026, 1, 10, 8, 0, tzinfo=timezone.utc)
+    scheduler.step(observation(started, a_running=True, a_remote=True))
+    scheduler.step(
+        observation(
+            started + timedelta(minutes=5),
+            a_running=False,
+            a_remote=False,
+        )
+    )
+
+    assert scheduler.states[GeneratorSlot.A].last_qualifying_run is None
 
 
 def test_scheduler_state_restores_active_attempt_without_duplicate_schedule():
@@ -286,3 +456,51 @@ def test_scheduler_state_restores_active_attempt_without_duplicate_schedule():
     assert decision.owned_slot == GeneratorSlot.A
     assert decision.desired_running is True
     assert restored.active_attempt.started_at == scheduler.active_attempt.started_at
+
+
+def test_restart_after_duration_preserves_shutdown_obligation():
+    scheduler = ExerciseScheduler(configs(b=False))
+    scheduler.step(
+        observation(datetime(2026, 1, 1, 14, 0, tzinfo=timezone.utc))
+    )
+    start_window = datetime(2026, 1, 31, 15, 0, tzinfo=timezone.utc)
+    scheduler.step(observation(start_window))
+    running = start_window + timedelta(seconds=5)
+    scheduler.step(observation(running, a_running=True, a_remote=True))
+
+    restored = ExerciseScheduler.from_dict(scheduler.to_dict(), configs(b=False))
+    after_duration = running + timedelta(minutes=11)
+    decision = restored.step(
+        observation(after_duration, a_running=True, a_remote=True)
+    )
+
+    assert decision.owned_slot == GeneratorSlot.A
+    assert decision.desired_running is False
+    assert decision.authorized_shutdown_slot == GeneratorSlot.A
+
+
+def test_qualifying_history_survives_handoff_when_duration_was_reached_first():
+    scheduler = ExerciseScheduler(configs(b=False))
+    scheduler.step(
+        observation(datetime(2026, 1, 1, 14, 0, tzinfo=timezone.utc))
+    )
+    start_window = datetime(2026, 1, 31, 15, 0, tzinfo=timezone.utc)
+    scheduler.step(observation(start_window))
+    running = start_window + timedelta(seconds=5)
+    scheduler.step(observation(running, a_running=True, a_remote=True))
+
+    qualified = running + timedelta(minutes=10)
+    current = observation(
+        qualified,
+        grid=False,
+        grid_path=False,
+        a_running=True,
+        a_remote=True,
+    )
+    scheduler.step(current)
+    qualifying_time = scheduler.states[GeneratorSlot.A].last_qualifying_run
+    scheduler.handoff_to_outage(GeneratorSlot.A, current)
+
+    assert qualifying_time is not None
+    assert scheduler.states[GeneratorSlot.A].last_qualifying_run == qualifying_time
+    assert scheduler.history[-1]["result"] == ExerciseResult.INTERRUPTED_BY_OUTAGE.value
