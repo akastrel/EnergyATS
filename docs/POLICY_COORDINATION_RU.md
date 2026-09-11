@@ -68,26 +68,20 @@ High-level пересечения разрешает один `PolicyCoordinator
 | Exercise уже RUNNING | Manual Start | работающий Exercise не захватывается молча; Scheduler сохраняет ownership, обычный managed-start не создаётся |
 | Exercise RUNNING | Grid outage | после обычного outage delay Supervisor может принять этот же генератор; затем выполняется явный `Exercise -> Outage` handoff |
 | Exercise | Recovery | Exercise становится FAILED/STOPPING, но Scheduler сохраняет shutdown ownership до безопасной остановки |
-| automatic outage-session | Charge Cycling enabled | только новая обычная automatic outage-session может получить `CHARGE_CYCLE` control mode |
+| automatic outage-session | Charge Cycling enabled | только новая обычная automatic outage-session может получить cycling ownership |
 | Charge Cycle | Target SoC | OutagePowerPolicy просит завершение; Supervisor выполняет `generator bus -> isolated/UPS -> cooldown -> stop` |
-| Charge Cycle | Manual Start | текущая outage-session переходит в `MANUAL_OVERRIDE`; автоматический Target SoC stop отменяется |
+| Charge Cycle | Manual Start | текущая outage-session становится manual override; автоматический Target SoC stop отменяется |
 | Charge Cycle | Manual Stop | cycling ownership снимается; выполняется обычная пользовательская последовательность stop/return |
 | Charge Cycle | стабильная Grid | возврат Grid имеет приоритет над Target SoC и завершает outage-session штатным Grid-return |
 | любой generator scenario | LoadManager overload | меняются только G1/G2; ownership генератора/source не меняется |
 | generator готов к transfer | LoadManager pre-transfer shedding | TPC ждёт разрешения LoadManager; generator-session остаётся активной |
 | LoadManager DEGRADED | core ATS требует generator | core transfer/return не превращается из-за этого в `RECOVERY_REQUIRED` |
 
-## 5. Session ownership
+## 5. Session ownership в PR20
 
-Внутри `GeneratorSession` ownership режима кодируется одним `SessionControlMode`, а не комбинацией независимых boolean:
+PR20 намеренно **не меняет persisted формат `GeneratorSession`**. Поля `cycle_owned`, `manual_override` и `stop_requested` остаются такими же, как в 0.7.0: это позволяет отделить архитектурный refactor от изменения restart/persistence semantics.
 
-- `STANDARD` — обычная managed-session;
-- `CHARGE_CYCLE` — automatic outage-session принадлежит cycling policy и может быть завершена по Target SoC;
-- `MANUAL_OVERRIDE` — пользователь принял active outage-session под ручное управление; автоматический Target SoC stop запрещён.
-
-Факт пользовательской команды остановки остаётся отдельным `stop_requested`; это действие, а не новый owner.
-
-Так невозможно получить противоречивое состояние вроде одновременно `cycle_owned=True` и `manual_override=True`.
+Их переходы теперь сосредоточены вокруг одного arbitration path и покрываются integration/coordinator tests. Возможную замену нескольких markers на более строгую модель ownership имеет смысл делать только отдельным изменением, если появится реальная необходимость; для текущего PR это было бы лишним риском.
 
 ## 6. Как добавлять новую policy
 
