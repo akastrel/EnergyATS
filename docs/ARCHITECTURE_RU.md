@@ -70,14 +70,14 @@ EnergyATS — один Home Assistant App и один Python-процесс. В�
 | `power_transfer.py` | Основные Grid/Generator контакторы и break-before-make |
 | `energy_supervisor.py` | **Единая системная логика:** `REQ-BEH-*`, managed-session, manual/outage, fallback, return, Recovery и разрешение пересечений режимов |
 | `exercise_scheduler.py` | Локальная логика Scheduled Exercise: schedule/history/warning/duration/result и ответственность за собственный auto-run до явного handoff |
-| `outage_power_policy.py` | Текущее implementation-name UPS Run subsystem: оценка battery/TTG/time, ожидание в `UPS_ONLY`, условия начала/окончания charge cycle. Не является вторым Supervisor |
+| `ups_run.py` | UPS Run subsystem: оценка battery/TTG/time, ожидание в `UPS_ONLY`, условия начала/окончания charge cycle. Не является вторым Supervisor |
 | `load_manager.py` | G1/G2: pre-transfer shedding, admission, continuous overload control, own-OFF ownership и локальный DEGRADED |
 | `ha_adapter.py` | HA states -> observations, разрешённые service calls, safety checks и публикация runtime outputs |
 | `main.py` | Composition root: snapshot, вызов компонентов, dispatch `SupervisorDecision`, journal/status/log |
 | `state_store.py` | Атомарное сохранение persistent state |
 | `ha_client.py` | WebSocket/REST transport Home Assistant и revisions входящих HA states |
 
-Название `outage_power_policy.py` сохраняется на текущем этапе как имя существующего кода. В требованиях и архитектурной модели функциональная область называется **UPS Run**. Переименование модуля имеет смысл делать после стабилизации логики, отдельно от смыслового рефактора.
+Функциональная область и runtime-модуль называются одинаково: **UPS Run / `ups_run.py`**.
 
 ---
 
@@ -343,7 +343,7 @@ Manual request во время cycle снимает automatic Target SoC stop ч
 
 ## 9. UPS Run subsystem
 
-В текущем коде функциональность реализуется модулем `outage_power_policy.py`; концептуально это **UPS Run**, а не самостоятельная верхнеуровневая policy.
+Функциональность реализуется модулем `ups_run.py`; это специализированная подсистема длительного outage, а не самостоятельная верхнеуровневая policy.
 
 Он отвечает только на локальные вопросы длительного outage:
 
@@ -445,7 +445,7 @@ restore/admission: G1 -> G2
 overload shedding: G2 -> G1
 ```
 
-` shed_by_energy_ats` хранится отдельно для каждой группы. Automatic ON разрешён только если текущий OFF был создан самим Load Manager. Пользовательский OFF не захватывается.
+`shed_by_energy_ats` хранится отдельно для каждой группы. Automatic ON разрешён только если текущий OFF был создан самим Load Manager. Пользовательский OFF не захватывается.
 
 ### 11.2. Pre-transfer shedding
 
@@ -521,7 +521,7 @@ Adapter:
 
 Presence является soft Scheduler input. `unknown/unavailable` presence не блокирует core ATS, а только не позволяет обычный presence-gated Exercise.
 
-Load Manager и battery optimization inputs намеренно не входят в обязательный core readiness set.
+Load Manager и UPS Run battery inputs намеренно не входят в обязательный core readiness set.
 
 Одновременный RUNNING A и B допустим.
 
@@ -581,10 +581,10 @@ Persistent state хранит только данные, необходимые 
 - `GeneratorBusTracker`;
 - `ExerciseScheduler`;
 - `LoadManager`;
-- UPS Run local state;
+- UPS Run local state в ключе `ups_run`;
 - core `pending_actions`.
 
-На текущем этапе implementation key/module может по-прежнему называться `outage_power_policy`; это не означает отдельный верхнеуровневый policy layer.
+Текущая schema persistent state — `3`. Миграция старых schema не выполняется: несовместимый state отклоняется явно.
 
 Load Manager сохраняет own-OFF (`shed_by_energy_ats`), phase/reason, pending consumer state и restore retry data. Measurement samples не persist-ятся: после restart power-based decision доказывается новым stabilization window.
 
