@@ -1,17 +1,17 @@
-# Установка и обновление Energy ATS 0.7.0
+# Установка и обновление Energy ATS 1.0.3
 
-Перед установкой или commissioning прочитать:
+Этот документ описывает безопасную установку и обновление текущей версии EnergyATS.
 
-- `PHYSICAL_POWER_TOPOLOGY_RU.md`;
-- `REQUIREMENTS_RU.md`;
-- `ENTITIES_RU.md`;
-- `USER_TESTS_RU.md`.
+Перед ARMED-запуском прочитайте:
 
-Версия 0.6 сохраняет базовую силовую модель 0.4 и Scheduled Exercise 0.5, добавляя отдельный Load Manager для G1/G2. Физическая топология Grid/Generator/UPS и правила A/B bus owner не меняются.
+- `PHYSICAL_POWER_TOPOLOGY_RU.md` — фактическая силовая схема;
+- `REQUIREMENTS_RU.md` — нормативное поведение;
+- `ENTITIES_RU.md` — Home Assistant contract;
+- `USER_TESTS_RU.md` — физический commissioning.
 
 ## 1. Рекомендуемое исходное состояние
 
-Для первого запуска/обновления безопаснее начинать из устойчивого состояния:
+Для первого запуска или заметного обновления безопаснее начинать из устойчивого состояния:
 
 ```text
 Grid Input Ready                 ON
@@ -26,28 +26,43 @@ Grid Power                      ON
 Generators Emergency Stop       OFF
 ```
 
-Перед физическими испытаниями App можно сначала запустить с `armed: false`.
+Первый запуск выполняйте с:
 
-Load Manager по умолчанию выключен (`load_management_enabled: false`). Поэтому обновить EnergyATS до 0.6 можно до установки его дополнительных meter/load entities: они являются soft dependencies и не блокируют core ATS.
+```yaml
+armed: false
+```
+
+В DISARMED App читает состояния, восстанавливает внутреннюю модель и публикует status, но не должна выдавать реальные hardware commands.
 
 ## 2. Установка repository/App
 
-Добавить repository EnergyATS в Home Assistant App store и установить Energy ATS обычным способом.
+Добавьте repository:
 
-App требует доступ к Home Assistant API (`homeassistant_api: true` в `config.yaml`).
+```text
+https://github.com/akastrel/EnergyATS
+```
 
-Корневой package `ats.yaml` создаёт:
+и установите **Energy ATS** как обычный Home Assistant App.
+
+App использует Home Assistant API:
+
+```yaml
+homeassistant_api: true
+stdin: true
+```
+
+Корневой package `ats.yaml` создаёт helper-ы:
 
 ```text
 input_boolean.automatic_generator_transfer
 input_boolean.generator_test_mode
 ```
 
-Если package-файлы подключаются вручную, убедиться, что `ats.yaml` реально загружается Home Assistant.
+Если Home Assistant packages подключаются вручную, убедитесь, что `ats.yaml` действительно загружен.
 
-## 3. Обязательный HA-контракт core ATS
+## 3. Обязательный core HA contract
 
-До ARMED-запуска должны существовать и иметь определённые состояния обязательные core entities.
+До `armed: true` должны существовать и иметь определённые состояния следующие entities.
 
 ### Grid / основные контакторы
 
@@ -72,7 +87,16 @@ button.generator_b_choke_to_cold_start
 button.generator_b_choke_to_run
 ```
 
-### Метаданные core / PRIMARY
+### Safety / environment
+
+```text
+switch.generators_emergency_stop
+sensor.garage_temperature
+```
+
+`garage_temperature` используется для choke/warmup. Временная недоступность температуры обрабатывается консервативно и сама по себе не является core blocker.
+
+### Generator metadata / PRIMARY
 
 ```text
 sensor.generator_a_name
@@ -82,20 +106,110 @@ sensor.generator_b_model
 select.primary_generator
 ```
 
-### Safety / temperature
+Имена должны быть непустыми и различаться. `select.primary_generator` должен содержать имя одного из двух генераторов.
+
+Полный смысл entities: `ENTITIES_RU.md`.
+
+## 4. Configuration App
+
+Основные параметры:
 
 ```text
-switch.generators_emergency_stop
-sensor.garage_temperature
+armed
+tick_seconds
+log_level
+grid_failure_delay
+grid_restore_stable_time
+transfer_confirmation_timeout
+generator_a_enabled
+generator_b_enabled
 ```
 
-`sensor.garage_temperature` используется консервативно для choke/warmup и не является причиной блокировки core ATS при временной недоступности.
+Текущие важные defaults:
 
-Полный смысл entities приведён в `ENTITIES_RU.md`.
+```text
+armed = false
+tick_seconds = 1.0
+grid_failure_delay = 60 s
+grid_restore_stable_time = 60 s
+transfer_confirmation_timeout = 60 s
+```
 
-## 4. Дополнительный контракт Load Manager
+PRIMARY выбирается через `select.primary_generator`, а не через внутреннюю настройку A/B.
 
-Перед включением `load_management_enabled: true` Generator Controller должен публиковать отдельные паспортные мощности:
+`generator_a_enabled` / `generator_b_enabled` — policy-флаги. Они позволяют исключить physical slot из новых managed sessions, не меняя entity IDs. Выбранный PRIMARY должен быть разрешён.
+
+## 5. UPS Run
+
+UPS Run — опциональная стратегия длительного outage. Обе функции выключены по умолчанию.
+
+```text
+delayed_generator_start_enabled = false
+generator_charge_cycle_enabled = false
+generator_start_soc = 40
+generator_target_charge_soc = 80
+generator_min_ttg_before_start = 60 min
+generator_max_start_delay = 21600 s
+```
+
+Для включения необходимы soft-dependency inputs:
+
+```text
+sensor.ups_battery_charge_level_soc
+sensor.ups_battery_time_remaining_minutes_ttg
+binary_sensor.ups_running_on_battery
+binary_sensor.ups_ready
+```
+
+Проверьте, что:
+
+- SoC — число 0–100;
+- TTG — число в **минутах**, а не форматированная строка;
+- `ups_running_on_battery` реально различает discharge и charge/float;
+- `ups_ready` отражает возможность продолжать работу от АКБ, включая critical state;
+- sensors действительно обновляются, а не остаются бесконечно со старым значением.
+
+При invalid/stale telemetry Delayed Start fail-safe прекращается и используется обычный generator start. Эти inputs не являются hard dependency core ATS.
+
+Нормативные правила находятся в разделе **UPS Run** `REQUIREMENTS_RU.md`.
+
+## 6. Scheduled Exercise
+
+Scheduled Exercise для A/B выключен по умолчанию.
+
+Основные настройки:
+
+```text
+family_presence_entity
+generator_a_exercise_enabled
+generator_a_exercise_interval_days
+generator_a_exercise_start_time
+generator_a_exercise_run_minutes
+generator_a_exercise_presence_grace_days
+# аналогично для B
+```
+
+Defaults:
+
+```text
+A: enabled=false, interval=30 дней, start=15:00, run=10 мин, grace=7 дней
+B: enabled=false, interval=45 дней, start=15:00, run=10 мин, grace=14 дней
+family_presence_entity=group.family
+```
+
+Presence — soft Scheduler input. `unknown/unavailable` не блокирует core ATS, но ordinary Exercise при таком состоянии откладывается.
+
+Перед включением Exercise проверьте, что пользовательские notifications реально доставляются: forced Exercise требует заранее подтверждённого warning.
+
+## 7. Load Manager
+
+Load Manager выключен по умолчанию:
+
+```text
+load_management_enabled = false
+```
+
+Перед включением должны быть доступны паспортные мощности A/B:
 
 ```text
 sensor.generator_a_nominal_power
@@ -104,14 +218,12 @@ sensor.generator_b_nominal_power
 sensor.generator_b_maximum_power
 ```
 
-Для текущего оборудования ожидаются:
+Текущие значения установленного оборудования в требованиях:
 
 ```text
-Elemax SH7600EX:             nominal 5600 W, maximum 6500 W
-Вепрь АПБ 6-230 ВХ-БСГ:     nominal 5500 W, maximum 6000 W
+Elemax SH7600EX:         nominal 5600 W, maximum 6500 W
+Вепрь АПБ 6-230 ВХ-БСГ: nominal 5500 W, maximum 6000 W
 ```
-
-Параметры должны быть числовыми и удовлетворять `0 < nominal <= maximum`.
 
 Управляемые группы:
 
@@ -120,7 +232,7 @@ G1 = switch.non_critical_loads_first_floor
 G2 = switch.non_critical_loads_basement_floor
 ```
 
-Счётчик общей генераторной шины:
+Generator-bus meter:
 
 ```text
 binary_sensor.generator_meter_status
@@ -133,44 +245,11 @@ sensor.generator_power_factor
 sensor.generator_frequency
 ```
 
-Для решений Load Manager используется прежде всего `sensor.generator_power`; остальная телеметрия диагностическая.
+Для automatic decisions используется прежде всего `sensor.generator_power`; остальная meter telemetry диагностическая.
 
-Все перечисленные в этом разделе entities являются soft dependencies относительно core ATS. Если они отсутствуют или сломаны, Load Manager может перейти в локальный `DEGRADED`, но App/GC/TPC/Supervisor не должны из-за этого переходить в системный `RECOVERY_REQUIRED`.
-
-## 5. Configuration
-
-Основные параметры:
+Настройки:
 
 ```text
-armed
-tick_seconds
-log_level
-grid_failure_delay
-grid_restore_stable_time
-generator_a_enabled
-generator_b_enabled
-transfer_confirmation_timeout
-```
-
-PRIMARY выбирается через `select.primary_generator` в Home Assistant, а не через внутренний A/B параметр App.
-
-`generator_a_enabled` / `generator_b_enabled` — policy-флаги: физически установленный генератор можно временно исключить из managed-сценариев, не меняя entity_id. Если выбранный PRIMARY запрещён policy-флагом, конфигурация считается ошибочной.
-
-### Load Manager
-
-```text
-load_management_enabled
-load_measurement_stabilization_time
-load_restore_margin_percent
-nominal_overload_time
-maximum_overload_confirmation_time
-load_restore_retry_interval
-```
-
-Defaults:
-
-```text
-load_management_enabled = false
 load_measurement_stabilization_time = 10 s
 load_restore_margin_percent = 15 %
 nominal_overload_time = 20 s
@@ -178,78 +257,80 @@ maximum_overload_confirmation_time = 4 s
 load_restore_retry_interval = 300 s
 ```
 
-При первом обновлении рекомендуется оставить `load_management_enabled=false`, проверить новые entities и status, затем включать функцию отдельно.
+Meter, G1/G2 и power metadata — soft dependencies core ATS. Их отказ может перевести только Load Manager в локальный `DEGRADED`.
 
-### Delayed Start / Charge Cycling
+## 8. Первый запуск после установки/обновления
 
-При обновлении обе функции остаются выключенными. Для включения используйте [отдельное руководство](DELAYED_START_RU.md): оно описывает все шесть параметров, необходимые батарейные сигналы и проверку их достоверности. В HA configuration доступны русские и английские названия и пояснения.
-
-### Scheduled Exercise
-
-Scheduled Exercise остаётся отдельно конфигурируемым для A/B; presence задаётся `family_presence_entity`.
-
-## 6. Первый запуск после обновления
-
-### DISARMED
-
-Рекомендуемый первый запуск:
+### Шаг 1 — DISARMED
 
 ```yaml
 armed: false
 ```
 
-Проверить в log/status:
+Проверьте:
 
-- оба генератора прочитаны с правильными именами/моделями;
+- A/B прочитаны с правильными именами и моделями;
 - PRIMARY совпадает с `select.primary_generator`;
-- Grid отображается корректно;
-- bus owner при остановленных генераторах = `none`;
-- нет `RECOVERY_REQUIRED`;
-- при наличии новых Generator Controller sensors правильно видны Nominal/Maximum Power;
-- Load Manager при default configuration показывает `disabled`.
+- Grid отображается правильно;
+- при остановленных генераторах `bus_owner = none`;
+- `source = grid` при штатной Grid;
+- нет необъяснённого `RECOVERY_REQUIRED`;
+- optional subsystems имеют ожидаемое enabled/disabled состояние.
 
-В DISARMED App наблюдает и публикует status, но не должен выдавать реальные аппаратные команды.
+### Шаг 2 — ARMED с optional functions OFF
 
-### ARMED без Load Manager
-
-После проверки:
+Включите:
 
 ```yaml
 armed: true
-load_management_enabled: false
 ```
 
-Core ATS должен вести себя как до 0.6. Дополнительные meter/G1/G2/power entities не могут мешать запуску и transfer.
+оставив UPS Run / Exercise / Load Manager выключенными, если они ещё не проверены.
 
-### ARMED с Load Manager
+Сначала пройдите базовые M-сценарии `USER_TESTS_RU.md`.
 
-До включения проверить:
+### Шаг 3 — включайте функции отдельно
 
-1. G1/G2 в Home Assistant действительно управляют только задуманными некритичными группами;
-2. `generator_meter_status` отражает доступность SDM120;
-3. `generator_power` измеряет общую generator bus;
-4. Nominal/Maximum относятся к правильному физическому A/B;
-5. состояния всех этих entities не `unknown/unavailable`.
+Не включайте одновременно все новые возможности перед первым физическим тестом.
 
-После этого включить:
+Рекомендуемый порядок:
 
-```yaml
-load_management_enabled: true
+1. core ATS;
+2. UPS Run;
+3. Scheduled Exercise;
+4. Load Manager.
+
+После включения каждой функции выполните её физические тесты.
+
+## 9. Persistent state и обновление старых версий
+
+Текущий top-level persistent format:
+
+```text
+STATE_SCHEMA_VERSION = 3
 ```
 
-И выполнить Load Manager-сценарии из `USER_TESTS_RU.md`.
+Schema 3 хранит как минимум:
 
-## 7. Persistent state и обновление старых версий
+- Supervisor/session state;
+- GeneratorBusTracker;
+- Scheduled Exercise;
+- UPS Run (`ups_run`);
+- Load Manager ownership/state;
+- `pending_actions` для незавершённых core hardware commands.
 
-Journal 0.3.x несовместим с моделью 0.4 и намеренно не мигрируется.
+EnergyATS **не обещает автоматическую миграцию несовместимых старых schema**. Если persisted state имеет неподдерживаемый format, App не должна угадывать старое состояние; используется безопасный Recovery path.
 
-Обновления 0.4 -> 0.5 -> 0.6 -> 0.7 сохраняют `schema_version = 2`. Старый совместимый journal без `exercise_scheduler`, `load_manager` или `outage_power_policy` получает свежий state соответствующего policy-компонента. Старые сессии без `cycle_owned` остаются вне cycling ownership. Устойчивое ожидание и cycle-owned RUNNING восстанавливаются; restart во время незавершённого силового перехода/остановки требует Recovery по обычным правилам.
+Особенно важно:
 
-Load Manager сохраняет собственное `shed_by_energy_ats` ownership, pending consumer action и retry state. Measurement samples не восстанавливаются: после restart power-based решение должно быть доказано новым stabilization window.
+- незавершённая core hardware command после restart не повторяется вслепую;
+- устойчивую однозначную managed session можно восстановить без duplicate start/transfer;
+- Load Manager measurement samples не persist-ятся — после restart нужен новый stabilization;
+- corruption optional Load Manager / UPS Run state локализуется и не должна сама превращать core ATS в неисправимую систему.
 
-Повреждение Load Manager state локализуется и не должно само по себе отправлять core ATS в recovery. В сомнительном случае ownership теряется консервативно: уже-OFF группа не включается автоматически без доказанного собственного OFF.
+Перед крупным обновлением полезно убедиться, что система находится в штатном Grid state и оба генератора остановлены.
 
-## 8. Проверка status sensor
+## 10. Status sensor
 
 После запуска должен появиться:
 
@@ -257,72 +338,26 @@ Load Manager сохраняет собственное `shed_by_energy_ats` owne
 sensor.energy_ats_status
 ```
 
-Базовые атрибуты:
+Проверьте как минимум:
 
 ```text
 source
 phase
 generator
-generator_model
-generator_slot
 managed_generator
 bus_owner
-generator_a_run_context
-generator_b_run_context
 primary_generator
-remaining_seconds
 session_reason
 fallback_used
+remaining_seconds
 armed
 ```
 
-Load Manager добавляет:
+Если включены дополнительные функции, status также содержит Exercise, UPS Run и Load Manager attributes.
 
-```text
-load_management_enabled
-load_manager_phase
-load_manager_degraded_reason
-generator_power
-active_generator_nominal_power
-active_generator_maximum_power
-load_g1_state
-load_g1_shed_by_energy_ats
-load_g2_state
-load_g2_shed_by_energy_ats
-load_nominal_overload_since
-load_maximum_overload_since
-load_next_restore_retry
-load_last_reason
-```
+Точный contract: `ENTITIES_RU.md`.
 
-Run-context значения:
-
-```text
-none
-outage_related
-test_run
-other
-unknown
-```
-
-## 9. Что проверить физически после 0.6
-
-Если Load Manager остаётся выключенным, достаточно базовых M-сценариев `USER_TESTS_RU.md` для core ATS и тех сценариев, которые затрагивались обновлением.
-
-Перед эксплуатацией с включённым Load Manager дополнительно необходимо физически проверить:
-
-- pre-transfer отключение G1/G2 до подключения generator bus;
-- последовательный admission G1 -> G2 при достаточном запасе;
-- отсутствие automatic ON для группы, которая была OFF пользователем;
-- непрерывный overload control во время уже установившегося питания от generator;
-- локальный `DEGRADED` при отказе generator meter без системного recovery;
-- возврат Grid раньше восстановления shed groups;
-- восстановление только собственного `shed_by_energy_ats`;
-- смену active nominal/maximum при аппаратном A/B takeover.
-
-Подробные пользовательские шаги приведены в `USER_TESTS_RU.md`.
-
-## 10. Recovery
+## 11. Recovery
 
 Команда:
 
@@ -330,23 +365,58 @@ unknown
 reset
 ```
 
-не является «стереть ошибку». Она запускает безопасное восстановление core ATS:
+запускает управляемое восстановление.
 
-1. проверяет обязательные физические состояния и E-stop;
-2. возвращает основные контакторы к Grid path;
-3. не захватывает внешний генератор;
-4. при наличии управляемого двигателя снимает нагрузку до остановки;
-5. локальные GC faults сбрасываются только для физически остановленного двигателя (`RUNNING=OFF`, `REMOTE=OFF`).
+В 1.0.3 системное решение Recovery принадлежит `EnergySupervisor`. Он определяет:
 
-Load Manager `DEGRADED` сам по себе не является причиной core recovery. Meter/G1/G2 fault устраняется восстановлением соответствующей soft dependency; power-based control после этого начинает новое measurement window.
+- нужен ли reset;
+- блокирует ли E-stop, unknown required state, TPC inconsistency или внешний RUNNING;
+- порядок `Grid path -> owned generator shutdown -> complete`;
+- какие generators EnergyATS имеет право остановить.
 
-## 11. Критерий готовности
+`main.py` и TPC/GC только исполняют выбранные безопасные шаги.
 
-Установка считается подготовленной к эксплуатации, когда одновременно выполнены:
+Не пытайтесь использовать reset как обход внешнего RUNNING или аппаратной проблемы feedback.
 
-- HA entities соответствуют `ENTITIES_RU.md`;
+## 12. Сетевые публикации и reconnect
+
+Обычные status/Logbook/user notifications выполняются best-effort и не должны блокировать control tick на сетевой timeout.
+
+При потере связи с Home Assistant незавершённые background publications отменяются перед reconnect.
+
+Аппаратные service calls остаются подтверждаемыми и journaled. Warning перед forced Scheduled Exercise также остаётся синхронным, потому что успешная доставка является safety prerequisite.
+
+Потеря HA во время transient physical operation может привести к `RECOVERY_REQUIRED`, чтобы после reconnect не продолжать силовой переход вслепую.
+
+## 13. Production verification
+
+CI текущей версии выполняет два независимых блока:
+
+1. полный Python test suite — для 1.0.3 **288 passed**;
+2. `addon-container-smoke` — реальная сборка add-on Docker image и проверка production `HomeAssistantClient` через локальный test WebSocket/REST endpoint внутри container.
+
+Это проверяет packaging/runtime, но не реальные контакторы, генераторы, DKG116, MAP и проводку.
+
+## 14. Физический commissioning
+
+Минимум для core ATS — M1–M10 из `USER_TESTS_RU.md`.
+
+Дополнительно:
+
+- UPS Run: C1–C4;
+- Scheduled Exercise: C5–C6;
+- fallback/feedback на реальной схеме: C7;
+- Load Manager: E12–E18.
+
+Не обходите аппаратные блокировки и не вмешивайтесь вручную в силовые контакторы ради теста.
+
+## 15. Критерий готовности
+
+Система подготовлена к эксплуатации, когда одновременно:
+
 - physical topology соответствует `PHYSICAL_POWER_TOPOLOGY_RU.md`;
-- App стартует без неоднозначных обязательных core состояний;
+- HA contract соответствует `ENTITIES_RU.md`;
+- App стартует без unknown обязательных core states;
+- PRIMARY/metadata корректны;
 - CI текущей версии зелёный;
-- базовые commissioning-сценарии подтверждены;
-- если Load Manager включён — его отдельные физические сценарии также пройдены без необъяснённых отклонений.
+- необходимые physical commissioning tests пройдены без необъяснённых отклонений.
