@@ -279,6 +279,8 @@ class EnergySupervisor:
                 return RecoveryDecision(RecoveryDirective.FINISH_TICK)
 
             self.begin_recovery_reset()
+            if grid_path_confirmed:
+                return self._recovery_after_grid(o, exercise_owned_slot)
             return RecoveryDecision(RecoveryDirective.BEGIN_GRID_RECOVERY)
 
         blocker = self._recovery_blocker(
@@ -292,7 +294,13 @@ class EnergySupervisor:
 
         if not grid_path_confirmed:
             return RecoveryDecision(RecoveryDirective.DRIVE_GRID_RECOVERY)
+        return self._recovery_after_grid(o, exercise_owned_slot)
 
+    def _recovery_after_grid(
+        self,
+        o: SupervisorObservation,
+        exercise_owned_slot: GeneratorSlot | None,
+    ) -> RecoveryDecision:
         stop_slots = {
             slot
             for slot in (
