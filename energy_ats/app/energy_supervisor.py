@@ -24,20 +24,6 @@ class SupervisorPhase(str, Enum):
     RECOVERY_REQUIRED = "recovery_required"
 
 
-class SessionControlMode(str, Enum):
-    """Кто/что сейчас определяет завершение managed-session.
-
-    Раньше это кодировалось двумя независимыми boolean `cycle_owned` и
-    `manual_override`, что допускало противоречивую комбинацию True/True.
-    Одно enum-state делает ownership явным и исключает невозможные состояния.
-    """
-
-    STANDARD = "standard"
-    CHARGE_CYCLE = "charge_cycle"
-    MANUAL_OVERRIDE = "manual_override"
-    MANUAL_STOP = "manual_stop"
-
-
 _TRANSIENT_PHASES = {
     SupervisorPhase.STARTING_GENERATOR,
     SupervisorPhase.RETURNING_TO_GRID,
@@ -65,17 +51,8 @@ class GeneratorSession:
     stop_requested: bool = False
     fallback_used: bool = False
     external_takeover_observed: bool = False
-    control_mode: SessionControlMode = SessionControlMode.STANDARD
-
-    @property
-    def cycle_owned(self) -> bool:
-        """Compatibility/readability view: session принадлежит Charge Cycling."""
-        return self.control_mode == SessionControlMode.CHARGE_CYCLE
-
-    @property
-    def manual_override(self) -> bool:
-        """Compatibility/readability view для прежнего status contract."""
-        return self.control_mode == SessionControlMode.MANUAL_OVERRIDE
+    cycle_owned: bool = False
+    manual_override: bool = False
 
     @classmethod
     def begin(
@@ -94,57 +71,24 @@ class GeneratorSession:
             "stop_requested": self.stop_requested,
             "fallback_used": self.fallback_used,
             "external_takeover_observed": self.external_takeover_observed,
-            "control_mode": self.control_mode.value,
+            "cycle_owned": self.cycle_owned,
+            "manual_override": self.manual_override,
         }
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "GeneratorSession":
-        reason = SessionReason(str(data["reason"]))
-        stop_requested = _strict_bool(
-            data.get("stop_requested", False), "session.stop_requested"
-        )
-
-        # 0.7.0 persisted two booleans. PR20 keeps one narrow migration path so
-        # an update during an active outage-session remains restart-safe.
-        if data.get("control_mode") is not None:
-            control_mode = SessionControlMode(str(data["control_mode"]))
-        else:
-            cycle_owned = _strict_bool(
-                data.get("cycle_owned", False), "session.cycle_owned"
-            )
-            manual_override = _strict_bool(
-                data.get("manual_override", False), "session.manual_override"
-            )
-            if cycle_owned and manual_override:
-                raise ValueError(
-                    "session не может одновременно принадлежать Charge Cycling "
-                    "и manual override"
-                )
-            if manual_override:
-                control_mode = SessionControlMode.MANUAL_OVERRIDE
-            elif cycle_owned:
-                control_mode = SessionControlMode.CHARGE_CYCLE
-            elif reason == SessionReason.GRID_OUTAGE and stop_requested:
-                control_mode = SessionControlMode.MANUAL_STOP
-            else:
-                control_mode = SessionControlMode.STANDARD
-
-        if reason != SessionReason.GRID_OUTAGE and control_mode != SessionControlMode.STANDARD:
-            raise ValueError(
-                "Специальный session control mode допустим только для GRID_OUTAGE"
-            )
-
         return cls(
-            reason,
+            SessionReason(str(data["reason"])),
             GeneratorSlot(str(data["generator"])),
             _strict_bool(data["grid_was_unavailable"], "session.grid_was_unavailable"),
-            stop_requested,
+            _strict_bool(data.get("stop_requested", False), "session.stop_requested"),
             _strict_bool(data.get("fallback_used", False), "session.fallback_used"),
             _strict_bool(
                 data.get("external_takeover_observed", False),
                 "session.external_takeover_observed",
             ),
-            control_mode,
+            _strict_bool(data.get("cycle_owned", False), "session.cycle_owned"),
+            _strict_bool(data.get("manual_override", False), "session.manual_override"),
         )
 
 
@@ -217,14 +161,14 @@ class EnergySupervisor:
         self._cycle_stop_requested = True
 
     def mark_session_cycle_owned(self) -> bool:
-        """Передать новую automatic outage-session под управление cycling policy."""
+        """Пометить новую automatic outage-session как принадлежащую cycling policy."""
         if (
             self.session is None
             or self.session.reason != SessionReason.GRID_OUTAGE
-            or self.session.control_mode != SessionControlMode.STANDARD
+            or self.session.manual_override
         ):
             return False
-        self.session.control_mode = SessionControlMode.CHARGE_CYCLE
+        self.session.cycle_owned = True
         return True
 
     def request_recovery_reset(self) -> None:
@@ -714,7 +658,8 @@ class EnergySupervisor:
     def _manual_start(self, o: SupervisorObservation) -> None:
         if self.session is not None:
             if self.session.reason == SessionReason.GRID_OUTAGE:
-                self.session.control_mode = SessionControlMode.MANUAL_OVERRIDE
+                self.session.manual_override = True
+                self.session.cycle_owned = False
                 self.session.stop_requested = False
                 if self.phase == SupervisorPhase.RETURNING_TO_UPS:
                     # Двигатель мог уже штатно остановиться. Возобновление
@@ -747,8 +692,7 @@ class EnergySupervisor:
             self._event("info", "Управляемая генераторная сессия не активна.")
             return
         self.session.stop_requested = True
-        if self.session.reason == SessionReason.GRID_OUTAGE:
-            self.session.control_mode = SessionControlMode.MANUAL_STOP
+        self.session.cycle_owned = False
         if o.grid_ready is False:
             self.automatic_start_suppressed_until_grid = True
         self.desired_source = PowerSource.GRID
@@ -758,7 +702,8 @@ class EnergySupervisor:
         if (
             self.session is None
             or self.session.reason != SessionReason.GRID_OUTAGE
-            or self.session.control_mode != SessionControlMode.CHARGE_CYCLE
+            or not self.session.cycle_owned
+            or self.session.manual_override
             or self.phase != SupervisorPhase.ON_GENERATOR
         ):
             return
