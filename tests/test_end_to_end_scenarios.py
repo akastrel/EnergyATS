@@ -223,7 +223,7 @@ async def test_missing_required_generator_state_never_emits_hardware_commands(tm
 
 @pytest.mark.asyncio
 async def test_manual_stop_without_grid_removes_house_load_before_engine_stop(tmp_path):
-    """При ручной остановке без доступной Grid дом сначала должен быть снят с генераторной ветви. Только после этого разрешено переходить к остановке двигателя, даже если результатом для обычной части дома будет UPS-only."""
+    """При ручной остановке без доступной Grid дом сначала снимается с генераторной ветви в UPS_ONLY. Grid contactor не включается поверх отсутствующей сети, а двигатель останавливается только после подтверждённого снятия нагрузки."""
 
     app, fake = make_app(tmp_path)
     fake.states[ENTITIES["grid_ready"]] = "off"
@@ -250,7 +250,8 @@ async def test_manual_stop_without_grid_removes_house_load_before_engine_stop(tm
 
     calls = switch_calls(fake)
     assert calls[0] == ("turn_off", ENTITIES["source_generator"])
-    assert ("turn_on", ENTITIES["grid_power"]) in calls
+    assert ("turn_on", ENTITIES["grid_power"]) not in calls
+    assert app.power_transfer.status().actual_path == PowerPath.ISOLATED
     assert app.power_transfer.status().actual_source == PowerSource.UPS_ONLY
     assert app.generator_controllers[GeneratorSlot.A].phase != GeneratorPhase.IDLE
 

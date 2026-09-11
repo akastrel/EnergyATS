@@ -28,6 +28,7 @@ class ExerciseResult(str, Enum):
     FAILED = "failed"
     DEFERRED = "deferred"
     INTERRUPTED_BY_OUTAGE = "interrupted_by_outage"
+    INTERRUPTED_BY_MANUAL = "interrupted_by_manual"
 
 
 @dataclass(frozen=True)
@@ -308,6 +309,25 @@ class ExerciseScheduler:
                 "warning",
                 f"Пробный запуск {o.generator_names[slot]} передан outage-сессии; "
                 "дальнейшая работа и остановка принадлежат АВР.",
+            ),
+        )
+
+    def handoff_to_manual(
+        self,
+        slot: GeneratorSlot,
+        o: ExerciseObservation,
+    ) -> tuple[SupervisorEvent, ...]:
+        """REQ-BEH-07: передать уже RUNNING Exercise ручной managed-сессии."""
+        attempt = self.active_attempt
+        if attempt is None or attempt.slot != slot:
+            return ()
+
+        self._finish_attempt(o, ExerciseResult.INTERRUPTED_BY_MANUAL, None)
+        return (
+            SupervisorEvent(
+                "info",
+                f"Пробный запуск {o.generator_names[slot]} передан ручной "
+                "managed-сессии; повторный запуск двигателя не требуется.",
             ),
         )
 
