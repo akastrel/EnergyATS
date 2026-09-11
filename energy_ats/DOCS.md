@@ -1,143 +1,83 @@
-# Energy ATS 0.7.0
+# Energy ATS 1.0.3 — руководство пользователя
 
-Energy ATS — Home Assistant App для безопасного управления резервным электроснабжением дома с двумя генераторами.
+Эта страница показывается во вкладке **Documentation** установленного Home Assistant App. Здесь собрана практическая информация для эксплуатации. Нормативное поведение системы задаёт `docs/REQUIREMENTS_RU.md` в repository.
 
-## Базовая ATS-модель
+## 1. Что делает App
 
-Основные инварианты сохраняются:
+EnergyATS управляет резервным электроснабжением дома с двумя генераторами и общей generator bus.
 
-- реальная физическая топология первична;
-- виртуального `Battery path` нет, используется `UPS_ONLY`;
-- два генератора могут штатно быть RUNNING одновременно;
-- persistent `GeneratorBusTracker` ведёт аппаратный FIFO owner;
-- run-context: `OUTAGE_RELATED`, `TEST_RUN`, `OTHER`, `UNKNOWN`;
-- один fallback `PRIMARY -> SECONDARY` без ping-pong;
-- внешний SECONDARY не захватывается автоматически;
-- outage-related генераторы штатно завершаются после безопасного возврата дома на стабильную Grid; для cycle-owned сессий разрешено также завершение по Target SoC через подтверждённый `UPS_ONLY`.
+Основные сценарии:
 
-## Delayed Start и Charge Cycling — 0.7
+- автоматический запуск резерва после потери Grid;
+- ручной переход на generator и обратно;
+- один fallback `PRIMARY -> SECONDARY`;
+- безопасный Grid / Generator transfer с подтверждением каждого шага;
+- работа только от критической UPS-линии (`UPS_ONLY`);
+- UPS Run для длительных отключений;
+- Scheduled Exercise для периодических пробных запусков;
+- Load Manager для двух некритичных групп;
+- Recovery после неоднозначной или незавершённой физической операции.
 
-Обе функции выключены по умолчанию и включаются независимо. Delayed Start после подтверждённого исчезновения сети оставляет критическую линию на UPS до достижения Start SoC, минимального TTG или максимальной задержки. Недостоверные батарейные данные отменяют ожидание и возвращают обычный запуск ATS.
+## 2. Важные особенности физической схемы
 
-Charge Cycling завершает только собственную автоматическую outage-сессию при достижении Target SoC: TPC снимает дом с генератора, подтверждается снятие нагрузки, GC выполняет cooldown/stop, затем начинается новое ожидание на UPS. Ручной запрос отменяет cycling для текущей сессии; внешний генератор по Target SoC не останавливается. Устойчивый возврат сети имеет приоритет, в том числе между циклами.
+- отдельного управляемого Battery contactor нет;
+- MAP самостоятельно переводит UPS-линию на АКБ;
+- A и B могут одновременно быть RUNNING;
+- общей generator bus физически владеет только один generator благодаря аппаратной блокировке;
+- `RUNNING`, `REMOTE`, selector command и feedback — разные сигналы;
+- EnergyATS не угадывает неизвестный bus owner;
+- внешний RUNNING generator не становится managed автоматически.
 
-Настройки, батарейные entities и наблюдаемость описаны в [руководстве Delayed Start / Charge Cycling](../docs/DELAYED_START_RU.md). Сценарии 78–94 из требований проверяются в `tests/test_outage_power_app.py`.
+## 3. Первый запуск
 
-## Load Manager
+Для первого запуска используйте:
 
-0.6 добавляет отдельный Load Manager для двух управляемых некритичных групп:
-
-```text
-G1 = switch.non_critical_loads_first_floor
-G2 = switch.non_critical_loads_basement_floor
+```yaml
+armed: false
 ```
 
-При `load_management_enabled=true`:
+Проверьте в Home Assistant и `sensor.energy_ats_status`:
 
-- после прогрева managed generator и непосредственно перед transfer G1/G2 снимаются с нагрузки;
-- после подключения дома к generator bus группы возвращаются по одной: `G1 -> G2`;
-- перед каждым admission и после каждого изменения выдерживается окно стабильных свежих измерений;
-- рабочий предел определяется по `Nominal Power` фактического `GeneratorBusOwner`;
-- sustained overload снимает нагрузки в обратном порядке: `G2 -> G1`;
-- превышение `Maximum Power` имеет отдельное короткое подтверждение;
-- контроль продолжается всё время питания дома от generator bus, а не только во время startup;
-- meter, G1/G2 и power metadata — soft dependencies: их отказ переводит только Load Manager в `DEGRADED`, не ломая core ATS;
-- после Grid восстанавливаются только группы, которые Load Manager сам ранее отключил.
+- Grid определяется правильно;
+- оба generator names/models корректны;
+- `select.primary_generator` указывает нужный generator;
+- оба RUNNING/REMOTE отображаются правильно;
+- `bus_owner = none`, если оба generator остановлены;
+- нет `RECOVERY_REQUIRED` без причины;
+- optional functions остаются выключенными, если вы ещё не готовы их тестировать.
 
-Load Manager по умолчанию **выключен**.
+Только после этого переходите к:
 
-Начальные параметры:
-
-```text
-load_management_enabled=false
-load_measurement_stabilization_time=10 s
-load_restore_margin_percent=15 %
-nominal_overload_time=20 s
-maximum_overload_confirmation_time=4 s
-load_restore_retry_interval=300 s
+```yaml
+armed: true
 ```
 
-Generator Controller должен публиковать:
+и выполняйте физические commissioning-тесты.
+
+## 4. Основные настройки
 
 ```text
-sensor.generator_a_nominal_power
-sensor.generator_a_maximum_power
-sensor.generator_b_nominal_power
-sensor.generator_b_maximum_power
+armed
+tick_seconds
+log_level
+grid_failure_delay
+grid_restore_stable_time
+transfer_confirmation_timeout
+generator_a_enabled
+generator_b_enabled
 ```
 
-Текущая generator-bus load читается прежде всего из `sensor.generator_power`; `binary_sensor.generator_meter_status` используется для проверки доступности счётчика.
-
-## Scheduled exercise
-
-Независимый плановый пробный запуск каждого генератора после длительного простоя сохраняется без изменений.
-
-Defaults:
+PRIMARY выбирается не по A/B-параметру App, а через:
 
 ```text
-A: enabled=false, interval=30 дней, start=15:00, run=10 мин, grace=7 дней
-B: enabled=false, interval=45 дней, start=15:00, run=10 мин, grace=14 дней
-family_presence_entity=group.family
+select.primary_generator
 ```
 
-Exercise:
+`generator_a_enabled` / `generator_b_enabled` позволяют временно исключить конкретный physical slot из новых managed sessions.
 
-- использует обычный GC;
-- не переводит дом с Grid на generator bus;
-- до forced-date требует подтверждённого отсутствия семьи;
-- после grace игнорирует только presence, но не safety;
-- forced start требует успешно отправленного предупреждения минимум за 60 минут;
-- не запускает второй генератор как fallback;
-- любой достоверный run нужной длительности может стать qualifying run;
-- сохраняет active attempt и ownership между restart;
-- использует существующий bus-context `TEST_RUN`;
-- при реальном outage допускает явный handoff уже работающего generator в outage-session;
-- если handoff не состоялся, остаётся ответственным за остановку.
+## 5. Ручные команды
 
-## Helper-ы
-
-```text
-input_boolean.automatic_generator_transfer
-input_boolean.generator_test_mode
-```
-
-`generator_test_mode` остаётся положительным маркером внешнего TEST_RUN. Scheduled exercise сам помечает собственный запуск как `TEST_RUN` и не требует включения helper-а.
-
-## Конфигурация
-
-Базовые policy/тайминги:
-
-- `armed`;
-- `tick_seconds`;
-- `log_level`;
-- `grid_failure_delay`;
-- `grid_restore_stable_time`;
-- `transfer_confirmation_timeout`;
-- `generator_a_enabled`;
-- `generator_b_enabled`.
-
-Load Manager:
-
-- `load_management_enabled`;
-- `load_measurement_stabilization_time`;
-- `load_restore_margin_percent`;
-- `nominal_overload_time`;
-- `maximum_overload_confirmation_time`;
-- `load_restore_retry_interval`.
-
-Exercise:
-
-- `family_presence_entity`;
-- `generator_a_exercise_enabled`;
-- `generator_a_exercise_interval_days`;
-- `generator_a_exercise_start_time`;
-- `generator_a_exercise_run_minutes`;
-- `generator_a_exercise_presence_grace_days`;
-- аналогичный набор для B.
-
-Имя, модель, паспортные мощности и PRIMARY читаются из Home Assistant / Generator Controller.
-
-## Ручные команды
+Через `hassio.app_stdin` App принимает:
 
 ```text
 start_generator
@@ -145,22 +85,252 @@ stop_generator
 reset
 ```
 
-## Диагностика
+### `start_generator`
 
-App публикует:
+Начинает manual managed session. Если уже идёт подходящий RUNNING Scheduled Exercise и безопасный handoff однозначен, EnergyATS может использовать этот же generator без stop/cold-start.
+
+### `stop_generator`
+
+Безопасно завершает managed session. Сначала снимается нагрузка дома, затем выполняются cooldown и REMOTE OFF.
+
+Если Grid отсутствует, manual stop переводит дом в `UPS_ONLY` и подавляет автоматический повторный запуск. Если Grid path перед этим был изолирован самим EnergyATS, обязанность восстановить его после устойчивого возврата Grid сохраняется даже через restart App.
+
+### `reset`
+
+Запускает Recovery. Это не «стереть ошибку».
+
+Recovery проверяет E-stop, физические feedback и внешний RUNNING. Supervisor задаёт порядок:
+
+```text
+Grid path
+  -> остановка только тех generator, которыми EnergyATS имеет право управлять
+  -> завершение Recovery
+```
+
+Внешний generator автоматически не захватывается.
+
+## 6. UPS Run
+
+UPS Run — стратегия длительного outage. Она состоит из двух независимых функций.
+
+### Delayed Start
+
+```text
+delayed_generator_start_enabled = false
+```
+
+После обычного `grid_failure_delay` EnergyATS может продолжать `UPS_ONLY`, если батарея пригодна для ожидания.
+
+Generator требуется, если выполняется хотя бы одно условие:
+
+```text
+SoC <= generator_start_soc
+OR TTG <= generator_min_ttg_before_start
+OR UPS wait >= generator_max_start_delay
+```
+
+Defaults:
+
+```text
+generator_start_soc = 40 %
+generator_min_ttg_before_start = 60 min
+generator_max_start_delay = 21600 s  # 6 h
+```
+
+### Charge Cycling
+
+```text
+generator_charge_cycle_enabled = false
+```
+
+Для автоматической cycle-owned outage session generator может быть остановлен после:
+
+```text
+SoC >= generator_target_charge_soc
+```
+
+Default:
+
+```text
+generator_target_charge_soc = 80 %
+```
+
+После Target SoC порядок такой:
+
+```text
+Generator supply
+  -> подтверждённый переход дома в UPS_ONLY
+  -> cooldown
+  -> generator OFF
+  -> новый UPS wait
+```
+
+Manual request отменяет automatic Target stop для текущей session. Stable Grid имеет приоритет и возвращает дом сразу по обычному Generator -> Grid сценарию.
+
+### Battery inputs
+
+```text
+sensor.ups_battery_charge_level_soc
+sensor.ups_battery_time_remaining_minutes_ttg
+binary_sensor.ups_running_on_battery
+binary_sensor.ups_ready
+```
+
+Это soft dependencies core ATS. Если UPS Run выключен, они не влияют на обычный ATS.
+
+Если UPS Run включён, stale/invalid telemetry считается основанием прекратить ожидание и использовать обычный безопасный generator start. TTG участвует в решении только при реальном discharge.
+
+## 7. Scheduled Exercise
+
+Scheduled Exercise настраивается отдельно для A и B и по умолчанию выключен.
+
+Defaults:
+
+```text
+A: interval=30 дней, start=15:00, run=10 мин, grace=7 дней
+B: interval=45 дней, start=15:00, run=10 мин, grace=14 дней
+family_presence_entity=group.family
+```
+
+Ordinary Exercise:
+
+- требует Grid и устойчивого Grid path;
+- не переводит дом на generator bus;
+- до forced date требует подтверждённого отсутствия семьи;
+- повторно проверяет presence непосредственно перед REMOTE ON;
+- при `home` или `unknown/unavailable` откладывается как `DEFERRED`;
+- не имеет fallback на второй generator.
+
+После grace presence больше не блокирует forced run, но safety checks сохраняются. Forced run разрешён только после заранее **успешно доставленного** warning.
+
+Если во время RUNNING Exercise появляется manual request или реальный outage, EnergyATS может явно передать этот же generator соответствующей managed session. До подтверждённого handoff Scheduler остаётся ответственным за stop.
+
+## 8. Load Manager
+
+Load Manager выключен по умолчанию:
+
+```text
+load_management_enabled = false
+```
+
+Он управляет только:
+
+```text
+G1 = switch.non_critical_loads_first_floor
+G2 = switch.non_critical_loads_basement_floor
+```
+
+При включении:
+
+1. после готовности generator, но до transfer, отключает доступные G1/G2;
+2. после generator transfer измеряет base load;
+3. возвращает группы по одной `G1 -> G2` при достаточном запасе;
+4. непрерывно контролирует generator power;
+5. при overload снимает `G2 -> G1`;
+6. после Grid возвращает только те группы, которые отключил сам.
+
+Defaults:
+
+```text
+load_measurement_stabilization_time = 10 s
+load_restore_margin_percent = 15 %
+nominal_overload_time = 20 s
+maximum_overload_confirmation_time = 4 s
+load_restore_retry_interval = 300 s
+```
+
+Soft dependencies:
+
+```text
+sensor.generator_a_nominal_power
+sensor.generator_a_maximum_power
+sensor.generator_b_nominal_power
+sensor.generator_b_maximum_power
+binary_sensor.generator_meter_status
+sensor.generator_power
+switch.non_critical_loads_first_floor
+switch.non_critical_loads_basement_floor
+```
+
+Потеря meter или load entity переводит только Load Manager в `DEGRADED`; core ATS продолжает работу. Stale power stream также считается потерей достоверного measurement и требует нового stabilization после восстановления.
+
+## 9. Status sensor
+
+EnergyATS публикует:
 
 ```text
 sensor.energy_ats_status
 ```
 
-Помимо базового source/phase/generator/bus/managed/run-context/PRIMARY/fallback status содержит exercise state и Load Manager: phase/degraded reason, measured power, active limits, G1/G2 state и `shed_by_energy_ats`, overload/retry state.
+Наиболее полезные поля:
 
-Status sensor не используется как управляющий вход.
+```text
+source
+phase
+generator
+generator_model
+generator_slot
+managed_generator
+bus_owner
+primary_generator
+session_reason
+fallback_used
+remaining_seconds
+armed
+```
 
-## Документация
+Дополнительно status содержит:
 
-- `docs/PHYSICAL_POWER_TOPOLOGY_RU.md` — физическая схема;
-- `docs/REQUIREMENTS_RU.md` — нормативное поведение;
-- `docs/ARCHITECTURE_RU.md` — реализация;
-- `docs/ENTITIES_RU.md` — HA contract;
-- `docs/USER_TESTS_RU.md` — физические пользовательские испытания.
+- run-context A/B;
+- Exercise due/history/active/result;
+- UPS Run battery/wait/cycle state;
+- Load Manager phase/reason/power/limits/G1/G2 ownership.
+
+Status — только диагностика. Управляющая логика не использует его как input.
+
+## 10. Logbook и notifications
+
+Физические действия и существенные события публикуются в Logbook. Critical events используют `script.notify_critical`.
+
+Обычные status/Logbook/user publications выполняются best-effort и не должны задерживать control tick из-за сетевого timeout. При reconnect незавершённые background publications отменяются.
+
+Исключение — warning перед forced Scheduled Exercise: Scheduler считает его доставленным только после успешного ответа Home Assistant.
+
+## 11. Restart и reconnect
+
+EnergyATS сохраняет состояние, необходимое для безопасного restart:
+
+- managed session;
+- GeneratorBusTracker;
+- Scheduled Exercise;
+- UPS Run;
+- Load Manager ownership;
+- незавершённые core hardware actions.
+
+Устойчивая однозначная session может быть восстановлена без повторного start/transfer. Restart во время неподтверждённой hardware transaction требует Recovery, если безопасное продолжение нельзя доказать.
+
+Потеря Home Assistant во время transient physical operation также может зафиксировать Recovery вместо слепого продолжения после reconnect.
+
+## 12. Что обязательно проверить физически
+
+Автоматические tests и container smoke не проверяют реальные контакторы, DKG116, генераторы и проводку.
+
+Перед эксплуатацией пройдите:
+
+- M1–M10 из `USER_TESTS_RU.md` для core ATS;
+- C1–C4, если используется UPS Run;
+- C5–C6, если используется Scheduled Exercise;
+- C7 для подтверждения реальной fallback/feedback семантики;
+- E12–E18, если включён Load Manager.
+
+## 13. Полная документация
+
+- [Физическая схема](https://github.com/akastrel/EnergyATS/blob/main/docs/PHYSICAL_POWER_TOPOLOGY_RU.md)
+- [Нормативные требования](https://github.com/akastrel/EnergyATS/blob/main/docs/REQUIREMENTS_RU.md)
+- [Архитектура](https://github.com/akastrel/EnergyATS/blob/main/docs/ARCHITECTURE_RU.md)
+- [HA entities](https://github.com/akastrel/EnergyATS/blob/main/docs/ENTITIES_RU.md)
+- [Установка и обновление](https://github.com/akastrel/EnergyATS/blob/main/docs/INSTALL_RU.md)
+- [Физические испытания](https://github.com/akastrel/EnergyATS/blob/main/docs/USER_TESTS_RU.md)
+- [Changelog](https://github.com/akastrel/EnergyATS/blob/main/energy_ats/CHANGELOG.md)
+
+Отдельного `DELAYED_START_RU.md` больше нет: UPS Run описывается здесь для пользователя, нормативно — в `REQUIREMENTS_RU.md`, HA contract — в `ENTITIES_RU.md`, а commissioning — в `USER_TESTS_RU.md`.
