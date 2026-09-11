@@ -287,7 +287,7 @@ armed: true
 
 оставив UPS Run / Exercise / Load Manager выключенными, если они ещё не проверены.
 
-Сначала пройдите базовые M-сценарии `USER_TESTS_RU.md`.
+Сначала пройдите core commissioning из `USER_TESTS_RU.md`: M1–M7, затем переходные/топологические проверки R1–R4 и электрический acceptance P1. Не повторяйте симметричные A/B software-сценарии только ради перестановки ролей.
 
 ### Шаг 3 — включайте функции отдельно
 
@@ -300,7 +300,7 @@ armed: true
 3. Scheduled Exercise;
 4. Load Manager.
 
-После включения каждой функции выполните её физические тесты.
+После включения каждой функции выполните только её физически значимые commissioning-тесты из `USER_TESTS_RU.md`.
 
 ## 9. Persistent state и обновление старых версий
 
@@ -399,14 +399,23 @@ CI текущей версии выполняет два независимых 
 
 ## 14. Физический commissioning
 
-Минимум для core ATS — M1–M10 из `USER_TESTS_RU.md`.
+`USER_TESTS_RU.md` больше не является каталогом всех software-комбинаций. Он содержит только сценарии, которые доказывают уникальный физический риск реальной установки.
 
-Дополнительно:
+Для базового ATS перед unattended эксплуатацией:
 
-- UPS Run: C1–C4;
-- Scheduled Exercise: C5–C6;
-- fallback/feedback на реальной схеме: C7;
-- Load Manager: E12–E18.
+- core ATS: M1–M7;
+- transition/topology: R1–R4;
+- electrical acceptance: P1;
+- R5 — если нужен полностью подтверждённый на реальной feedback-схеме fallback и есть безопасный способ вызвать отказ PRIMARY;
+- P2 — перед длительной unattended эксплуатацией каждого generator.
+
+Для optional features:
+
+- UPS Run: U1–U2;
+- Scheduled Exercise: X1–X3;
+- Load Manager: L1–L3; L4 optional, если meter можно безопасно сделать недоступным.
+
+Симметричные A/B permutations, двойной отказ ради проверки ping-pong и искусственное отсутствие feedback без безопасного штатного способа остаются automated/HIL tests, а не пользовательским commissioning.
 
 Не обходите аппаратные блокировки и не вмешивайтесь вручную в силовые контакторы ради теста.
 
