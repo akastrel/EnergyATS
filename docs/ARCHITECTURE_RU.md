@@ -1,54 +1,101 @@
-# Energy ATS 0.7.0 — архитектура
+# Energy ATS — архитектура
 
-## 1. Источники истины
+## 1. Назначение документа и источники истины
 
-Архитектура реализует два документа более высокого уровня:
+Этот документ описывает **как программно реализованы требования EnergyATS**. Он не является источником нового поведения и не расширяет разрешённые сценарии.
 
-1. `PHYSICAL_POWER_TOPOLOGY_RU.md` — что физически существует и как ведёт себя железо;
-2. `REQUIREMENTS_RU.md` — как при этой физической схеме должен вести себя EnergyATS.
+Источники истины разделены так:
 
-Этот документ описывает только способ реализации требований. Он не вводит новые физические устройства и не расширяет разрешённые сценарии.
+1. `PHYSICAL_POWER_TOPOLOGY_RU.md` — что физически существует и как ведёт себя электроустановка;
+2. `REQUIREMENTS_RU.md` — как EnergyATS обязан вести себя в наблюдаемой ситуации;
+3. `ARCHITECTURE_RU.md` — какими программными компонентами это поведение реализовано;
+4. `USER_TESTS_RU.md` и автоматические tests — как требования проверяются.
 
-Scheduled Exercise и Load Manager являются policy-функциями и не меняют физическую силовую топологию.
+Если архитектура противоречит `REQUIREMENTS_RU.md`, исправляется архитектура и код, а не требование подгоняется под существующую реализацию.
 
-## 2. Разделение ответственности
+Ключевой принцип этой архитектуры: **верхнеуровневое решение «что EnergyATS должна делать сейчас» принимается в одном месте — `EnergySupervisor`.** Остальные компоненты либо предоставляют ему локальные факты/условия, либо безопасно исполняют уже принятое решение.
 
-EnergyATS — один Home Assistant App и один Python-процесс, но управляющая логика разделена на небольшие независимые части.
+---
+
+## 2. Общая модель управления
+
+EnergyATS — один Home Assistant App и один Python-процесс. Внутри него есть три разных типа компонентов, которые намеренно не смешиваются.
+
+### 2.1. Системный Supervisor
+
+`EnergySupervisor` — единственный компонент, который разрешает пересечения режимов и принимает общесистемные решения:
+
+- manual request;
+- реальный Grid outage;
+- ожидание/charge cycling внутри outage;
+- Scheduled Exercise при конфликте с более важной задачей;
+- fallback;
+- возврат Grid;
+- Recovery.
+
+Именно здесь реализуются системные требования `REQ-BEH-*`.
+
+### 2.2. Специализированные подсистемы
+
+Они знают только свою локальную область и **не являются конкурирующими верхнеуровневыми policy**:
+
+- `ExerciseScheduler` — график, due/grace/warning, history и lifecycle maintenance-run;
+- UPS Run subsystem — можно ли продолжать `UPS_ONLY`, когда пора запускать generator и когда cycle-owned run достиг Target SoC;
+- `LoadManager` — G1/G2, admission, shedding и overload control.
+
+Они передают Supervisor факты, желания или локальные результаты, но не решают конфликт `Manual vs Outage vs Exercise vs Recovery` самостоятельно.
+
+### 2.3. Исполнительные автоматы
+
+- `GeneratorController` — как безопасно запустить/прогреть/остановить конкретный двигатель;
+- `PowerTransferController` — как безопасно переключить Grid / Generator с break-before-make.
+
+Они не решают, **зачем** выполняется операция.
+
+### 2.4. Composition и I/O
+
+`main.py` собирает наблюдения, вызывает компоненты в определённом порядке и механически исполняет полученное решение. Он не содержит отдельного слоя бизнес-арбитража.
+
+Допустимы `if` для технического dispatch, например «если Supervisor выдал handoff directive — вызвать соответствующий метод Scheduler». Недопустимо решать в `main.py`, **когда** outage важнее Exercise, должен ли Target SoC проиграть manual request или можно ли захватить уже работающий generator.
+
+---
+
+## 3. Модули и ответственность
 
 | Модуль | Ответственность |
 |---|---|
-| `domain.py` | Общие термины: A/B, `PowerSource`, `PowerPath`, причина managed-сессии |
-| `generator_bus.py` | FIFO-owner общей генераторной шины и контекст непрерывных RUNNING |
-| `generator_controller.py` | Жизненный цикл одного двигателя: choke, REMOTE, запуск, прогрев, cooldown, stop |
-| `power_transfer.py` | Основные контакторы Grid / Generator и break-before-make |
-| `energy_supervisor.py` | Основная ATS-policy: outage, managed-сессия, fallback, возврат Grid, recovery |
-| `exercise_scheduler.py` | Maintenance-policy: due/grace/warning, qualifying history и ownership scheduled exercise |
-| `load_manager.py` | Policy некритичных G1/G2: pre-transfer LOAD_SHEDDING, admission, continuous overload control и собственный OFF ownership |
-| `outage_power_policy.py` | Решение ждать на UPS, начать automatic outage-session или завершить собственный charge cycle |
-| `ha_adapter.py` | HA states -> observations и разрешённые HA service calls |
-| `main.py` | Composition root: единый tick, arbitration policy-компонентов, journal, status и log |
+| `domain.py` | Общие доменные типы: A/B, `PowerSource`, `PowerPath`, причины managed-session и другие shared values |
+| `generator_bus.py` | Фактический FIFO-owner общей generator bus и контекст непрерывных RUNNING |
+| `generator_controller.py` | Lifecycle одного двигателя: choke, REMOTE, start, warmup, ready, cooldown, stop |
+| `power_transfer.py` | Основные Grid/Generator контакторы и break-before-make |
+| `energy_supervisor.py` | **Единая системная логика:** `REQ-BEH-*`, managed-session, manual/outage, fallback, return, Recovery и разрешение пересечений режимов |
+| `exercise_scheduler.py` | Локальная логика Scheduled Exercise: schedule/history/warning/duration/result и ответственность за собственный auto-run до явного handoff |
+| `outage_power_policy.py` | Текущее implementation-name UPS Run subsystem: оценка battery/TTG/time, ожидание в `UPS_ONLY`, условия начала/окончания charge cycle. Не является вторым Supervisor |
+| `load_manager.py` | G1/G2: pre-transfer shedding, admission, continuous overload control, own-OFF ownership и локальный DEGRADED |
+| `ha_adapter.py` | HA states -> observations, разрешённые service calls, safety checks и публикация runtime outputs |
+| `main.py` | Composition root: snapshot, вызов компонентов, dispatch `SupervisorDecision`, journal/status/log |
 | `state_store.py` | Атомарное сохранение persistent state |
-| `ha_client.py` | WebSocket/REST transport Home Assistant и revision входящих HA states |
+| `ha_client.py` | WebSocket/REST transport Home Assistant и revisions входящих HA states |
 
-Главное правило границ: **policy-компоненты решают, что требуется; GC и TPC решают, как безопасно выполнить уже разрешённую физическую операцию; HA Adapter только связывает доменную модель с реальными entities.**
+Название `outage_power_policy.py` сохраняется на текущем этапе как имя существующего кода. В требованиях и архитектурной модели функциональная область называется **UPS Run**. Переименование модуля имеет смысл делать после стабилизации логики, отдельно от смыслового рефактора.
 
-Exercise Scheduler и Load Manager не управляют генераторными REMOTE/choke или основной парой Grid/Generator контакторов напрямую.
+---
 
-## 3. Доменные термины питания
+## 4. Доменные термины питания
 
-### `PowerSource`
+### 4.1. `PowerSource`
 
-Фактически наблюдаемый режим питания дома:
+Фактически наблюдаемый пользовательский режим питания дома:
 
 - `GRID` — дом питается от основной сети;
-- `GENERATOR` — дом подключён к общей генераторной шине;
-- `UPS_ONLY` — обычная шина дома не получает внешний источник, но UPS-линия может работать от MAP;
+- `GENERATOR` — дом подключён к общей generator bus;
+- `UPS_ONLY` — обычная часть дома не получает Grid/Generator, но критическая UPS-линия может работать от МАП/АКБ;
 - `NO_POWER` — питание отсутствует;
 - `UNKNOWN` — состояние нельзя безопасно определить.
 
-Нет `BATTERY`, `GENERATOR_A` или `GENERATOR_B` как отдельных силовых источников.
+Нет отдельных силовых источников `BATTERY`, `GENERATOR_A` или `GENERATOR_B`: это не соответствует физической топологии.
 
-### `PowerPath`
+### 4.2. `PowerPath`
 
 Подтверждённое положение основной пары контакторов:
 
@@ -57,11 +104,21 @@ Exercise Scheduler и Load Manager не управляют генераторн�
 - `GENERATOR`;
 - `UNKNOWN`.
 
-`PowerPath` и `PowerSource` различаются намеренно. Например, при выбранном Grid path и отсутствующей внешней Grid фактический режим может быть `UPS_ONLY`.
+`PowerPath` и `PowerSource` различаются намеренно. Например, Grid path может быть выбран, но при физически отсутствующей Grid пользовательский source будет `UPS_ONLY`.
 
-## 4. GeneratorBusTracker
+### 4.3. Managed session
 
-`generator_bus.py` — единственное место, где определяется логический owner общей генераторной шины.
+Managed session означает, что EnergyATS явно принял ответственность за текущий generator-run: выбор slot, необходимость продолжать RUNNING, transfer дома, fallback и штатное завершение.
+
+Причина session — как минимум manual start либо Grid outage. UPS Run не создаёт отдельный физический тип session: он определяет стратегию внутри automatic outage-session и может пометить её как cycle-owned.
+
+Scheduled Exercise до явного handoff остаётся отдельным maintenance-run.
+
+---
+
+## 5. GeneratorBusTracker
+
+`generator_bus.py` — единственное место, где определяется логический owner общей generator bus.
 
 Owner:
 
@@ -70,19 +127,19 @@ Owner:
 - `NONE`;
 - `UNKNOWN`.
 
-Tracker использует историю `generator_*_is_running` и повторяет аппаратное FIFO-поведение контакторов:
+Tracker повторяет аппаратное FIFO-поведение контакторов:
 
-- первый появившийся RUNNING получает owner;
-- второй RUNNING не меняет owner;
+- первый появившийся RUNNING получает bus;
+- второй RUNNING не отбирает bus;
 - пока текущий owner продолжает RUNNING, owner не меняется;
-- если owner остановился, а второй генератор продолжает RUNNING, owner автоматически переходит ко второму;
-- если после restart/history gap оба уже RUNNING и порядок нельзя восстановить, owner = `UNKNOWN`.
+- если owner остановился, а второй generator продолжает RUNNING, bus аппаратно переходит ко второму;
+- если после restart/history gap оба уже RUNNING и порядок нельзя доказать, owner = `UNKNOWN`.
 
-Ни TPC, ни HA Adapter, ни Load Manager не пытаются повторно вычислять owner.
+Ни Supervisor, ни TPC, ни Load Manager, ни HA Adapter не вычисляют owner повторно.
 
-### Контекст непрерывного RUNNING
+### 5.1. Контекст непрерывного RUNNING
 
-Для каждого двигателя Tracker хранит:
+Для каждого двигателя Tracker хранит run-context:
 
 - `NONE`;
 - `OUTAGE_RELATED`;
@@ -90,13 +147,15 @@ Tracker использует историю `generator_*_is_running` и повт
 - `OTHER`;
 - `UNKNOWN`.
 
-Это не ownership двигателя. Контекст используется для классификации текущего run и узких policy-правил.
+Это **не ownership двигателя**. Контекст нужен для классификации непрерывного run и узких правил, например остановки outage-related run после стабильного возврата Grid.
 
-Внешний `input_boolean.generator_test_mode` может классифицировать новый внешний RUNNING как `TEST_RUN`. Если helper отсутствует, это трактуется как `OFF`; существующий `unknown/unavailable` остаётся неопределённым. Scheduled Exercise передаёт Tracker-у свой internal test slot напрямую и от helper-а не зависит.
+Внешний `input_boolean.generator_test_mode` может классифицировать новый внешний RUNNING как `TEST_RUN`. Scheduled Exercise передаёт происхождение собственного test run напрямую и не зависит от helper-а.
 
-## 5. GeneratorController
+---
 
-Один экземпляр GC обслуживает один физический генератор и не знает про PRIMARY/SECONDARY или причину, по которой policy требует RUNNING.
+## 6. GeneratorController
+
+Один экземпляр GC обслуживает один физический generator slot и не знает про PRIMARY/SECONDARY либо причину, по которой Supervisor/Scheduler требует RUNNING.
 
 Фазы:
 
@@ -113,24 +172,26 @@ Tracker использует историю `generator_*_is_running` и повт
 - `EXTERNAL_RUNNING`;
 - `FAULT`.
 
-GC выдаёт только:
+GC выдаёт только локальные engine actions:
 
 - `REMOTE_ON`;
 - `REMOTE_OFF`;
 - `CHOKE_TO_COLD_START`;
 - `CHOKE_TO_RUN`.
 
-Ошибка жизненного цикла фиксируется локальным `FAULT`. Решение о fallback, exercise failure либо системном `RECOVERY_REQUIRED` принадлежит policy-слою.
+GC может определить локальный `FAULT`, но не принимает системное решение о fallback, Exercise result или `RECOVERY_REQUIRED`.
 
-`step_authorized_shutdown()` используется только после того, как policy уже разрешила остановить конкретный разгруженный двигатель.
+`step_authorized_shutdown()` используется только после того, как верхний уровень уже разрешил остановить конкретный разгруженный двигатель.
 
-При restart работающего scheduler-owned генератора точная transient phase GC не persist-ится. Поэтому GC консервативно восстанавливает choke: не выдаёт повторный REMOTE START, выдерживает безопасный choke-hold и идемпотентно переводит заслонку в RUN перед продолжением.
+При restart работающего scheduler-owned generator transient GC phase не обязана точно persist-иться. GC восстанавливается консервативно: не выдаёт повторный REMOTE START, безопасно нормализует choke и продолжает lifecycle из наблюдаемого физического состояния.
 
-Имя, модель и паспортные Nominal/Maximum Power приходят из Generator Controller через Home Assistant. Паспортные мощности не являются настройками GC lifecycle и используются Load Manager по фактическому bus owner.
+Имя, модель и Nominal/Maximum Power приходят через Home Assistant из Generator Controller. Power limits не относятся к engine lifecycle; их использует Load Manager по фактическому bus owner.
 
-## 6. PowerTransferController
+---
 
-TPC управляет только основной парой Grid / Generator и ничего не знает о Generator A/B, scheduled exercise или допустимой мощности consumer groups.
+## 7. PowerTransferController
+
+TPC управляет только основной парой Grid / Generator и ничего не знает о Generator A/B, причине session, Scheduled Exercise или допустимой мощности G1/G2.
 
 Фазы:
 
@@ -141,28 +202,42 @@ TPC управляет только основной парой Grid / Generator
 Grid -> Generator:
 
 1. `grid_power -> OFF`;
-2. дождаться снятия Grid control feedback;
+2. подтвердить снятие Grid control feedback;
 3. `use_generator_as_power_source -> ON`;
-4. дождаться generator control feedback.
+4. подтвердить Generator control feedback.
 
-Generator -> Grid симметрично:
+Generator -> Grid:
 
 1. `use_generator_as_power_source -> OFF`;
-2. дождаться снятия generator feedback;
+2. подтвердить снятие Generator feedback;
 3. `grid_power -> ON`;
-4. дождаться Grid feedback.
+4. подтвердить Grid feedback.
 
 Каждый tick выдаёт не более одной новой силовой команды и не начинает следующий шаг до подтверждения предыдущего.
 
-Обычный scheduled exercise TPC не использует: дом остаётся на подтверждённом Grid path.
+Обычный Scheduled Exercise TPC не использует: дом остаётся на Grid.
 
-Load Manager не меняет внутреннюю FSM TPC. `main.py` может временно не передавать TPC желание `GENERATOR`, пока доступные G1/G2 ещё не подтвердили pre-transfer OFF; локальный timeout/отказ Load Manager после этого освобождает core transfer, а не переводит TPC в recovery.
+Load Manager не меняет FSM TPC. Для managed Grid -> Generator transfer он может только сообщить, завершено ли доступное pre-transfer shedding. Это execution gate, а не новое решение о desired source. Возврат Generator -> Grid Load Manager задерживать не имеет права.
 
-## 7. EnergySupervisor
+---
 
-Supervisor содержит основную ATS-policy, которую нельзя вывести из одного локального контроллера.
+## 8. EnergySupervisor — единый центр системных решений
 
-Фазы:
+`energy_supervisor.py` является **единственным владельцем верхнеуровневой поведенческой логики EnergyATS**. Он реализует прежде всего `REQ-BEH-01..18` и связанные core requirements.
+
+Supervisor отвечает на вопросы:
+
+- нужен ли сейчас managed generator-run;
+- какой slot принадлежит текущей managed session;
+- нужен ли один разрешённый fallback;
+- какой source должен иметь дом;
+- когда вернуть Grid;
+- когда automatic charge cycle можно завершить;
+- что делать при manual command во время outage/cycle/Exercise;
+- можно ли принять already-running Exercise generator;
+- когда обычное управление должно уступить Recovery.
+
+### 8.1. Фазы Supervisor
 
 - `WAITING_FOR_DATA`;
 - `NORMAL`;
@@ -174,55 +249,134 @@ Supervisor содержит основную ATS-policy, которую нель
 - `EXTERNAL_RUNNING`;
 - `RECOVERY_REQUIRED`.
 
-Отдельных exercise- или Load Manager-фаз в Supervisor нет.
+Exercise и Load Manager не получают собственные фазы внутри Supervisor: их локальные FSM существуют отдельно.
 
-### Managed-сессия
+### 8.2. Входы Supervisor
 
-Сессия хранит:
+Supervisor получает единый набор наблюдений и локальных фактов:
 
-- причину (`manual_generator_start` / `grid_outage`);
-- текущий managed slot;
-- началась ли сессия при отсутствующей Grid;
-- запрошена ли остановка;
-- использован ли единственный fallback;
-- принадлежит ли сессия cycling (`cycle_owned`) и включён ли ручной override;
-- наблюдался ли внешний аппаратный takeover после отказа managed generator.
+- Grid/source/feedback state;
+- состояния GC и фактический GeneratorBusOwner;
+- manual start/stop requests;
+- persisted managed session;
+- состояние Recovery/E-stop;
+- от Exercise Scheduler: active state, owned slot, desired running и факты, необходимые для handoff/defer;
+- от UPS Run: можно ли ещё ждать в `UPS_ONLY`, требуется ли automatic start, принадлежит ли новая automatic session cycling, достигнут ли Target SoC и нужен ли новый post-cycle wait.
 
-### Fallback
+Scheduler и UPS Run не передают Supervisor готовое общесистемное решение вида «я победил другой режим». Они передают только факты/локальные условия своей области.
 
-При отказе managed PRIMARY допускается один переход на SECONDARY.
+### 8.3. `SupervisorDecision`
 
-- если SECONDARY уже работает внешне, он не присваивается автоматически;
-- если SECONDARY свободен и разрешён, начинается единственный managed fallback;
-- после отказа SECONDARY повторного возврата к PRIMARY нет — требуется recovery;
-- если внешний SECONDARY уже принял bus после отказа managed PRIMARY, а затем пользователь остановил его, Supervisor не запускает его заново как fallback и переходит в recovery.
+Результат одного `step()` — единое решение для текущего tick. Оно должно содержать достаточно информации, чтобы `main.py` мог **механически**:
 
-### Возврат Grid
+- передать TPC желаемый source;
+- передать GC желаемый RUNNING/authorized shutdown;
+- сообщить Exercise Scheduler о defer/handoff/failure/continuation, когда это требуется;
+- сообщить UPS Run о начале нового post-cycle wait;
+- опубликовать события/diagnostics.
 
-После стабильной Grid:
+Конкретная форма dataclass является implementation detail, но business conditions, определяющие эти директивы, находятся в Supervisor.
 
-1. Supervisor требует `GRID` у TPC;
-2. TPC безопасно снимает Generator и возвращает Grid;
-3. только после подтверждённого Grid path разрешается остановка требуемых generator runs;
-4. внешний `TEST_RUN`, `OTHER` и `UNKNOWN` узким outage-cleanup правилом не захватываются.
+### 8.4. Требования `REQ-BEH-*` в коде
 
-Load Manager не имеет права задерживать возврат Grid из-за meter/G1/G2 failure.
+Каждая нетривиальная ветка Supervisor, реализующая системное решение, должна быть помечена requirement ID и кратким человеческим смыслом, например:
 
-### Delayed Start / Charge Cycling
+```python
+# REQ-BEH-04 — Grid outage во время RUNNING Exercise.
+# Не останавливаем пригодный уже работающий generator ради нового cold start;
+# после подтверждённого outage явно принимаем тот же slot в managed session.
+```
 
-`OutagePowerPolicy` не выдаёт аппаратных команд. В едином tick она получает батарейные данные и контекст сессии, затем передаёт Supervisor решение о задержке старта или остановке собственного цикла. Новая automatic outage-session получает `cycle_owned`; manual/external и adopted exercise-сессии автоматически его не получают.
+Комментарий нужен не для пересказа Python, а чтобы по коду было видно **почему** решение корректно.
 
-В `RETURNING_TO_UPS` Supervisor требует изоляцию через TPC и только после её подтверждения снимает желание RUNNING у GC. GC выполняет cooldown/stop. Отказ остановки требует Recovery без fallback. Ручной запрос возобновляет штатный запуск того же двигателя и отменяет cycle ownership.
+### 8.5. Managed session
 
-После подтверждённой остановки `post_cycle_wait` сохраняет обязанность восстановить сетевой ввод при устойчивом возврате Grid. Первое краткое появление сети не обнуляет таймер. Новые циклы проходят тот же Load Manager и TPC, что и обычные outage-сессии.
+Session хранит как минимум:
 
-Policy сохраняет начало ожидания и признак межциклового ожидания; Supervisor сохраняет ownership и override. Батарейные измерения проверяются заново по независимым revision SoC/TTG и HA `last_updated`. Отсутствие обновлений более 300 с считается stale; старый cache после restart не становится свежим измерением.
+- reason (`manual_generator_start` / `grid_outage`);
+- managed slot;
+- `grid_was_unavailable`;
+- `stop_requested`;
+- был ли использован единственный fallback;
+- cycling ownership (`cycle_owned`);
+- manual override;
+- наблюдался ли внешний takeover после отказа managed generator.
 
-## 8. ExerciseScheduler
+Эти поля описывают ответственность и историю session. Они не создают второй decision layer.
 
-`exercise_scheduler.py` — чистый policy-компонент без Home Assistant dependency.
+### 8.6. Fallback
 
-Он хранит отдельно для A/B:
+При отказе managed generator разрешён максимум один переход на другой slot:
+
+- уже внешний SECONDARY автоматически не захватывается;
+- свободный разрешённый SECONDARY может стать единственным managed fallback;
+- после его отказа автоматического A -> B -> A нет;
+- дальнейшее неоднозначное продолжение ведёт в Recovery.
+
+### 8.7. Возврат Grid
+
+После стабильной `grid_restore_stable_time` Supervisor требует `GRID`. TPC выполняет безопасный transfer. Только после подтверждённого снятия дома с generator bus Supervisor/authorized cleanup разрешает требуемые engine stops.
+
+Load Manager не может задержать возврат Grid из-за meter/G1/G2 failure.
+
+### 8.8. Exercise handoff
+
+Grid outage или manual request во время already-running Exercise **не разрешаются Scheduler-ом**. Scheduler сообщает локальные факты, а Supervisor применяет `REQ-BEH-04..08`:
+
+- unstarted Exercise может быть deferred;
+- пригодный RUNNING Exercise-generator может быть явно принят в outage/manual managed session;
+- до успешного handoff Scheduler сохраняет ответственность за stop собственного auto-run;
+- неоднозначный handoff запрещён;
+- Recovery не должен оставлять автоматически запущенный Exercise без ответственного за остановку.
+
+### 8.9. UPS Run / Charge Cycling
+
+UPS Run subsystem не выдаёт engine/TPC commands. Он вычисляет локальные условия battery strategy. Supervisor решает, что они означают для общей session.
+
+В `RETURNING_TO_UPS` Supervisor требует изоляцию через TPC и только после подтверждённого снятия нагрузки разрешает GC cooldown/stop. Отказ stop требует Recovery без fallback.
+
+Manual request во время cycle снимает automatic Target SoC stop через manual override. Устойчивый возврат Grid имеет приоритет над переходом Generator -> UPS_ONLY.
+
+После подтверждённой cycle stop UPS Run начинает новый post-cycle wait. Следующий automatic start снова проходит обычный Supervisor/GC/LoadManager/TPC path.
+
+---
+
+## 9. UPS Run subsystem
+
+В текущем коде функциональность реализуется модулем `outage_power_policy.py`; концептуально это **UPS Run**, а не самостоятельная верхнеуровневая policy.
+
+Он отвечает только на локальные вопросы длительного outage:
+
+- разрешено ли после `grid_failure_delay` продолжать `UPS_ONLY`;
+- достигнут ли Start SoC;
+- достигнут ли минимальный TTG;
+- истёк ли max wait;
+- батарейные данные валидны или нужен fail-safe generator start;
+- достигнут ли Target SoC для cycle-owned session;
+- когда начинается новый post-cycle wait.
+
+Он **не** решает:
+
+- какой generator выбрать;
+- можно ли прервать Exercise;
+- что делать с manual request;
+- выполнять ли fallback;
+- как переключить TPC;
+- можно ли остановить external generator.
+
+Эти решения принадлежат Supervisor.
+
+UPS Run persist-ит только локальное состояние ожидания/цикла, необходимое для restart. Ownership managed generator session и manual override сохраняются Supervisor-ом.
+
+Battery telemetry является soft dependency optimization. Stale/invalid данные отменяют оптимизацию ожидания и приводят к обычному safe generator path согласно requirements, а не к отказу core ATS.
+
+---
+
+## 10. ExerciseScheduler
+
+`exercise_scheduler.py` — самостоятельная локальная FSM maintenance-run без Home Assistant dependency и без права разрешать общесистемные конфликты.
+
+Для A/B независимо хранятся:
 
 - `initial_reference_time`;
 - `last_qualifying_run`;
@@ -230,7 +384,7 @@ Policy сохраняет начало ожидания и признак меж
 - forced-warning state;
 - последний physical exercise result/failure.
 
-Одновременно может существовать максимум один `active_attempt`:
+Одновременно существует максимум один `active_attempt`:
 
 ```text
 STARTING -> RUNNING -> STOPPING
@@ -241,11 +395,12 @@ STARTING -> RUNNING -> STOPPING
 - `SUCCESS`;
 - `FAILED`;
 - `DEFERRED`;
-- `INTERRUPTED_BY_OUTAGE`.
+- `INTERRUPTED_BY_OUTAGE`;
+- при необходимости отдельный результат/причина прерывания manual handoff согласно требованиям.
 
-`DEFERRED` — journal event, а не physical test failure.
+`DEFERRED` — событие планировщика, а не physical test failure.
 
-### Scheduling
+### 10.1. Scheduling
 
 Для каждого slot независимо:
 
@@ -254,241 +409,263 @@ next_due = reference + interval_days
 forced_date = due_date + presence_grace_days
 ```
 
-Scheduler рассматривает start только в собственном ежедневном `exercise_start_time`. Пропущенное окно не запускается позже в произвольное время.
+Start рассматривается только в собственном ежедневном `exercise_start_time`. Пропущенное окно не запускается позже в произвольное время.
 
-До forced-date absence must be explicitly confirmed. На forced-date presence уже не блокирует запуск, но остаются Grid, E-stop, known-state, no-transition и no-conflicting-policy prerequisites.
+До forced-date отсутствие семьи должно быть однозначно подтверждено. Начиная с forced-date presence больше не блокирует start, но safety/system prerequisites продолжают действовать.
 
-Warning запрашивается заранее. Факт delivery подтверждается App и persist-ится вместе с фактическим временем; forced start проверяет lead >= 60 минут.
+Warning запрашивается заранее, а факт успешной delivery persist-ится с временем. Forced start проверяет требуемый lead.
 
-### Qualifying run и ownership
+### 10.2. Qualifying run и ответственность за stop
 
-Scheduler наблюдает RUNNING даже вне собственного active attempt. Непрерывный достоверный run нужной длительности может обновить `last_qualifying_run` независимо от причины запуска.
+Scheduler наблюдает qualifying RUNNING независимо от причины запуска. Достоверный run достаточной длительности может обновить `last_qualifying_run`.
 
-После физического начала собственного auto-run Scheduler сохраняет stop ownership до одного из двух событий:
+После физического старта собственного automatic Exercise Scheduler сохраняет ответственность за stop до одного из событий:
 
 1. подтверждены `RUNNING=OFF` и `REMOTE=OFF`;
-2. Supervisor явно создал outage-session на этом же already-running slot, после чего Scheduler записывает `INTERRUPTED_BY_OUTAGE` и передаёт ownership.
+2. Supervisor явно передал этот уже RUNNING slot в другую managed session.
 
-Простой факт исчезновения Grid сам по себе ownership не снимает. Maintenance exercise не запускает fallback на второй slot.
+Простое изменение Grid state или наличие manual request само по себе ответственность не снимает. Handoff происходит только по явной директиве Supervisor.
 
-## 9. LoadManager
+Maintenance Exercise не создаёт fallback на второй slot.
 
-`load_manager.py` — отдельный policy-компонент управления только G1/G2. Он не зависит от Home Assistant API и получает обычный `LoadManagerObservation`.
+---
 
-Конфигурационный master switch — `load_management_enabled`; default `false`. При выключенной функции Load Manager не создаёт G1/G2 actions, не является transfer gate и не деградирует из-за отсутствующих soft inputs.
+## 11. LoadManager
 
-### 9.1. Управляемые группы и ownership
+`load_manager.py` — отдельный subsystem управления только G1/G2. Он получает `LoadManagerObservation` и не принимает решение о причине работы источника.
+
+Master switch — `load_management_enabled`, default `false`. При выключенной функции Load Manager не создаёт G1/G2 actions, не является transfer gate и не деградирует из-за soft inputs.
+
+### 11.1. Ownership состояния G1/G2
 
 Приоритеты:
 
 ```text
 restore/admission: G1 -> G2
-overload LOAD_SHEDDING: G2 -> G1
+overload shedding: G2 -> G1
 ```
 
-Load Manager хранит `shed_by_energy_ats` отдельно для каждой группы. Право будущего автоматического ON появляется только после подтверждённого собственного OFF. Уже выключенная пользователем группа не захватывается в ownership.
+` shed_by_energy_ats` хранится отдельно для каждой группы. Automatic ON разрешён только если текущий OFF был создан самим Load Manager. Пользовательский OFF не захватывается.
 
-Ручной пользовательский ON ранее shed-группы снимает ownership текущего OFF. Если Load Manager позднее снова отключит эту группу из-за overload, создаётся новое ownership.
+### 11.2. Pre-transfer shedding
 
-### 9.2. Pre-transfer LOAD_SHEDDING
+Для managed Generator transfer preliminary shedding начинается после `READY_FOR_LOAD`, но до фактического TPC transfer.
 
-Для managed generator session предварительное отключение начинается только когда GC выбранного generator достиг `READY_FOR_LOAD`, а основной TPC ещё не начал generator transfer.
+Load Manager по одной обрабатывает доступные ON-группы и возвращает execution-факт `transfer_permitted`. Недоступная/unavailable группа создаёт локальный DEGRADED, но после локального timeout не блокирует core transfer бесконечно.
 
-Load Manager:
+Если Grid вернулась до transfer, Supervisor выбирает Grid path, а собственные OFF восстанавливаются после подтверждённого Grid.
 
-1. по одной отключает доступные ON-группы;
-2. ждёт подтверждения фактического OFF каждой команды;
-3. только после обработки доступных групп возвращает `transfer_permitted=True`.
+### 11.3. Measurement freshness
 
-Показания generator meter для этого шага не нужны. Если consumer switch отсутствует, unavailable или не подтверждает OFF до локального timeout, Load Manager фиксирует `DEGRADED`, но освобождает core transfer.
-
-Если Grid вернулась до generator transfer, отдельного transfer ради завершения Load Manager не происходит; после подтверждённого Grid path собственные OFF восстанавливаются обычным Grid-алгоритмом.
-
-### 9.3. Измерение и freshness
-
-После подключения дома к generator bus power-based действия разрешены только при известных:
+Power-based decisions разрешены только при известных:
 
 - фактическом `GeneratorBusOwner`;
-- корректных `0 < nominal <= maximum` текущего owner;
-- `binary_sensor.generator_meter_status = ON`;
-- числовом `sensor.generator_power`;
-- известных состояниях G1/G2.
+- корректных `0 < nominal <= maximum` owner;
+- `generator_meter_status = ON`;
+- свежем числовом `generator_power`;
+- пригодных состояниях G1/G2.
 
-`ha_client.py` ведёт монотонную revision входящих HA state updates. Adapter передаёт revision `sensor.generator_power` как `power_sample_id`, поэтому policy отличает новый sample от повторного чтения кэша.
+`ha_client.py` ведёт revisions входящих state updates; Adapter передаёт revision power sample, чтобы Load Manager отличал новое измерение от повторного чтения cache.
 
-После изменения нагрузки, restart, восстановления meter либо смены bus owner начинается новое stabilization window. Для решения требуется несколько свежих samples; реализация использует максимум мощности внутри текущего measurement window как консервативный агрегат.
+После изменения нагрузки, restart, meter recovery или bus takeover начинается новое stabilization window. Для решения требуется несколько свежих samples.
 
-### 9.4. Admission
+### 11.4. Admission
 
-После transfer сначала измеряется base load с отключёнными собственными G1/G2. Следующая группа может быть добавлена только если:
+После transfer измеряется base load. Следующая группа может быть добавлена только при restore margin:
 
 ```text
 P <= nominal * (1 - restore_margin_percent / 100)
 ```
 
-После ON конкретной группы начинается новое stabilization window. Если установившаяся нагрузка после собственного admission оказалась выше nominal, эта же группа возвращается OFF сразу, без ожидания общего nominal-overload timer. Следующая группа в таком cycle не добавляется.
+После ON группы выполняется новый stabilization cycle. Если новая установившаяся P > nominal, только что добавленная группа возвращается OFF; следующая в этом cycle не добавляется.
 
-### 9.5. Непрерывный overload control
+### 11.5. Continuous overload control
 
-После startup Load Manager не завершается: пока дом подтверждённо находится на generator bus, каждый новый пригодный sample участвует в контроле.
+Load Manager работает всё время, пока дом подтверждённо на generator bus:
 
-- `P <= nominal` — нормальная область;
-- `nominal < P <= maximum` — запускается `nominal_overload_time`;
-- `P > maximum` — используется отдельный более короткий `maximum_overload_confirmation_time`.
+- `P <= nominal` — normal;
+- `nominal < P <= maximum` — nominal overload timer;
+- `P > maximum` — shorter maximum confirmation.
 
-После подтверждённой перегрузки Load Manager снимает только одну ON-группу, ждёт подтверждения OFF и новое stabilization window, затем заново оценивает P. Если управляемых ON-групп больше нет, создаётся warning/critical event; generator автоматически только по измеренной перегрузке не останавливается.
+После confirmed overload снимается только одна группа, затем выполняется новое measurement. Если доступных groups больше нет, создаётся warning/critical event. Сам по себе overload Load Manager **не является основанием остановить generator**.
 
-Группа, снятая overload/admission, повторно рассматривается не раньше `load_restore_retry_interval` и только после нового restore-margin measurement.
+### 11.6. Soft dependencies и DEGRADED
 
-### 9.6. Soft dependencies и DEGRADED
-
-Meter, power metadata и G1/G2 являются soft dependencies относительно core ATS. Их неисправность:
+Meter, power metadata и G1/G2 являются soft dependencies core ATS. Их failure:
 
 - не блокирует App startup;
 - не создаёт системный `RECOVERY_REQUIRED`;
 - не останавливает generator;
-- не блокирует безопасный возврат Grid.
+- не блокирует возврат Grid.
 
-`DEGRADED` принадлежит только Load Manager. Если meter пропал уже во время устойчивой работы, Load Manager не переключает текущие группы только из-за потери измерителя; power-based действия возобновляются после восстановления данных и нового stabilization window.
+`DEGRADED` принадлежит только Load Manager.
 
-### 9.7. Bus takeover
+### 11.7. Bus takeover
 
-При смене `GeneratorBusOwner` старые limits немедленно перестают использоваться. Новые actions запрещены до корректных limits нового owner и нового stabilization window. UNKNOWN owner переводит только Load Manager в `DEGRADED`.
+При смене `GeneratorBusOwner` старые limits немедленно перестают использоваться. До корректных limits нового owner и нового stabilization новые power-based actions запрещены. UNKNOWN owner деградирует Load Manager, но не Supervisor.
 
-## 10. Arbitration policy-компонентов
+---
 
-`main.py` является composition root, но не создаёт скрытую третью силовую policy.
-
-При обычной Grid Scheduler может добавить только intent конкретного GC (`desired_running=True`); `desired_source` дома не меняется.
-
-Если появляется основная ATS/ручная операция:
-
-- unstarted exercise можно отложить;
-- реальный outage имеет приоритет;
-- already-running подходящий exercise-generator может быть явно принят Supervisor-ом в outage session;
-- до факта такого handoff Scheduler остаётся ответственным за stop;
-- при `RECOVERY_REQUIRED` active exercise переводится в FAILED/STOPPING, а безопасная остановка разрешается через GC safety checks.
-
-Load Manager получает уже принятое Supervisor решение и может временно gate только начало managed `Grid -> Generator` transfer до завершения доступного pre-transfer shedding. Он не меняет `desired_source` Supervisor и не может препятствовать `Generator -> Grid`.
-
-G1/G2 service calls исполняются отдельно от core Generator/TPC pending-action journal: ошибка soft consumer command возвращается Load Manager как локальный failure и не превращается в системный recovery.
-
-## 11. HomeAssistantAdapter
+## 12. HomeAssistantAdapter
 
 Adapter:
 
 - читает обязательные core physical/control entities;
 - читает configurable presence entity;
-- читает soft Load Manager entities и per-generator Nominal/Maximum Power;
+- читает soft battery/UPS, Load Manager и power metadata inputs;
 - формирует observations;
-- исполняет Generator/Transfer actions;
-- отдельно исполняет G1/G2 actions с локализацией ошибок;
-- выполняет аппаратные safety checks Generator/TPC;
+- выполняет разрешённые Generator/TPC actions;
+- отдельно выполняет G1/G2 actions с локализацией ошибок;
+- выполняет аппаратные safety checks;
 - публикует status, Logbook и notifications.
 
-Presence — мягкий Scheduler-input. `unknown/unavailable` presence не делает core ATS «не готовым»; он только не позволяет обычный presence-gated exercise.
+Presence является soft Scheduler input. `unknown/unavailable` presence не блокирует core ATS, а только не позволяет обычный presence-gated Exercise.
 
-Load Manager entities и power metadata намеренно не входят в `missing_required_entities()`. Поэтому их отсутствие не мешает core ATS дождаться собственных обязательных данных и перейти к работе.
+Load Manager и battery optimization inputs намеренно не входят в обязательный core readiness set.
 
-Одновременный RUNNING A и B разрешён.
+Одновременный RUNNING A и B допустим.
 
-## 12. Один tick
+---
 
-Нормальный поток:
+## 13. `main.py` и один tick
+
+`main.py` — **composition root, а не второй Supervisor**.
+
+Нормальный поток одного tick:
 
 ```text
 HA snapshot
   -> GeneratorBusTracker
-  -> GC/TPC observation refresh
-  -> ExerciseScheduler.step()
-  -> OutagePowerPolicy.step(battery + session context)
-  -> EnergySupervisor.step(exercise + outage policy intent)
-  -> explicit Exercise/Supervisor handoff when required
-  -> LoadManager.step(supervisor decision + bus/meter/load observations)
+  -> refresh observations GC/TPC
+  -> ExerciseScheduler.step()      # локальные schedule/lifecycle facts
+  -> UPS Run step()                # локальные battery/wait/cycle facts
+  -> EnergySupervisor.step(...)    # ЕДИНСТВЕННОЕ системное решение
+  -> dispatch Supervisor directives to Exercise / UPS Run
+  -> LoadManager.step(...)         # downstream G1/G2 execution constraints
   -> G1/G2 soft actions
-  -> GC actions
-  -> Load Manager gate для начала Grid -> Generator transfer
+  -> GC actions / authorized shutdown
+  -> Load Manager execution gate for Grid -> Generator
   -> TPC actions
   -> HA Adapter service calls
-  -> status/log
-  -> persistent journal
+  -> status / log / notifications
+  -> persistence
 ```
 
-Policy не должна повторно выполняться из слоя публикации status/log.
+Порядок вызова не даёт `main.py` права интерпретировать конфликт режимов. Все условия вида:
 
-## 13. Persistent journal
+```text
+Exercise + Outage
+Exercise + Manual
+Charge Cycle + Target SoC
+Charge Cycle + Manual
+Grid return + Target SoC
+Recovery + Exercise
+```
 
-Top-level `schema_version = 2` сохраняется совместимым с 0.4/0.5.
+должны быть разрешены в `EnergySupervisor` и трассированы к `REQ-BEH-*`.
 
-Journal содержит:
+`main.py` может только исполнять результат: вызвать handoff/defer method, начать post-cycle wait, передать desired source/desired running и записать события.
+
+Status/log/persistence не имеют права повторно выполнять управляющие FSM либо менять принятое решение.
+
+---
+
+## 14. Persistent state и journal
+
+Persistent state хранит только данные, необходимые для безопасного restart и восстановления ownership/таймеров.
+
+Сохраняются как минимум:
 
 - `app_version`;
-- Supervisor;
+- Supervisor managed session/state;
 - `GeneratorBusTracker`;
 - `ExerciseScheduler`;
 - `LoadManager`;
-- `OutagePowerPolicy`;
+- UPS Run local state;
 - core `pending_actions`.
 
-Старый совместимый journal без `exercise_scheduler` или `load_manager` получает новый пустой state соответствующего policy-компонента.
+На текущем этапе implementation key/module может по-прежнему называться `outage_power_policy`; это не означает отдельный верхнеуровневый policy layer.
 
-Load Manager persist-ит как минимум собственное `shed_by_energy_ats`, phase/reason, pending consumer action и restore retry deadline. Measurement samples намеренно не persist-ятся: после restart power-based решение доказывается заново новым stabilization window.
+Load Manager сохраняет own-OFF (`shed_by_energy_ats`), phase/reason, pending consumer state и restore retry data. Measurement samples не persist-ятся: после restart power-based decision доказывается новым stabilization window.
 
-Повреждение Load Manager payload локализуется: создаётся безопасный пустой Load Manager ownership, а основной Supervisor не переводится в recovery только из-за soft policy state. Это означает консервативное следствие: при потерянном ownership уже-OFF группа не будет автоматически включена.
+Повреждение soft Load Manager/UPS optimization state локализуется и не должно само по себе создавать core Recovery, если requirements позволяют безопасное fail-safe поведение.
 
-Core `pending_actions` сохраняются перед Generator/TPC service call и очищаются только после его завершения; незавершённая core-команда после restart требует recovery. G1/G2 actions не записываются в этот core journal, чтобы ошибка consumer switch не могла заблокировать ATS.
+Core `pending_actions` записываются до Generator/TPC service call и очищаются после завершения. Незавершённая core physical command после restart требует Recovery, если безопасное продолжение нельзя доказать.
 
-## 14. Status sensor
+G1/G2 soft actions не должны превращать consumer switch failure в блокировку core ATS.
 
-`sensor.energy_ats_status` — диагностическая проекция, а не источник policy.
+---
 
-Базовые attributes: source/phase/generator/model/managed/bus owner/run-context/PRIMARY/fallback/session/timers/armed.
+## 15. Status sensor и наблюдаемость
 
-Exercise добавляет отдельно для A/B due/history/forced-warning/active/result state.
+`sensor.energy_ats_status` — диагностическая проекция, а не источник решений.
 
-Load Manager добавляет:
+Core attributes включают source/phase/generator/model/managed/bus owner/run-context/PRIMARY/fallback/session/timers/armed.
 
-- enabled и phase;
+Exercise публикует для A/B due/history/forced-warning/active/result state.
+
+UPS Run публикует как минимум:
+
+- enabled state Delayed Start / Charge Cycling;
+- battery SoC/TTG validity;
+- current UPS wait elapsed/remaining;
+- reason ожидания либо запуска;
+- cycle state / cycle ownership;
+- Target/Start thresholds.
+
+Load Manager публикует:
+
+- enabled/phase;
 - degraded reason;
-- текущую measured generator power;
-- active nominal/maximum текущего owner;
-- state и `shed_by_energy_ats` для G1/G2;
+- measured generator power;
+- active nominal/maximum owner;
+- G1/G2 state и `shed_by_energy_ats`;
 - overload timers;
 - next restore retry;
 - last reason.
 
-Runtime log при включённом Load Manager также показывает его фазу, текущую мощность и активные limits.
+UI/log обязаны использовать реальные generator names, а не A/B там, где речь идёт о пользователе.
 
-## 15. Safety-инварианты реализации
+---
+
+## 16. Safety-инварианты реализации
 
 1. Неизвестное обязательное физическое состояние core ATS блокирует соответствующие управляющие действия.
 2. Команда никогда не считается подтверждением.
-3. TPC соблюдает break-before-make независимо от policy.
-4. Два RUNNING — допустимый физический режим.
-5. Нельзя угадывать bus owner при недостаточной истории.
-6. Внешний RUNNING не становится managed автоматически.
-7. Единственный ATS fallback не превращается в ping-pong.
-8. Генератор не останавливается под подтверждённой нагрузкой дома.
-9. Scheduled exercise не создаёт отдельный силовой путь и не имеет fallback.
-10. Автоматически запущенный exercise-generator не может остаться без policy-owner stop responsibility.
-11. Presence failure не блокирует core ATS.
-12. Выключенный Load Manager полностью исключён из G1/G2 control path.
-13. Load Manager не управляет никакими нагрузками кроме явно заданных G1/G2.
-14. Meter/G1/G2/power-metadata failure не создаёт core `RECOVERY_REQUIRED`.
-15. Load Manager не включает OFF-группу без собственного подтверждённого ownership.
-16. После изменения управляемой нагрузки следующее power-based решение требует нового stabilization window.
-17. Generator limits всегда относятся к фактическому bus owner; старые limits после takeover не используются.
-18. Generator не останавливается автоматически только по измеренному overload Load Manager.
-19. UI/log/persistence не продвигают управляющие FSM.
+3. TPC всегда соблюдает break-before-make независимо от причины transfer.
+4. Два RUNNING generator допустимы.
+5. Bus owner нельзя угадывать при недостаточной истории.
+6. External RUNNING не становится managed автоматически.
+7. Один fallback не превращается в A/B ping-pong.
+8. Generator не останавливается под подтверждённой нагрузкой дома.
+9. Scheduled Exercise не создаёт отдельный силовой путь и не имеет собственного fallback.
+10. Автоматически запущенный Exercise-generator всегда имеет явного ответственного за будущий stop до подтверждённого handoff/stop.
+11. UPS Run не получает права остановки manual/external/adopted run только из-за Target SoC.
+12. Recovery имеет приоритет над обычной автоматизацией и не может быть обойдён локальной subsystem.
+13. Presence failure не блокирует core ATS.
+14. Выключенный Load Manager не участвует в G1/G2 control path.
+15. Load Manager не управляет никакими loads кроме явно заданных G1/G2.
+16. Meter/G1/G2/power metadata failure не создаёт core `RECOVERY_REQUIRED` сам по себе.
+17. Load Manager не включает OFF-group без собственного подтверждённого ownership.
+18. После изменения managed load следующее power-based решение требует нового stabilization window.
+19. Generator power limits всегда относятся к фактическому bus owner.
+20. Generator не останавливается автоматически только по overload Load Manager.
+21. `main.py` не принимает бизнес-решения о пересечении режимов.
+22. Каждая нетривиальная системная decision branch Supervisor трассируется к конкретному requirement.
+23. UI/log/persistence не продвигают управляющие FSM.
 
-## 16. Проверка архитектуры
+---
 
-Изменение считается законченным только если одновременно согласованы:
+## 17. Проверка архитектуры
+
+Изменение считается законченным, когда согласованы:
 
 ```text
 PHYSICAL_POWER_TOPOLOGY_RU.md
         ↓
 REQUIREMENTS_RU.md
+        ↓
+ARCHITECTURE_RU.md
         ↓
 production code
         ↓
@@ -497,6 +674,12 @@ unit / integration / end-to-end tests
 commissioning на реальном оборудовании
 ```
 
-Если меняется только policy, физическая схема не переписывается.
+Для системных пересечений обязательна трассировка:
 
-Зелёный CI проверяет программную модель, но не заменяет физическую проверку контакторов, G1/G2, generator-bus meter, генераторов, DKG116 и MAP.
+```text
+REQ-BEH-* -> EnergySupervisor branch -> TC-BEH-* / integration scenario
+```
+
+Для локальных feature requirements аналогично используются соответствующие `REQ-*` и `TC-*` families.
+
+Зелёный CI проверяет программную модель, но не заменяет физические испытания контакторов, generator bus, G1/G2, meter, генераторов, DKG116 и MAP.
