@@ -6,20 +6,52 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+from pathlib import Path
+
 import pytest
 
-from app_test_support import (
-    PhysicalFakeClient,
-    accelerate_generators,
-    make_app,
-    set_grid_outage,
-    switch_calls,
-)
 from domain import GeneratorSlot
 from energy_supervisor import SupervisorPhase
 from ha_adapter import ENTITIES
 from load_manager import LoadGroup, LoadManagerPhase
-from main import EnergySupervisorApp
+from main import DEFAULT_OPTIONS, EnergySupervisorApp
+from test_app_adapter import PhysicalFakeClient, attach_fake_client, populated_states
+
+
+def make_app(tmp_path: Path, **overrides) -> tuple[EnergySupervisorApp, PhysicalFakeClient]:
+    journal = tmp_path / "state.json"
+    app = EnergySupervisorApp(
+        {
+            **DEFAULT_OPTIONS,
+            "armed": True,
+            "state_file": str(journal),
+            **overrides,
+        },
+        token="test",
+    )
+    fake = PhysicalFakeClient(journal)
+    fake.states = populated_states()
+    fake.states[ENTITIES["ambient_temperature_external"]] = "20"
+    fake.states[ENTITIES["test_mode"]] = "off"
+    attach_fake_client(app, fake)
+    return app, fake
+
+
+def accelerate_generators(app: EnergySupervisorApp) -> None:
+    for controller in app.generator_controllers.values():
+        controller.profile = replace(
+            controller.profile,
+            choke_move_seconds=0.0,
+            cold_start_choke_hold_seconds=0.0,
+            start_timeout_seconds=2.0,
+            stop_timeout_seconds=2.0,
+            cooldown_seconds=0.0,
+            warmup_warm_seconds=0.0,
+            warmup_cool_seconds=0.0,
+            warmup_cold_seconds=0.0,
+            warmup_very_cold_seconds=0.0,
+        )
 
 
 def add_load_entities(
@@ -44,13 +76,27 @@ def add_load_entities(
     )
 
 
+def set_outage(fake: PhysicalFakeClient) -> None:
+    fake.states[ENTITIES["automatic_transfer"]] = "on"
+    fake.states[ENTITIES["grid_ready"]] = "off"
+    fake.states[ENTITIES["house_grid"]] = "off"
+
+
+def switch_calls(fake: PhysicalFakeClient) -> list[tuple[str, str]]:
+    return [
+        (service, data.get("entity_id"))
+        for domain, service, data in fake.calls
+        if domain == "switch"
+    ]
+
+
 async def drive_managed_a_to_house(
     app: EnergySupervisorApp,
     fake: PhysicalFakeClient,
     *,
     start: float = 0.0,
 ) -> float:
-    set_grid_outage(fake)
+    set_outage(fake)
     now = start
     for _ in range(50):
         await app._tick(now)
