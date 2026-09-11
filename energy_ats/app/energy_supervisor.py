@@ -716,14 +716,14 @@ class EnergySupervisor:
             self._finish_session()
 
     def _returning_to_ups(self, o: SupervisorObservation) -> None:
-        """REQ-BEH-11: сначала снять дом с generator bus, затем остановить engine."""
+        """Снять дом с generator bus, затем штатно остановить managed engine."""
         assert self.session is not None
         slot = self.session.generator
         self.desired_source = PowerSource.UPS_ONLY
         managed = o.generators[slot]
         if _generator_failed(managed):
             self._require_recovery(
-                managed.fault or "Ошибка генератора при завершении charge cycle."
+                managed.fault or "Ошибка генератора при завершении работы на UPS."
             )
             return
 
@@ -733,10 +733,17 @@ class EnergySupervisor:
 
         self.desired_generators[slot] = False
         if managed.running is False and managed.remote_on is False:
-            self._event(
-                "info",
-                "Цикл подзаряда завершён; дом остаётся на UPS до следующей необходимости запуска.",
-            )
+            if self.session.cycle_owned:
+                message = (
+                    "Цикл подзаряда завершён; дом остаётся на UPS до следующей "
+                    "необходимости запуска."
+                )
+            else:
+                message = (
+                    "Управляемая генераторная сессия остановлена по команде пользователя; "
+                    "до восстановления Grid дом остаётся на UPS."
+                )
+            self._event("info", message)
             self._finish_session(preserve_grid_failure_timer=True)
 
     def _cancel_return(self, o: SupervisorObservation) -> None:
@@ -858,9 +865,17 @@ class EnergySupervisor:
             return
         self.session.stop_requested = True
         self.session.cycle_owned = False
+
+        # REQ-BEH-14 — при продолжающемся outage пользователь явно просит
+        # отказаться от generator supply. Поэтому возвращаться к отсутствующей
+        # Grid нельзя: сначала изолируем generator bus, затем останавливаем engine
+        # и подавляем automatic restart до Grid либо нового manual start.
         if o.grid_ready is False:
-            # REQ-BEH-14 — explicit stop suppresses automatic restart until Grid.
             self.automatic_start_suppressed_until_grid = True
+            self.desired_source = PowerSource.UPS_ONLY
+            self.phase = SupervisorPhase.RETURNING_TO_UPS
+            return
+
         self.desired_source = PowerSource.GRID
         self.phase = SupervisorPhase.RETURNING_TO_GRID
 
