@@ -60,7 +60,7 @@ from outage_power_policy import (
 from power_transfer import PowerTransferController, TransferAction, TransferPhase
 from state_store import StateStore
 
-APP_VERSION = "0.7.0"
+APP_VERSION = "1.0.0"
 STATE_SCHEMA_VERSION = 2
 
 DEFAULT_OPTIONS: dict[str, Any] = {
