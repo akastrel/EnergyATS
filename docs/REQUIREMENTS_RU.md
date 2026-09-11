@@ -1535,3 +1535,241 @@ REQUIREMENTS_RU.md
 ```
 
 Если меняется только политика автоматики, физическая схема не переписывается.
+
+---
+
+## 25. Delayed Generator Start и Long Outage Charge Cycling
+
+### 25.1. Цель и область ответственности
+
+Delayed Generator Start предназначен для того, чтобы при физическом исчезновении Grid не запускать генератор немедленно, если критическая UPS-линия уже автоматически продолжает работать от МАП/АКБ и батарея имеет достаточный запас.
+
+Long Outage Charge Cycling предназначен для многосуточного/многосуточного отключения: генератор периодически запускается для подзаряда батареи, после чего система снова может некоторое время работать только от UPS.
+
+Эта policy отвечает только на вопрос **нужен ли генератор сейчас**. Она не дублирует Generator Controller, TPC, Load Manager или fallback-логику.
+
+### REQ-DELAY-01. Delayed Start выключен по умолчанию
+
+```text
+delayed_generator_start_enabled = false
+```
+
+При `false` после `grid_failure_delay` используется существующий обычный автоматический сценарий запуска генератора.
+
+### REQ-DELAY-02. Delayed Start не управляет UPS
+
+Фраза «UPS поддерживает критическую линию» не означает отдельную команду EnergyATS и не требует нового UPS-contactor.
+
+МАП уже физически выполняет это автоматически при исчезновении внешнего AC. EnergyATS только наблюдает батарейные данные и описывает такое состояние как `UPS_ONLY`.
+
+Для Delayed Start не требуется отдельная команда `connect_battery` или иной исполнительный механизм UPS.
+
+### REQ-DELAY-03. Когда разрешено ожидать на UPS
+
+После окончания `grid_failure_delay` EnergyATS может продолжить `UPS_ONLY` без запуска generator, если одновременно:
+
+- `delayed_generator_start_enabled = true`;
+- физическая Grid по-прежнему отсутствует;
+- батарейные данные доступны и пригодны для принятия решения;
+- отсутствует критическое состояние батареи;
+- пользователь явно не запросил питание дома от generator.
+
+Сам факт `UPS_ONLY` является наблюдаемым состоянием, а не отдельным силовым режимом, создаваемым EnergyATS.
+
+### REQ-DELAY-04. Условия автоматического запуска generator
+
+Во время ожидания на UPS generator требуется запустить, если выполнено хотя бы одно условие:
+
+```text
+battery_soc <= generator_start_soc
+```
+
+или
+
+```text
+battery_ttg <= generator_min_ttg_before_start
+```
+
+или
+
+```text
+time_in_current_ups_only_wait >= generator_max_start_delay
+```
+
+Условия объединяются по OR.
+
+`generator_max_start_delay` отсчитывается от начала текущего периода ожидания в `UPS_ONLY`: для первого цикла — после подтверждённого outage и `grid_failure_delay`, для последующих циклов — после завершения предыдущего charge cycle и возврата в `UPS_ONLY`.
+
+### REQ-DELAY-05. Fail-safe при недостоверных батарейных данных
+
+Delayed Start является оптимизацией расхода топлива, а не обязательной зависимостью core ATS.
+
+Если необходимые для решения SoC/TTG/critical-state данные отсутствуют, `unknown/unavailable`, stale либо явно некорректны, EnergyATS не должен бесконечно продолжать ожидание.
+
+В таком случае Delayed Start прекращается и запускается обычный managed generator session.
+
+### REQ-DELAY-06. Critical battery отменяет задержку
+
+Если доступный батарейный сигнал означает критический разряд, дальнейшее ожидание запрещено независимо от configured SoC/TTG thresholds и `generator_max_start_delay`.
+
+EnergyATS должен немедленно перейти к обычному managed generator start, если это не запрещено более приоритетным safety-state, например Emergency Stop.
+
+### REQ-DELAY-07. TTG учитывается только при реальном разряде
+
+TTG используется как условие запуска только когда батарея действительно разряжается и значение TTG имеет числовой конечный смысл.
+
+При зарядке, поддержании/float, бесконечном TTG, `unknown/unavailable` или ином неосмысленном значении TTG это конкретное условие не участвует в решении. При этом остальные условия, включая SoC, critical-state и fail-safe validity, продолжают действовать.
+
+### REQ-DELAY-08. Возврат Grid во время ожидания
+
+Если Grid устойчиво восстановилась до запуска generator, generator не запускается только ради завершения Delayed Start-сценария.
+
+Система завершает ожидание и возвращается к штатному Grid state.
+
+### REQ-DELAY-09. Ручной запрос питания от generator имеет приоритет
+
+Если во время `UPS_ONLY` пользователь через EnergyATS явно запросил переход на резервное питание, Delayed Start немедленно прекращает ожидание.
+
+Создаётся обычная ручная managed generator session; дальнейшие запуск, Load Management и transfer выполняются существующими механизмами.
+
+Ручной запрос означает, что пользователь хочет получить питание обычной части дома от generator сейчас, поэтому автоматическая задержка не должна ему препятствовать.
+
+### 25.2. Long Outage Charge Cycling
+
+### REQ-CYCLE-01. Charge Cycling включается отдельно
+
+```text
+generator_charge_cycle_enabled = false
+```
+
+Delayed Start и Charge Cycling являются независимыми разрешателями.
+
+Можно использовать Delayed Start только для первого запуска, не разрешая последующую автоматическую остановку generator при продолжающемся outage. Можно также разрешить cycling при немедленном первом запуске generator.
+
+### REQ-CYCLE-02. Порог окончания зарядного цикла
+
+При включённом Charge Cycling задаётся:
+
+```text
+generator_target_charge_soc
+```
+
+Когда батарея достигает этого уровня при продолжающемся outage, автоматически запущенный charge-cycle generator может быть остановлен при выполнении остальных требований этого раздела.
+
+### REQ-CYCLE-03. Соотношение Start SoC и Target SoC
+
+Конфигурация должна удовлетворять:
+
+```text
+0 < generator_start_soc < generator_target_charge_soc <= 100
+```
+
+Некорректная конфигурация отключает именно автоматический cycling/delayed policy и не должна делать core ATS неработоспособным.
+
+### REQ-CYCLE-04. Автоматическая остановка разрешена только для cycle-owned generator session
+
+Достижение `generator_target_charge_soc` само по себе не даёт EnergyATS права остановить любой работающий generator.
+
+Автоматическая остановка по Target SoC разрешена только если текущая managed generator session была создана Delayed Start / Charge Cycling policy либо эта policy явно и однозначно сохранила ownership своей ранее созданной session.
+
+Если generator был:
+
+- запущен пользователем вручную через EnergyATS для питания обычных потребителей дома;
+- запущен локально/внешней автоматикой и остаётся external;
+- запущен по иной policy-причине, не передавшей ownership Charge Cycling,
+
+то достижение Target SoC **не является основанием автоматически остановить этот generator или снять дом с generator supply**.
+
+### REQ-CYCLE-05. Пользовательский manual override при продолжающемся outage
+
+Если пользователь во время автоматического ожидания или charge cycle явно запросил обычную ручную generator session, пользовательская причина имеет приоритет над автоматическим cycling.
+
+После такого запроса Charge Cycling не должен автоматически завершать эту manual session по достижении Target SoC. Generator продолжает работать согласно правилам manual managed session до явного пользовательского завершения либо до другого уже существующего разрешённого основания, например устойчивого возврата Grid.
+
+### REQ-CYCLE-06. Завершение автоматического charge cycle
+
+При продолжающемся outage автоматически созданная cycle-owned generator session может быть завершена, когда одновременно:
+
+- `generator_charge_cycle_enabled = true`;
+- батарея достигла `generator_target_charge_soc`;
+- session остаётся owned Charge Cycling policy;
+- отсутствует manual override;
+- нет другой активной policy-причины, требующей продолжения generator supply;
+- переход обратно в `UPS_ONLY` может быть выполнен штатными существующими TPC/GC механизмами.
+
+Тогда EnergyATS:
+
+1. снимает обычную часть дома с generator supply штатным TPC-переходом;
+2. подтверждает снятие нагрузки с generator;
+3. выполняет обычный GC cooldown/stop;
+4. возвращается к ожиданию в `UPS_ONLY`.
+
+### REQ-CYCLE-07. Следующий цикл использует те же условия запуска
+
+После автоматического завершения charge cycle при всё ещё отсутствующей Grid система снова находится в `UPS_ONLY`.
+
+Следующий automatic generator start выполняется по тем же условиям REQ-DELAY-04: Start SoC, TTG либо максимальное время ожидания.
+
+### REQ-CYCLE-08. Grid имеет приоритет над charge cycle
+
+Если Grid устойчиво восстановилась во время generator charge cycle, Target SoC ждать не требуется.
+
+Используется обычный существующий возврат дома на Grid и штатное завершение outage-related managed generator session.
+
+### REQ-CYCLE-09. External/manual generator не захватывается cycling policy
+
+Сам факт подходящего SoC/TTG, отсутствия Grid или питания дома от generator bus не превращает внешний либо manual generator run в cycle-owned.
+
+Charge Cycling не должен угадывать ownership и не получает право остановки такого двигателя. Отдельное существующее правило остановки outage-related внешнего generator после устойчивого восстановления Grid остаётся без изменений.
+
+### 25.3. Начальная конфигурация
+
+```text
+delayed_generator_start_enabled = false
+generator_charge_cycle_enabled = false
+generator_start_soc = 40 %
+generator_target_charge_soc = 80 %
+generator_min_ttg_before_start = 60 min
+generator_max_start_delay = 6 h
+```
+
+### 25.4. Наблюдаемость
+
+Пользователь должен иметь возможность понять, почему generator сейчас не запущен либо почему принято решение его запустить/остановить.
+
+Как минимум должны быть наблюдаемы:
+
+```text
+delayed_start_enabled
+charge_cycle_enabled
+battery_soc
+battery_ttg_minutes
+generator_start_soc
+generator_target_charge_soc
+current_wait_elapsed / remaining
+delayed_start_reason
+charge_cycle_state
+cycle_session_owned_by_energy_ats
+```
+
+Техническая форма status attributes определяется реализацией.
+
+### 25.5. Минимальные сценарные тесты
+
+78. Grid lost, батарея имеет достаточный запас -> после `grid_failure_delay` система остаётся в `UPS_ONLY`, generator не запускается;
+79. SoC достигает `generator_start_soc` -> начинается обычный managed generator start;
+80. TTG достигает `generator_min_ttg_before_start` раньше SoC -> generator запускается;
+81. достигается `generator_max_start_delay` при достаточном SoC/TTG -> generator запускается;
+82. необходимые батарейные данные становятся недостоверными -> ожидание прекращается fail-safe запуском generator;
+83. critical battery state -> задержка немедленно отменяется;
+84. Grid восстанавливается во время ожидания -> generator не запускается;
+85. пользователь вручную запрашивает резервное питание во время ожидания -> generator запускается без дальнейшей delayed-паузы;
+86. Charge Cycling включён, cycle-owned session достигает Target SoC -> дом возвращается в `UPS_ONLY`, generator штатно останавливается;
+87. после автоматической остановки батарея снова достигает Start SoC/TTG/max-delay -> начинается новый cycle;
+88. Grid возвращается во время charge cycle -> обычный возврат Grid без ожидания Target SoC;
+89. Charge Cycling выключен -> после первого автоматического запуска generator не останавливается по Target SoC;
+90. пользователь вручную запускает/запрашивает generator во время outage -> достижение Target SoC не останавливает manual session;
+91. внешний generator работает во время outage -> Charge Cycling не захватывает его ownership и не останавливает по Target SoC;
+92. restart во время `UPS_ONLY` ожидания не должен создавать немедленный generator start без оснований и не должен терять уже истёкшее время ожидания;
+93. restart во время cycle-owned generator session сохраняет ownership, достаточный для безопасного завершения cycle после Target SoC;
+94. restart не превращает manual/external run в cycle-owned.
