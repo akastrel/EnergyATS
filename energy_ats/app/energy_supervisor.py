@@ -34,6 +34,17 @@ class ExerciseDirective(str, Enum):
     FAIL_ACTIVE = "fail_active"
 
 
+class RecoveryDirective(str, Enum):
+    """Следующий механический шаг recovery, выбранный EnergySupervisor."""
+
+    NONE = "none"
+    FINISH_TICK = "finish_tick"
+    BEGIN_GRID_RECOVERY = "begin_grid_recovery"
+    DRIVE_GRID_RECOVERY = "drive_grid_recovery"
+    STOP_GENERATORS = "stop_generators"
+    COMPLETE = "complete"
+
+
 _TRANSIENT_PHASES = {
     SupervisorPhase.STARTING_GENERATOR,
     SupervisorPhase.RETURNING_TO_GRID,
@@ -139,6 +150,14 @@ class SupervisorDecision:
     begin_post_cycle_wait: bool = False
 
 
+@dataclass(frozen=True)
+class RecoveryDecision:
+    """System-level recovery decision; main.py только исполняет directive."""
+
+    directive: RecoveryDirective
+    stop_generators: frozenset[GeneratorSlot] = frozenset()
+
+
 class EnergySupervisor:
     """Единственный центр верхнеуровневых решений EnergyATS.
 
@@ -212,6 +231,7 @@ class EnergySupervisor:
         return self._manual_start_requested
 
     def consume_recovery_reset_request(self) -> bool:
+        """Compatibility helper; normal App uses recovery_step()."""
         requested = self._recovery_reset_requested
         self._recovery_reset_requested = False
         return requested
@@ -219,6 +239,88 @@ class EnergySupervisor:
     @property
     def recovery_reset_in_progress(self) -> bool:
         return self._recovery_reset_active
+
+    def recovery_step(
+        self,
+        o: SupervisorObservation,
+        *,
+        transfer_blocker: str | None,
+        exercise_owned_slot: GeneratorSlot | None,
+        grid_path_confirmed: bool,
+    ) -> RecoveryDecision:
+        """Выбрать следующий system-level шаг Recovery.
+
+        TPC сообщает только локальный blocker/факт Grid path; Scheduler сообщает
+        только owned slot. Право начать reset, допустимые stop owners и порядок
+        `Grid path -> owned generator stop -> complete` принадлежат Supervisor.
+        """
+        requested = self._recovery_reset_requested
+        self._recovery_reset_requested = False
+        needs_reset = (
+            self.phase == SupervisorPhase.RECOVERY_REQUIRED
+            or o.power.recovery_required
+            or any(_generator_failed(status) for status in o.generators.values())
+        )
+
+        if not self._recovery_reset_active:
+            if not requested:
+                return RecoveryDecision(RecoveryDirective.NONE)
+            if not needs_reset:
+                self.report_recovery_reset_not_needed()
+                return RecoveryDecision(RecoveryDirective.FINISH_TICK)
+
+            blocker = self._recovery_blocker(
+                o,
+                transfer_blocker=transfer_blocker,
+                exercise_owned_slot=exercise_owned_slot,
+            )
+            if blocker is not None:
+                self.reject_recovery_reset(f"Сброс отклонён: {blocker}")
+                return RecoveryDecision(RecoveryDirective.FINISH_TICK)
+
+            self.begin_recovery_reset()
+            if grid_path_confirmed:
+                return self._recovery_after_grid(o, exercise_owned_slot)
+            return RecoveryDecision(RecoveryDirective.BEGIN_GRID_RECOVERY)
+
+        blocker = self._recovery_blocker(
+            o,
+            transfer_blocker=transfer_blocker,
+            exercise_owned_slot=exercise_owned_slot,
+        )
+        if blocker is not None:
+            self.fail_recovery_reset(blocker)
+            return RecoveryDecision(RecoveryDirective.FINISH_TICK)
+
+        if not grid_path_confirmed:
+            return RecoveryDecision(RecoveryDirective.DRIVE_GRID_RECOVERY)
+        return self._recovery_after_grid(o, exercise_owned_slot)
+
+    def _recovery_after_grid(
+        self,
+        o: SupervisorObservation,
+        exercise_owned_slot: GeneratorSlot | None,
+    ) -> RecoveryDecision:
+        stop_slots = {
+            slot
+            for slot in (
+                self.session.generator if self.session is not None else None,
+                exercise_owned_slot,
+            )
+            if slot is not None
+        }
+        active_owned = frozenset(
+            slot
+            for slot in stop_slots
+            if o.generators[slot].running is not False
+            or o.generators[slot].remote_on is not False
+        )
+        if active_owned:
+            return RecoveryDecision(
+                RecoveryDirective.STOP_GENERATORS,
+                active_owned,
+            )
+        return RecoveryDecision(RecoveryDirective.COMPLETE)
 
     def begin_recovery_reset(self) -> None:
         self._recovery_reset_active = True
@@ -1152,6 +1254,35 @@ class EnergySupervisor:
             for slot, status in o.generators.items()
             if status.running is True or status.remote_on is True
         )
+
+    def _recovery_blocker(
+        self,
+        o: SupervisorObservation,
+        *,
+        transfer_blocker: str | None,
+        exercise_owned_slot: GeneratorSlot | None,
+    ) -> str | None:
+        if o.emergency_stop is not False:
+            return "сначала снимите Generators Emergency Stop."
+        if transfer_blocker is not None:
+            return transfer_blocker
+        if any(
+            status.running is None or status.remote_on is None
+            for status in o.generators.values()
+        ):
+            return "неизвестны обязательные состояния генераторов."
+
+        managed = self.session.generator if self.session is not None else None
+        external = [
+            slot
+            for slot, status in o.generators.items()
+            if (status.running is True or status.remote_on is True)
+            and slot not in {managed, exercise_owned_slot}
+        ]
+        if external:
+            names = ", ".join(o.generators[slot].display_name for slot in external)
+            return f"обнаружен внешний запуск ({names}); recovery им не управляет."
+        return None
 
     @staticmethod
     def _grid_path(o: SupervisorObservation) -> bool:

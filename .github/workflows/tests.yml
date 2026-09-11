@@ -21,3 +21,25 @@ jobs:
 
       - name: Run tests
         run: pytest -q
+
+  addon-container-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build add-on container
+        run: >-
+          docker build
+          --build-arg BUILD_VERSION=ci
+          --build-arg BUILD_ARCH=amd64
+          -t energy-ats:ci
+          energy_ats
+
+      - name: Run production HA transport and command smoke
+        run: >-
+          docker run --rm
+          --entrypoint python3
+          -v "$PWD/tests/container_smoke.py:/smoke.py:ro"
+          energy-ats:ci
+          /smoke.py

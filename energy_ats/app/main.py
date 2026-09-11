@@ -25,6 +25,7 @@ from domain import (
 from energy_supervisor import (
     EnergySupervisor,
     ExerciseDirective,
+    RecoveryDirective,
     SupervisorConfig,
     SupervisorDecision,
     SupervisorObservation,
@@ -60,7 +61,7 @@ from ups_run import (
 from power_transfer import PowerTransferController, TransferAction, TransferPhase
 from state_store import StateStore
 
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 STATE_SCHEMA_VERSION = 3
 
 DEFAULT_OPTIONS: dict[str, Any] = {
@@ -253,6 +254,7 @@ class EnergySupervisorApp:
                     )
             finally:
                 self.commands_ready = False
+                await self.adapter.cancel_background_publications()
                 await self.client.close()
             await self._stop_requested_within(reconnect_delay)
 
@@ -273,10 +275,7 @@ class EnergySupervisorApp:
         self._sync_generator_configuration(hardware)
         self._refresh_component_views(now, hardware)
 
-        if self.supervisor.consume_recovery_reset_request():
-            self._start_recovery_reset(hardware)
-        if self.supervisor.recovery_reset_in_progress:
-            await self._tick_recovery_reset(now, hardware)
+        if await self._tick_recovery(now, hardware):
             return
 
         observation = self._supervisor_observation(hardware)
@@ -336,7 +335,7 @@ class EnergySupervisorApp:
         )
         load_events = list(load_decision.events)
         for message in load_decision.notifications:
-            await self.adapter.publish_user_notification(message)
+            self.adapter.publish_user_notification_background(message)
 
         # Load Manager commands are local soft-dependency actions. Its pending
         # transaction is persisted in load_manager state, but never placed into
@@ -349,7 +348,7 @@ class EnergySupervisorApp:
                     action, error
                 )
                 load_events.append(event)
-                await self.adapter.publish_user_notification(notification)
+                self.adapter.publish_user_notification_background(notification)
             if failures:
                 self._save_state(force=True)
 
@@ -747,107 +746,68 @@ class EnergySupervisorApp:
 
     # Recovery --------------------------------------------------------
 
-    def _start_recovery_reset(self, hardware: HardwareSnapshot) -> None:
-        needs_reset = (
-            self.supervisor.phase == SupervisorPhase.RECOVERY_REQUIRED
-            or self.power_transfer.status().recovery_required
-            or any(
-                controller.phase == GeneratorPhase.FAULT
-                for controller in self.generator_controllers.values()
-            )
+    async def _tick_recovery(self, now: float, hardware: HardwareSnapshot) -> bool:
+        """Механически исполнить RecoveryDecision EnergySupervisor.
+
+        Здесь нет выбора owner/приоритета/порядка восстановления: main только
+        передаёт TPC facts Supervisor-у и исполняет выбранную directive.
+        """
+        observation = self._supervisor_observation(hardware)
+        recovery = self.supervisor.recovery_step(
+            observation,
+            transfer_blocker=self.power_transfer.recovery_blocker(
+                hardware.power_transfer
+            ),
+            exercise_owned_slot=self.exercise_scheduler.owned_slot,
+            grid_path_confirmed=self._grid_path_confirmed(hardware),
         )
-        if not needs_reset:
-            self.supervisor.report_recovery_reset_not_needed()
-            return
-        blocker = self._recovery_blocker(hardware)
-        if blocker is not None:
-            self.supervisor.reject_recovery_reset(f"Сброс отклонён: {blocker}")
-            return
+        directive = recovery.directive
+        if directive == RecoveryDirective.NONE:
+            return False
 
-        self.supervisor.begin_recovery_reset()
-        self.power_transfer.begin_recovery_to_grid_path()
+        if directive == RecoveryDirective.BEGIN_GRID_RECOVERY:
+            self.power_transfer.begin_recovery_to_grid_path()
 
-    async def _tick_recovery_reset(self, now: float, hardware: HardwareSnapshot) -> None:
-        blocker = self._recovery_blocker(hardware)
-        if blocker is not None:
-            self.supervisor.fail_recovery_reset(blocker)
-            await self._finish_tick(now, hardware, self.supervisor.take_events())
-            return
-
-        transfer_actions, error = self.power_transfer.step_recovery_to_grid_path(
-            now, hardware.power_transfer
-        )
-        if error is not None:
-            self.supervisor.fail_recovery_reset(error)
-            await self._finish_tick(now, hardware, self.supervisor.take_events())
-            return
-        if transfer_actions:
-            await self._execute_controller_actions(transfer_actions, [])
-            await self._finish_tick(now, hardware, self.supervisor.take_events())
-            return
-        if not self._grid_path_confirmed(hardware):
-            await self._finish_tick(now, hardware, self.supervisor.take_events())
-            return
-
-        managed_slot = self.supervisor.session.generator if self.supervisor.session else None
-        scheduler_slot = self.exercise_scheduler.owned_slot
-        stop_slots = tuple(
-            dict.fromkeys(
-                slot for slot in (managed_slot, scheduler_slot) if slot is not None
-            )
-        )
-        for slot in stop_slots:
-            actions, error = self.generator_controllers[slot].step_authorized_shutdown(
-                now,
-                hardware.generators[slot],
+        elif directive == RecoveryDirective.DRIVE_GRID_RECOVERY:
+            transfer_actions, error = self.power_transfer.step_recovery_to_grid_path(
+                now, hardware.power_transfer
             )
             if error is not None:
                 self.supervisor.fail_recovery_reset(error)
-                await self._finish_tick(now, hardware, self.supervisor.take_events())
-                return
-            if actions:
-                await self._execute_controller_actions([], actions)
-                await self._finish_tick(now, hardware, self.supervisor.take_events())
-                return
-            item = hardware.generators[slot]
-            if item.running is not False or item.remote_on is not False:
-                await self._finish_tick(now, hardware, self.supervisor.take_events())
-                return
+            elif transfer_actions:
+                await self._execute_controller_actions(transfer_actions, [])
 
-        for slot, controller in self.generator_controllers.items():
-            controller.reset_if_safe(hardware.generators[slot])
-        if not self.power_transfer.request_recovery_reset(hardware.power_transfer):
-            self.supervisor.fail_recovery_reset(
-                "Grid path не получил окончательного подтверждения."
-            )
-            await self._finish_tick(now, hardware, self.supervisor.take_events())
-            return
+        elif directive == RecoveryDirective.STOP_GENERATORS:
+            generator_actions: list[GeneratorAction] = []
+            errors: list[str] = []
+            for slot in recovery.stop_generators:
+                actions, error = self.generator_controllers[slot].step_authorized_shutdown(
+                    now,
+                    hardware.generators[slot],
+                )
+                generator_actions.extend(actions)
+                if error is not None:
+                    errors.append(error)
+            if errors:
+                self.supervisor.fail_recovery_reset("; ".join(errors))
+            elif generator_actions:
+                await self._execute_controller_actions([], generator_actions)
 
-        self.supervisor.complete_recovery_reset()
-        self._save_state(force=True)
+        elif directive == RecoveryDirective.COMPLETE:
+            for slot, controller in self.generator_controllers.items():
+                controller.reset_if_safe(hardware.generators[slot])
+            if not self.power_transfer.request_recovery_reset(hardware.power_transfer):
+                self.supervisor.fail_recovery_reset(
+                    "Grid path не получил окончательного подтверждения."
+                )
+            else:
+                self.supervisor.complete_recovery_reset()
+                self._save_state(force=True)
+
+        # FINISH_TICK намеренно не выполняет hardware actions: Supervisor уже
+        # отклонил/завершил текущий recovery decision и вернул событие пользователю.
         await self._finish_tick(now, hardware, self.supervisor.take_events())
-
-    def _recovery_blocker(self, hardware: HardwareSnapshot) -> str | None:
-        if hardware.emergency_stop is not False:
-            return "сначала снимите Generators Emergency Stop."
-        blocker = self.power_transfer.recovery_blocker(hardware.power_transfer)
-        if blocker is not None:
-            return blocker
-        if any(not item.required_states_known for item in hardware.generators.values()):
-            return "неизвестны обязательные состояния генераторов."
-
-        managed = self.supervisor.session.generator if self.supervisor.session else None
-        scheduler = self.exercise_scheduler.owned_slot
-        external = [
-            slot
-            for slot, item in hardware.generators.items()
-            if (item.running is True or item.remote_on is True)
-            and slot not in {managed, scheduler}
-        ]
-        if external:
-            names = ", ".join(self._profile(slot).display_name for slot in external)
-            return f"обнаружен внешний запуск ({names}); recovery им не управляет."
-        return None
+        return True
 
     def _grid_path_confirmed(self, hardware: HardwareSnapshot) -> bool:
         status = self.power_transfer.status()

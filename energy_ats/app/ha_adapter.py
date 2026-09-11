@@ -6,7 +6,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections.abc import Coroutine
 from dataclasses import dataclass
 from typing import Any, Hashable
 
@@ -138,6 +140,11 @@ class HomeAssistantAdapter:
         # scheduled exercise включён, unknown/unavailable presence не должен
         # блокировать запуск самого ATS: Scheduler просто отложит обычный test.
         self.require_family_presence = require_family_presence
+        # Routine Logbook/status/user publications are best-effort I/O. They
+        # must not hold the 1-second control loop behind HA/network timeouts.
+        # Safety-significant forced Exercise warning deliberately uses the
+        # synchronous publish_user_notification() method instead.
+        self._publication_tasks: set[asyncio.Task[None]] = set()
 
     def snapshot(self) -> HardwareSnapshot:
         grid_ready = self.bool_state(ENTITIES["grid_ready"])
@@ -412,30 +419,48 @@ class HomeAssistantAdapter:
         return failures
 
     async def publish_events(self, events: tuple[SupervisorEvent, ...]) -> None:
+        """Поставить обычные Logbook/critical publications в background.
+
+        Эти публикации информируют пользователя, но не являются подтверждением
+        физической операции. Поэтому сетевой timeout не должен растягивать tick.
+        """
         for event in events:
-            try:
-                await self._logbook(event.message, ENERGY_ATS_LOG_ENTITY)
-            except Exception as exc:
-                self.log.warning(
-                    "Не удалось записать событие Energy ATS в Logbook: %s",
-                    exc,
-                )
-            if not self.armed or event.level != "critical":
-                continue
-            try:
-                await self.client.call_service(
-                    "script",
-                    "notify_critical",
-                    service_data={"message": event.message},
-                )
-            except Exception as exc:
-                self.log.warning(
-                    "Не удалось отправить критическое уведомление: %s",
-                    exc,
-                )
+            self._schedule_publication(
+                self._publish_event(event),
+                f"event:{event.level}",
+            )
+        # Дать быстрым fake/local calls выполниться, не ожидая медленный network I/O.
+        await asyncio.sleep(0)
+
+    async def _publish_event(self, event: SupervisorEvent) -> None:
+        try:
+            await self._logbook(event.message, ENERGY_ATS_LOG_ENTITY)
+        except Exception as exc:
+            self.log.warning(
+                "Не удалось записать событие Energy ATS в Logbook: %s",
+                exc,
+            )
+        if not self.armed or event.level != "critical":
+            return
+        try:
+            await self.client.call_service(
+                "script",
+                "notify_critical",
+                service_data={"message": event.message},
+            )
+        except Exception as exc:
+            self.log.warning(
+                "Не удалось отправить критическое уведомление: %s",
+                exc,
+            )
 
     async def publish_user_notification(self, message: str) -> bool:
-        """Доставить обычное пользовательское уведомление через общий HA script."""
+        """Доставить подтверждаемое уведомление через общий HA script.
+
+        Этот метод намеренно ждёт результат: forced Exercise warning является
+        safety prerequisite и Scheduler не имеет права считать его доставленным
+        до успешного ответа Home Assistant.
+        """
         if not self.armed:
             self.log.info("DISARMED: подавлено уведомление: %s", message)
             return False
@@ -450,7 +475,36 @@ class HomeAssistantAdapter:
             return False
         return True
 
+    def publish_user_notification_background(self, message: str) -> None:
+        """Best-effort user notification без блокировки control tick."""
+        if not self.armed:
+            self.log.info("DISARMED: подавлено уведомление: %s", message)
+            return
+        self._schedule_publication(
+            self._publish_user_notification_background(message),
+            "user-notification",
+        )
+
+    async def _publish_user_notification_background(self, message: str) -> None:
+        try:
+            await self.client.call_service(
+                "script",
+                "notify_critical",
+                service_data={"message": message},
+            )
+        except Exception as exc:
+            self.log.warning("Не удалось отправить уведомление: %s", exc)
+
     async def publish_status(self, state: str, attributes: dict[str, Any]) -> bool:
+        """Поставить status publication в background и сразу вернуть управление."""
+        self._schedule_publication(
+            self._publish_status(state, attributes),
+            "status",
+        )
+        await asyncio.sleep(0)
+        return True
+
+    async def _publish_status(self, state: str, attributes: dict[str, Any]) -> None:
         try:
             await self.client.set_state(
                 ENERGY_ATS_STATUS_ENTITY,
@@ -463,8 +517,38 @@ class HomeAssistantAdapter:
                 ENERGY_ATS_STATUS_ENTITY,
                 exc,
             )
-            return False
-        return True
+
+    async def cancel_background_publications(self) -> None:
+        """Отменить незавершённый best-effort I/O перед закрытием HA transport."""
+        tasks = tuple(self._publication_tasks)
+        if not tasks:
+            return
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._publication_tasks.clear()
+
+    def _schedule_publication(
+        self,
+        coroutine: Coroutine[Any, Any, None],
+        name: str,
+    ) -> None:
+        try:
+            task = asyncio.create_task(coroutine, name=f"energy-ats-{name}")
+        except RuntimeError:
+            coroutine.close()
+            raise
+        self._publication_tasks.add(task)
+        task.add_done_callback(self._publication_done)
+
+    def _publication_done(self, task: asyncio.Task[None]) -> None:
+        self._publication_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except Exception as exc:
+            self.log.warning("Фоновая публикация Energy ATS завершилась ошибкой: %s", exc)
 
     def bool_state(self, entity_id: str) -> bool | None:
         state = self.client.get_state(entity_id)
@@ -599,7 +683,8 @@ class HomeAssistantAdapter:
         entries: list[tuple[str, str]],
     ) -> None:
         for message, entity_id in entries:
-            try:
-                await self._logbook(message, entity_id)
-            except Exception as exc:
-                self.log.warning("Не удалось записать событие в Logbook: %s", exc)
+            self._schedule_publication(
+                self._logbook(message, entity_id),
+                "logbook",
+            )
+        await asyncio.sleep(0)
