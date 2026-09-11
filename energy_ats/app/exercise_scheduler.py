@@ -503,6 +503,22 @@ class ExerciseScheduler:
                 return events
 
         if attempt.phase == ExerciseAttemptPhase.STARTING:
+            # F4 / REQ-EXERCISE-06: ordinary Exercise должен оставаться
+            # presence-gated вплоть до физического REMOTE ON. Если разрешение
+            # отозвано до старта двигателя, это DEFERRED, а не FAILED.
+            if (
+                not attempt.forced
+                and status.running is False
+                and status.remote_on is False
+                and o.family_present is not False
+            ):
+                return list(
+                    self.cancel_unstarted(
+                        o,
+                        "отсутствие семьи дома больше не подтверждено перед физическим запуском",
+                    )
+                )
+
             if status.running is True and status.remote_on is True:
                 attempt.phase = ExerciseAttemptPhase.RUNNING
                 attempt.started_at = o.now
@@ -819,8 +835,7 @@ class ExerciseScheduler:
 
 def _same_minute(left: datetime, right: datetime) -> bool:
     return left.replace(second=0, microsecond=0) == right.replace(
-        second=0,
-        microsecond=0,
+        second=0, microsecond=0,
     )
 
 
