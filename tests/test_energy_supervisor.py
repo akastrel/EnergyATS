@@ -408,7 +408,8 @@ def test_test_run_is_not_outage_cleanup_target():
     assert decision.stop_outage_generators == frozenset()
 
 
-def test_manual_stop_during_outage_does_not_stop_external_secondary():
+def test_manual_stop_during_outage_returns_to_ups_and_does_not_stop_external_secondary():
+    """Проверяет REQ-BEH-14: manual stop при отсутствующей Grid снимает дом с generator supply в UPS_ONLY и не расширяет право остановки на внешний SECONDARY."""
     supervisor = stable_session()
     supervisor.request_manual_stop()
     decision = supervisor.step(
@@ -431,8 +432,11 @@ def test_manual_stop_during_outage_does_not_stop_external_secondary():
             ),
         ),
     )
-    assert supervisor.phase == SupervisorPhase.RETURNING_TO_GRID
+    assert supervisor.phase == SupervisorPhase.RETURNING_TO_UPS
+    assert decision.desired_source == PowerSource.UPS_ONLY
+    assert decision.desired_generators[GeneratorSlot.A] is True
     assert decision.stop_outage_generators == frozenset()
+    assert supervisor.automatic_start_suppressed_until_grid is True
 
 
 def test_unknown_required_state_and_transfer_fault_block_actions():
