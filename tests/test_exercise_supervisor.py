@@ -1,7 +1,13 @@
 from __future__ import annotations
 
-from domain import GeneratorSlot, PowerPath, PowerSource
-from energy_supervisor import EnergySupervisor, SupervisorConfig, SupervisorObservation, SupervisorPhase
+from domain import GeneratorSlot, PowerPath, PowerSource, SessionReason
+from energy_supervisor import (
+    EnergySupervisor,
+    ExerciseDirective,
+    SupervisorConfig,
+    SupervisorObservation,
+    SupervisorPhase,
+)
 from generator_bus import (
     GeneratorBusOwner,
     GeneratorBusStatus,
@@ -90,6 +96,7 @@ def observation(
 
 
 def test_outage_adopts_running_exercise_generator_even_when_primary_is_other_slot():
+    """Проверяет, что после outage delay уже RUNNING Exercise-generator принимается в outage-session вместо cold start настроенного PRIMARY."""
     supervisor = EnergySupervisor(
         SupervisorConfig(
             grid_failure_delay=5,
@@ -128,7 +135,8 @@ def test_outage_adopts_running_exercise_generator_even_when_primary_is_other_slo
     assert second.desired_generators[GeneratorSlot.B] is False
 
 
-def test_unconfirmed_exercise_start_blocks_duplicate_primary_start_during_outage():
+def test_unstarted_exercise_is_cancelled_before_outage_primary_start():
+    """Проверяет REQ-BEH-03: реальный outage отменяет ещё не начавшийся физически Exercise и продолжает обычный запуск PRIMARY, не позволяя maintenance-run стартовать во время outage."""
     supervisor = EnergySupervisor(
         SupervisorConfig(
             grid_failure_delay=1,
@@ -150,13 +158,18 @@ def test_unconfirmed_exercise_start_blocks_duplicate_primary_start_during_outage
         exercise_desired_running=True,
     )
 
-    assert supervisor.session is None
-    assert supervisor.phase == SupervisorPhase.GRID_FAILURE_DELAY
-    assert decision.desired_generators[GeneratorSlot.A] is True
-    assert decision.desired_generators[GeneratorSlot.B] is False
+    assert supervisor.session is not None
+    assert supervisor.session.reason == SessionReason.GRID_OUTAGE
+    assert supervisor.session.generator == GeneratorSlot.B
+    assert supervisor.phase == SupervisorPhase.STARTING_GENERATOR
+    assert decision.exercise_directive == ExerciseDirective.CANCEL_UNSTARTED
+    assert decision.exercise_slot == GeneratorSlot.A
+    assert decision.desired_generators[GeneratorSlot.A] is False
+    assert decision.desired_generators[GeneratorSlot.B] is True
 
 
 def test_exercise_does_not_create_outage_session_when_automatic_transfer_is_disabled():
+    """Проверяет, что отключённый automatic transfer не превращает RUNNING Exercise в outage managed-session."""
     supervisor = EnergySupervisor(
         SupervisorConfig(grid_failure_delay=0, primary_generator=GeneratorSlot.B)
     )
@@ -183,6 +196,7 @@ def test_exercise_does_not_create_outage_session_when_automatic_transfer_is_disa
 
 
 def test_foreign_running_generator_still_prevents_exercise_adoption():
+    """Проверяет, что наличие отдельного внешнего RUNNING generator не позволяет молча принять Exercise-generator в managed outage-session."""
     supervisor = EnergySupervisor(
         SupervisorConfig(grid_failure_delay=0, primary_generator=GeneratorSlot.B)
     )
@@ -208,6 +222,7 @@ def test_foreign_running_generator_still_prevents_exercise_adoption():
 
 
 def test_generator_bus_marks_internal_scheduled_run_as_test_run_even_during_grid_outage():
+    """Проверяет, что Scheduled Exercise сохраняет run-context TEST_RUN даже если Grid исчезла после начала тестового запуска."""
     tracker = GeneratorBusTracker()
     tracker.update(
         {GeneratorSlot.A: False, GeneratorSlot.B: False},
@@ -225,6 +240,7 @@ def test_generator_bus_marks_internal_scheduled_run_as_test_run_even_during_grid
 
 
 def test_generator_bus_restores_running_internal_test_context_without_reclassification():
+    """Проверяет, что restart Tracker не переклассифицирует продолжающийся internal TEST_RUN как outage-related только из-за текущего Grid state."""
     tracker = GeneratorBusTracker()
     tracker.update(
         {GeneratorSlot.A: True, GeneratorSlot.B: False},
