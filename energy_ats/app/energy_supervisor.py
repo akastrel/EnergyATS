@@ -291,15 +291,6 @@ class EnergySupervisor:
         self._stop_outage_generators.clear()
         self._clear_step_directives()
 
-        cycle_completion_candidate = bool(
-            self.session is not None
-            and self.session.cycle_owned
-            and (
-                self.phase == SupervisorPhase.RETURNING_TO_UPS
-                or request_cycle_stop
-                or self._cycle_stop_requested
-            )
-        )
         session_before = self.session
         if request_cycle_stop:
             self._cycle_stop_requested = True
@@ -347,6 +338,16 @@ class EnergySupervisor:
         if self.phase == SupervisorPhase.RECOVERY_REQUIRED:
             self._fail_exercise_for_recovery(exercise_owned_slot)
             return self._decision(o, exercise_owned_slot, False)
+
+        # REQ-CYCLE-07 — post-cycle wait допустим только если после manual
+        # arbitration session всё ещё действительно принадлежит cycling и уже
+        # находится в Generator -> UPS_ONLY return. Manual stop/override не
+        # должны наследовать устаревший cycle intent текущего tick.
+        cycle_completion_candidate = bool(
+            self.session is not None
+            and self.session.cycle_owned
+            and self.phase == SupervisorPhase.RETURNING_TO_UPS
+        )
 
         if self.session is None:
             self._without_session(
