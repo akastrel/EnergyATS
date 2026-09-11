@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.0.3
+
+Runtime hardening после диагностического review 1.0.1 и исправлений F1–F5 в 1.0.2. Новых пользовательских режимов не добавлено.
+
+- Recovery arbitration перенесён к заявленному владельцу системной логики — `EnergySupervisor`. Supervisor теперь решает, можно ли начинать reset, блокирует захват внешнего generator, задаёт порядок `Grid path -> owned generator stop -> complete` и возвращает явные `RecoveryDirective`; `main.py` только исполняет TPC/GC-действия.
+- Сохранена прежняя безопасная семантика: если Grid path уже подтверждён в момент recovery request, reset не получает искусственный дополнительный tick и может сразу перейти к остановке owned generator либо завершению.
+- Обычные Logbook/status/Load Manager notifications переведены в best-effort background publications и больше не ждут сетевой timeout внутри control tick. Незавершённые publication tasks отменяются перед reconnect/закрытием HA transport.
+- Forced Scheduled Exercise warning намеренно остаётся синхронным: Scheduler подтверждает warning только после успешного ответа Home Assistant, так как доставка является safety prerequisite для forced start.
+- Добавлены production-like runtime tests: реальный внешний `run()/reconnect` loop при потере HA во время transient operation, сохранение persisted Grid-restore obligation, независимые RUNNING/REMOTE/selector/house feedback, Supervisor-owned Recovery order/ownership и медленные publication calls.
+- CI теперь не ограничивается pytest: отдельно собирается реальный Home Assistant add-on container. Внутри собранного production image smoke-test проходит настоящий `HomeAssistantClient` WebSocket/REST auth/subscribe/get_states/get_config/service/state flow и проверяет обработку App-команды/остановки.
+- Финальный Python suite: `288 passed`; отдельный `addon-container-smoke` также проходит.
+- App и add-on version подняты до `1.0.3`; persistent `schema_version` остаётся `3`, так как формат persisted state не менялся.
+
+---
+
 ## 1.0.2
 
 Исправления пяти воспроизведённых дефектов F1–F5, найденных независимым ревью EnergyATS 1.0.1, без нового архитектурного слоя.
@@ -34,7 +49,7 @@
 
 - `EnergySupervisor` теперь является единственным центром системных решений: Manual, Grid outage, fallback, возврат Grid, Recovery и пересечения с Exercise/UPS Run разрешаются в одном месте. Дополнительный `PolicyCoordinator` не используется.
 - `main.py` оставлен composition/I/O/dispatch слоем: Scheduler и UPS Run передают локальные факты/условия, Supervisor принимает решение, GC/TPC безопасно исполняют его, Load Manager управляет только G1/G2.
-- `REQUIREMENTS_RU.md` переработан в цельную спецификацию с `REQ-BEH-*`, стабильными `TC-*` identifiers и traceability `requirement -> Supervisor branch -> automated/physical test`.
+- `REQUIREMENTS_RU.md` переработан в цельную спецификацию с `REQ-BEH-*`, стабильными `TC-*` identifiers и traceability `requirement -> Supervisor branch -> automated / physical test`.
 - Уже RUNNING исправный Exercise-generator при подтверждённом outage может быть принят той же outage-session без `REMOTE OFF -> cold start`; при manual reserve request тот же run может быть передан manual managed-session.
 - Exercise -> Manual handoff фиксируется как нейтральный `INTERRUPTED_BY_MANUAL`, а не как технический failure; до явного handoff Scheduler сохраняет обязанность безопасной остановки своего auto-run.
 - Manual stop при продолжающемся outage теперь явно переводит дом `Generator -> UPS_ONLY`, после подтверждённого снятия нагрузки штатно останавливает managed generator и подавляет automatic restart до восстановления Grid либо нового manual start.
