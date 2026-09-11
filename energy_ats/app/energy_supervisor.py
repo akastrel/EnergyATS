@@ -157,6 +157,10 @@ class EnergySupervisor:
         self.grid_failed_since: float | None = None
         self.grid_ready_since: float | None = None
         self.automatic_start_suppressed_until_grid = False
+        # F1 / REQ-BEH-14: только EnergyATS-owned изоляция после manual stop
+        # создаёт обязанность позже восстановить Grid. Флаг переживает restart и
+        # не относится к произвольному пользовательскому grid_power=OFF.
+        self.grid_restore_pending = False
         self.recovery_reason: str | None = None
         self.initialized = False
 
@@ -242,6 +246,7 @@ class EnergySupervisor:
         self.desired_generators = _stopped_generators()
         self.grid_failed_since = None
         self.grid_ready_since = None
+        self.grid_restore_pending = False
         self._cycle_stop_requested = False
         self._stop_outage_generators.clear()
         self._event("info", "Восстановление завершено; управление снова разрешено.")
@@ -421,6 +426,22 @@ class EnergySupervisor:
         restore_grid_after_cycle: bool,
     ) -> None:
         self.desired_generators = _stopped_generators()
+
+        # F1 / REQ-BEH-14: если именно EnergyATS оставил дом изолированным после
+        # manual stop при outage, обязанность reconnect не исчезает вместе с
+        # generator session и переживает restart. Чужой/user grid_power=OFF этого
+        # флага не имеет и по-прежнему не исправляется автоматически.
+        if self.grid_restore_pending:
+            self.desired_source = None
+            self.phase = SupervisorPhase.NORMAL
+            if self._grid_path(o):
+                self.grid_restore_pending = False
+                if o.grid_ready is True:
+                    self.automatic_start_suppressed_until_grid = False
+                return
+            if self._grid_stable(now):
+                self.desired_source = PowerSource.GRID
+            return
 
         if restore_grid_after_cycle and self._grid_stable(now):
             self.desired_source = PowerSource.GRID
@@ -709,6 +730,14 @@ class EnergySupervisor:
         self._stop_outage_generators.update(outage_slots)
 
         managed = o.generators[self.session.generator]
+        # F2: после подтверждённого возврата дома на Grid отказ managed GC во
+        # время остановки — terminal system fault этого сценария. Fallback на B
+        # здесь бессмыслен и потенциально опасен: источник дома уже Grid.
+        if _generator_failed(managed):
+            self._require_recovery(
+                managed.fault or "Ошибка генератора при завершении возврата на Grid."
+            )
+            return
         if (
             managed.running is False
             and managed.remote_on is False
@@ -873,6 +902,7 @@ class EnergySupervisor:
         # и подавляем automatic restart до Grid либо нового manual start.
         if o.grid_ready is False:
             self.automatic_start_suppressed_until_grid = True
+            self.grid_restore_pending = True
             self.desired_source = PowerSource.UPS_ONLY
             self.phase = SupervisorPhase.RETURNING_TO_UPS
             return
@@ -1067,6 +1097,7 @@ class EnergySupervisor:
             "automatic_start_suppressed_until_grid": (
                 self.automatic_start_suppressed_until_grid
             ),
+            "grid_restore_pending": self.grid_restore_pending,
             "recovery_reason": self.recovery_reason,
         }
 
@@ -1087,6 +1118,10 @@ class EnergySupervisor:
         supervisor.automatic_start_suppressed_until_grid = _strict_bool(
             data.get("automatic_start_suppressed_until_grid", False),
             "automatic_start_suppressed_until_grid",
+        )
+        supervisor.grid_restore_pending = _strict_bool(
+            data.get("grid_restore_pending", False),
+            "grid_restore_pending",
         )
         reason = data.get("recovery_reason")
         supervisor.recovery_reason = str(reason) if reason is not None else None
