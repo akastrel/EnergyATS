@@ -1,10 +1,10 @@
-"""Policy задержки запуска генератора и циклической подзарядки UPS.
+"""UPS Run: ожидание на UPS и циклическая подзарядка при длительном outage.
 
 Модуль намеренно не знает о Home Assistant, GC, TPC и силовых реле. Он отвечает
 только на два вопроса:
 
 * можно ли сейчас продолжать ждать на UPS вместо автоматического запуска;
-* можно ли завершить принадлежащую policy generator-session после достижения
+* можно ли завершить принадлежащую UPS Run generator-session после достижения
   целевого SoC.
 
 Физические действия по-прежнему выполняют EnergySupervisor, GC и TPC.
@@ -20,7 +20,7 @@ from typing import Any, Hashable, Mapping
 from domain import SessionReason, SupervisorEvent
 
 
-class OutagePowerState(str, Enum):
+class UPSRunState(str, Enum):
     IDLE = "idle"
     WAITING_ON_UPS = "waiting_on_ups"
     GENERATOR_REQUIRED = "generator_required"
@@ -30,7 +30,7 @@ class OutagePowerState(str, Enum):
 
 
 @dataclass(frozen=True)
-class OutagePowerConfig:
+class UPSRunConfig:
     delayed_start_enabled: bool = False
     charge_cycle_enabled: bool = False
     start_soc: float = 40.0
@@ -70,7 +70,7 @@ class BatteryObservation:
 
 
 @dataclass(frozen=True)
-class OutagePowerObservation:
+class UPSRunObservation:
     now: float
     grid_ready: bool | None
     automatic_transfer_enabled: bool
@@ -87,7 +87,7 @@ class OutagePowerObservation:
 
 
 @dataclass(frozen=True)
-class OutagePowerDecision:
+class UPSRunDecision:
     defer_automatic_start: bool = False
     outage_delay_already_satisfied: bool = False
     claim_new_outage_session: bool = False
@@ -97,12 +97,12 @@ class OutagePowerDecision:
     events: tuple[SupervisorEvent, ...] = ()
 
 
-class OutagePowerPolicy:
-    """Небольшой stateful policy-слой без собственной аппаратной FSM."""
+class UPSRun:
+    """Локальная stateful-стратегия длительного outage без аппаратной FSM."""
 
-    def __init__(self, config: OutagePowerConfig | None = None) -> None:
-        self.config = config or OutagePowerConfig()
-        self.state = OutagePowerState.IDLE
+    def __init__(self, config: UPSRunConfig | None = None) -> None:
+        self.config = config or UPSRunConfig()
+        self.state = UPSRunState.IDLE
         self.waiting_since: float | None = None
         self.post_cycle_wait = False
         self.last_reason: str | None = None
@@ -123,13 +123,13 @@ class OutagePowerPolicy:
         """Начать следующий battery interval после штатного cycle stop."""
         self.post_cycle_wait = True
         self.waiting_since = now
-        self.state = OutagePowerState.WAITING_ON_UPS
+        self.state = UPSRunState.WAITING_ON_UPS
         self.last_reason = (
             "Цикл заряда завершён; ожидаем следующей необходимости запуска."
         )
         self._last_event_key = None
 
-    def step(self, o: OutagePowerObservation) -> OutagePowerDecision:
+    def step(self, o: UPSRunObservation) -> UPSRunDecision:
         events: list[SupervisorEvent] = []
         self._observe_sample(o.now, o.battery.sample_id)
         ttg_sample = (
@@ -147,31 +147,31 @@ class OutagePowerPolicy:
             # вернуть его сохраняется до подтверждения Grid supply.
             restore_grid = self.post_cycle_wait and not o.session_active
             if not o.grid_stable or (restore_grid and not o.grid_supply_restored):
-                return OutagePowerDecision(restore_grid_after_cycle=restore_grid)
+                return UPSRunDecision(restore_grid_after_cycle=restore_grid)
             self._reset_wait()
             self.post_cycle_wait = False
-            self.state = OutagePowerState.IDLE
+            self.state = UPSRunState.IDLE
             self.last_reason = None
             self._last_event_key = None
-            return OutagePowerDecision()
+            return UPSRunDecision()
 
         if o.grid_ready is not False:
-            return OutagePowerDecision()
+            return UPSRunDecision()
 
         if not self.enabled or not o.automatic_transfer_enabled:
             self._reset_wait()
             # Отключение оптимизации не снимает обязанность вернуть сетевой
             # ввод, ранее изолированный при нашем cycle stop.
-            self.state = OutagePowerState.IDLE
+            self.state = UPSRunState.IDLE
             self.last_reason = None
-            return OutagePowerDecision()
+            return UPSRunDecision()
 
         if not self.config.valid:
             reason = "Некорректны настройки Delayed Start / Charge Cycling."
-            self.state = OutagePowerState.DEGRADED
+            self.state = UPSRunState.DEGRADED
             self.last_reason = reason
             self._emit_once(events, "invalid_config", "warning", reason)
-            return OutagePowerDecision(reason=reason, events=tuple(events))
+            return UPSRunDecision(reason=reason, events=tuple(events))
 
         if o.session_active:
             self._reset_wait()
@@ -182,21 +182,21 @@ class OutagePowerPolicy:
 
     def _without_session(
         self,
-        o: OutagePowerObservation,
+        o: UPSRunObservation,
         events: list[SupervisorEvent],
-    ) -> OutagePowerDecision:
+    ) -> UPSRunDecision:
         # Пользовательская команда всегда сильнее delayed start. Она будет
         # обработана Supervisor в этом же tick.
         if o.manual_start_pending:
-            self.state = OutagePowerState.GENERATOR_REQUIRED
+            self.state = UPSRunState.GENERATOR_REQUIRED
             self.last_reason = "Пользователь запросил питание от генератора."
-            return OutagePowerDecision(reason=self.last_reason)
+            return UPSRunDecision(reason=self.last_reason)
 
         delay_satisfied = self.waiting_since is not None
         if not delay_satisfied and not o.core_delay_elapsed:
-            self.state = OutagePowerState.IDLE
+            self.state = UPSRunState.IDLE
             self.last_reason = None
-            return OutagePowerDecision()
+            return UPSRunDecision()
 
         # Начало собственного интервала ожидания происходит только после
         # обычного grid_failure_delay. При restart persisted waiting_since
@@ -215,9 +215,9 @@ class OutagePowerPolicy:
         # после core delay. Но последующие cycling intervals всё равно обязаны
         # ждать Start SoC/TTG/max-delay, иначе generator тут же перезапустится.
         if not should_wait_on_battery:
-            self.state = OutagePowerState.GENERATOR_REQUIRED
+            self.state = UPSRunState.GENERATOR_REQUIRED
             self.last_reason = "Delayed Start выключен."
-            return OutagePowerDecision(
+            return UPSRunDecision(
                 outage_delay_already_satisfied=delay_satisfied,
                 claim_new_outage_session=claim,
                 reason=self.last_reason,
@@ -225,7 +225,7 @@ class OutagePowerPolicy:
 
         battery_reason = self._battery_problem(o)
         if battery_reason is not None:
-            self.state = OutagePowerState.GENERATOR_REQUIRED
+            self.state = UPSRunState.GENERATOR_REQUIRED
             self.last_reason = battery_reason
             self._emit_once(
                 events,
@@ -233,7 +233,7 @@ class OutagePowerPolicy:
                 "warning",
                 f"Delayed Start отменён: {battery_reason} Запускаем генератор штатно.",
             )
-            return OutagePowerDecision(
+            return UPSRunDecision(
                 outage_delay_already_satisfied=delay_satisfied,
                 claim_new_outage_session=claim,
                 reason=battery_reason,
@@ -262,7 +262,7 @@ class OutagePowerPolicy:
             reason = "Достигнута максимальная задержка запуска генератора."
 
         if reason is not None:
-            self.state = OutagePowerState.GENERATOR_REQUIRED
+            self.state = UPSRunState.GENERATOR_REQUIRED
             self.last_reason = reason
             self._emit_once(
                 events,
@@ -270,16 +270,16 @@ class OutagePowerPolicy:
                 "info",
                 f"Delayed Start завершён: {reason}",
             )
-            return OutagePowerDecision(
+            return UPSRunDecision(
                 outage_delay_already_satisfied=True,
                 claim_new_outage_session=claim,
                 reason=reason,
                 events=tuple(events),
             )
 
-        self.state = OutagePowerState.WAITING_ON_UPS
+        self.state = UPSRunState.WAITING_ON_UPS
         self.last_reason = "UPS продолжает питать критическую линию."
-        return OutagePowerDecision(
+        return UPSRunDecision(
             defer_automatic_start=True,
             outage_delay_already_satisfied=True,
             reason=self.last_reason,
@@ -288,36 +288,36 @@ class OutagePowerPolicy:
 
     def _with_session(
         self,
-        o: OutagePowerObservation,
+        o: UPSRunObservation,
         events: list[SupervisorEvent],
-    ) -> OutagePowerDecision:
+    ) -> UPSRunDecision:
         # Ручная команда, уже ожидающая обработки Supervisor, немедленно
         # запрещает Target-SoC stop в этом tick.
         if o.manual_start_pending:
-            self.state = OutagePowerState.IDLE
+            self.state = UPSRunState.IDLE
             self.last_reason = (
                 "Пользователь принял generator-session под ручное управление."
             )
-            return OutagePowerDecision(reason=self.last_reason)
+            return UPSRunDecision(reason=self.last_reason)
 
         if o.session_reason != SessionReason.GRID_OUTAGE:
-            self.state = OutagePowerState.IDLE
+            self.state = UPSRunState.IDLE
             self.last_reason = None
-            return OutagePowerDecision()
+            return UPSRunDecision()
 
         if (
             not self.config.charge_cycle_enabled
             or not o.session_cycle_owned
             or o.session_manual_override
         ):
-            self.state = OutagePowerState.IDLE
+            self.state = UPSRunState.IDLE
             self.last_reason = None
-            return OutagePowerDecision()
+            return UPSRunDecision()
 
         if not o.session_on_generator:
-            self.state = OutagePowerState.CHARGING
+            self.state = UPSRunState.CHARGING
             self.last_reason = "Generator-session ещё не в устойчивом режиме."
-            return OutagePowerDecision(reason=self.last_reason)
+            return UPSRunDecision(reason=self.last_reason)
 
         soc = o.battery.soc
         if (
@@ -326,10 +326,10 @@ class OutagePowerPolicy:
             or o.battery.ready is not True
         ):
             reason = "SoC или готовность батареи недостоверны; cycling не завершает generator-session."
-            self.state = OutagePowerState.DEGRADED
+            self.state = UPSRunState.DEGRADED
             self.last_reason = reason
             self._emit_once(events, "cycle_soc_invalid", "warning", reason)
-            return OutagePowerDecision(reason=reason, events=tuple(events))
+            return UPSRunDecision(reason=reason, events=tuple(events))
 
         assert soc is not None
         if soc >= self.config.target_soc:
@@ -337,7 +337,7 @@ class OutagePowerPolicy:
                 f"Батарея заряжена до {soc:.1f}% "
                 f"(target {self.config.target_soc:.1f}%)."
             )
-            self.state = OutagePowerState.TARGET_REACHED
+            self.state = UPSRunState.TARGET_REACHED
             self.last_reason = reason
             self._emit_once(
                 events,
@@ -345,20 +345,20 @@ class OutagePowerPolicy:
                 "info",
                 f"{reason} Завершаем автоматический charge cycle.",
             )
-            return OutagePowerDecision(
+            return UPSRunDecision(
                 request_cycle_stop=True,
                 reason=reason,
                 events=tuple(events),
             )
 
-        self.state = OutagePowerState.CHARGING
+        self.state = UPSRunState.CHARGING
         self.last_reason = (
             f"Заряд батареи {soc:.1f}%; ожидаем target {self.config.target_soc:.1f}%."
         )
         self._last_event_key = None
-        return OutagePowerDecision(reason=self.last_reason)
+        return UPSRunDecision(reason=self.last_reason)
 
-    def _battery_problem(self, o: OutagePowerObservation) -> str | None:
+    def _battery_problem(self, o: UPSRunObservation) -> str | None:
         b = o.battery
         if b.ready is False:
             return "UPS/Battery сообщает критическое состояние."
@@ -459,16 +459,16 @@ class OutagePowerPolicy:
     def from_dict(
         cls,
         data: Mapping[str, Any],
-        config: OutagePowerConfig,
-    ) -> "OutagePowerPolicy":
-        policy = cls(config)
-        policy.state = OutagePowerState(
-            str(data.get("state", OutagePowerState.IDLE.value))
+        config: UPSRunConfig,
+    ) -> "UPSRun":
+        ups_run = cls(config)
+        ups_run.state = UPSRunState(
+            str(data.get("state", UPSRunState.IDLE.value))
         )
         waiting = data.get("waiting_since")
-        policy.waiting_since = float(waiting) if waiting is not None else None
-        if policy.waiting_since is not None and (
-            not math.isfinite(policy.waiting_since) or policy.waiting_since < 0
+        ups_run.waiting_since = float(waiting) if waiting is not None else None
+        if ups_run.waiting_since is not None and (
+            not math.isfinite(ups_run.waiting_since) or ups_run.waiting_since < 0
         ):
             raise ValueError(
                 "waiting_since должен быть конечным неотрицательным временем"
@@ -476,10 +476,10 @@ class OutagePowerPolicy:
         post_cycle_wait = data.get("post_cycle_wait", False)
         if type(post_cycle_wait) is not bool:
             raise ValueError("post_cycle_wait должен быть boolean")
-        policy.post_cycle_wait = post_cycle_wait
+        ups_run.post_cycle_wait = post_cycle_wait
         reason = data.get("last_reason")
-        policy.last_reason = str(reason) if reason is not None else None
-        return policy
+        ups_run.last_reason = str(reason) if reason is not None else None
+        return ups_run
 
 
 def _valid_soc(value: float | None) -> bool:

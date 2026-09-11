@@ -1,4 +1,4 @@
-"""Сценарии §25.5: реальные App/Supervisor/GC/TPC и HA-adapter с fake hardware.
+"""UPS Run: реальные App/Supervisor/GC/TPC и HA-adapter с fake hardware.
 
 Время задаётся тестом, контакторы подтверждаются fake HA, RUNNING меняется
 отдельно от REMOTE. Короткие docstrings описывают защищаемое поведение.
@@ -13,7 +13,7 @@ from domain import GeneratorSlot, SessionReason
 from energy_supervisor import SupervisorPhase
 from generator_controller import GeneratorPhase
 from ha_adapter import ENTITIES
-from outage_power_policy import OutagePowerState
+from ups_run import UPSRunState
 from test_end_to_end_scenarios import (
     make_app,
     accelerate_generators,
@@ -56,7 +56,7 @@ async def wait_on_ups(app, fake):
     await app._tick(0)
     await app._tick(2)
     assert app.supervisor.session is None
-    assert app.outage_power_policy.state == OutagePowerState.WAITING_ON_UPS
+    assert app.ups_run.state == UPSRunState.WAITING_ON_UPS
 
 
 async def drive(app, fake, now, until, *, follow_running=True):
@@ -87,7 +87,7 @@ async def complete_cycle(app, fake, now):
     now = await drive(app, fake, now, lambda: app.supervisor.session is None)
     battery(fake, soc=79)
     await app._tick(now)
-    assert app.outage_power_policy.state == OutagePowerState.WAITING_ON_UPS
+    assert app.ups_run.state == UPSRunState.WAITING_ON_UPS
     return now + 1
 
 
@@ -167,7 +167,7 @@ async def test_84_grid_return_during_wait_never_starts_generator(tmp_path):
     assert app.supervisor.session is None
     assert fake.states[ENTITIES["house_grid"]] == "on"
     assert not switch_calls(fake)
-    assert app.outage_power_policy.waiting_since is None
+    assert app.ups_run.waiting_since is None
 
 
 @pytest.mark.asyncio
@@ -224,7 +224,7 @@ async def test_87_next_cycle_waits_even_without_initial_delayed_start(
     app, fake = setup(tmp_path, delayed_generator_start_enabled=False)
     now = await on_generator(app, fake)
     now = await complete_cycle(app, fake, now)
-    wait_start = app.outage_power_policy.waiting_since
+    wait_start = app.ups_run.waiting_since
     assert fake.states[ENTITIES["generator_a_remote"]] == "off"
     if trigger == "soc":
         battery(fake, soc=40)
@@ -315,7 +315,7 @@ async def test_92_restart_wait_preserves_elapsed_time(tmp_path):
     app, fake = _restart_app(tmp_path, fake.states, **app.options)
     await app._tick(90)
     assert app.supervisor.session is None
-    assert app.outage_power_policy.waiting_since == 2
+    assert app.ups_run.waiting_since == 2
     await app._tick(102)
     assert app.supervisor.session is not None
 
@@ -417,29 +417,25 @@ async def test_manual_override_after_cycle_engine_stopped_restarts_same_generato
 async def test_stale_soc_cannot_be_masked_by_new_ttg(tmp_path, discharging):
     """Обновляющийся TTG не делает зависший SoC достоверным. Устаревший SoC прекращает ожидание и при разряде, и при заявленном режиме зарядки/поддержания."""
     app, fake = setup(tmp_path)
-    app.outage_power_policy.config = replace(
-        app.outage_power_policy.config, telemetry_stale_time=3
-    )
+    app.ups_run.config = replace(app.ups_run.config, telemetry_stale_time=3)
     battery(fake, discharging=discharging)
     await wait_on_ups(app, fake)
     fake.states[ENTITIES["ups_battery_ttg_minutes"]] = "170"
     await app._tick(4)
     assert app.supervisor.session is not None
-    assert "SoC" in app.outage_power_policy.last_reason
+    assert "SoC" in app.ups_run.last_reason
 
 
 @pytest.mark.asyncio
 async def test_stale_ttg_cannot_be_masked_by_new_soc(tmp_path):
     """Свежий SoC не скрывает остановившийся TTG во время разряда. Без достоверного прогноза времени работы ожидание прекращается штатным запуском."""
     app, fake = setup(tmp_path)
-    app.outage_power_policy.config = replace(
-        app.outage_power_policy.config, telemetry_stale_time=3
-    )
+    app.ups_run.config = replace(app.ups_run.config, telemetry_stale_time=3)
     await wait_on_ups(app, fake)
     fake.states[ENTITIES["ups_battery_soc"]] = "69"
     await app._tick(4)
     assert app.supervisor.session is not None
-    assert "TTG" in app.outage_power_policy.last_reason
+    assert "TTG" in app.ups_run.last_reason
 
 
 @pytest.mark.asyncio
@@ -451,7 +447,7 @@ async def test_cached_old_battery_is_not_fresh_after_restart(tmp_path):
     fake.get_state_updated_at = lambda entity: -400.0
     await app._tick(3)
     assert app.supervisor.session is not None
-    assert "устарела" in app.outage_power_policy.last_reason
+    assert "устарела" in app.ups_run.last_reason
 
 
 @pytest.mark.asyncio
@@ -462,7 +458,7 @@ async def test_stale_target_does_not_stop_generator(tmp_path):
     battery(fake, soc=90, discharging=False)
     fake.get_state_updated_at = lambda entity: now - 400
     await app._tick(now)
-    assert app.outage_power_policy.state == OutagePowerState.DEGRADED
+    assert app.ups_run.state == UPSRunState.DEGRADED
     assert app.supervisor.phase == SupervisorPhase.ON_GENERATOR
     assert fake.states[ENTITIES["house_generator"]] == "on"
 
@@ -499,7 +495,7 @@ async def test_invalid_thresholds_disable_only_optimization(tmp_path):
     now = await on_generator(app, fake)
     battery(fake, soc=90, discharging=False)
     await app._tick(now)
-    assert app.outage_power_policy.state == OutagePowerState.DEGRADED
+    assert app.ups_run.state == UPSRunState.DEGRADED
     assert app.supervisor.phase == SupervisorPhase.ON_GENERATOR
     assert not app.supervisor.session.cycle_owned
 
@@ -556,8 +552,8 @@ async def test_disabling_cycling_between_runs_preserves_grid_restore(tmp_path):
     """Выключение оптимизации между циклами не снимает обязанность восстановить сетевой ввод, изолированный самим ATS. После устойчивого возврата сети дом снова получает Grid без запуска генератора."""
     app, fake = setup(tmp_path)
     now = await complete_cycle(app, fake, await on_generator(app, fake))
-    app.outage_power_policy.config = replace(
-        app.outage_power_policy.config,
+    app.ups_run.config = replace(
+        app.ups_run.config,
         delayed_start_enabled=False,
         charge_cycle_enabled=False,
     )

@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.0.1
+
+Терминологический cleanup UPS Run без изменения поведения EnergyATS.
+
+- `outage_power_policy.py` и семейство `OutagePower*` полностью переименованы в `ups_run.py` и `UPSRun*`.
+- `main.py`, unit/integration tests и internal state используют единое имя `UPS Run` / `ups_run`; старые runtime/test identifiers удалены.
+- Persistent state key переименован в `ups_run`; `schema_version` поднят до `3`. Миграции schema 2 намеренно нет.
+- `ARCHITECTURE_RU.md` синхронизирован с фактическим именем модуля.
+- Версия App и add-on поднята до `1.0.1`.
+
+---
+
 ## 1.0.0
 
 Архитектурная стабилизация EnergyATS после Exercise, Load Manager и UPS Run / Charge Cycling. Версия 1.0.0 фиксирует единую модель верхнеуровневого поведения перед физическим commissioning.

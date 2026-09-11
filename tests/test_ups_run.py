@@ -1,12 +1,12 @@
 import pytest
 
 from domain import SessionReason
-from outage_power_policy import (
+from ups_run import (
     BatteryObservation,
-    OutagePowerConfig,
-    OutagePowerObservation,
-    OutagePowerPolicy,
-    OutagePowerState,
+    UPSRun,
+    UPSRunConfig,
+    UPSRunObservation,
+    UPSRunState,
 )
 
 
@@ -21,7 +21,7 @@ def cfg(**overrides):
         "telemetry_stale_time": 300,
     }
     values.update(overrides)
-    return OutagePowerConfig(**values)
+    return UPSRunConfig(**values)
 
 
 def battery(soc=70, ttg=180, *, discharging=True, ready=True, sample=1):
@@ -42,7 +42,7 @@ def obs(
     manual_override=False,
     manual_pending=False,
 ):
-    return OutagePowerObservation(
+    return UPSRunObservation(
         now=now,
         grid_ready=grid,
         automatic_transfer_enabled=avr,
@@ -57,16 +57,16 @@ def obs(
     )
 
 
-def test_disabled_policy_does_not_defer_or_cycle():
-    p = OutagePowerPolicy(OutagePowerConfig())
+def test_disabled_ups_run_does_not_defer_or_cycle():
+    p = UPSRun(UPSRunConfig())
     d = p.step(obs())
     assert not d.defer_automatic_start
     assert not d.request_cycle_stop
-    assert p.state == OutagePowerState.IDLE
+    assert p.state == UPSRunState.IDLE
 
 
 def test_wait_starts_only_after_core_grid_failure_delay():
-    p = OutagePowerPolicy(cfg())
+    p = UPSRun(cfg())
     before = p.step(obs(10, core_delay=False))
     after = p.step(obs(60, core_delay=True, b=battery(sample=2)))
     assert not before.defer_automatic_start
@@ -75,11 +75,11 @@ def test_wait_starts_only_after_core_grid_failure_delay():
 
 
 def test_high_soc_and_ttg_keep_generator_off():
-    p = OutagePowerPolicy(cfg())
+    p = UPSRun(cfg())
     d = p.step(obs(100, b=battery(75, 240)))
     assert d.defer_automatic_start
     assert d.outage_delay_already_satisfied
-    assert p.state == OutagePowerState.WAITING_ON_UPS
+    assert p.state == UPSRunState.WAITING_ON_UPS
 
 
 @pytest.mark.parametrize(
@@ -90,7 +90,7 @@ def test_high_soc_and_ttg_keep_generator_off():
     ],
 )
 def test_soc_or_ttg_threshold_requires_generator(b, now, expected_text):
-    p = OutagePowerPolicy(cfg())
+    p = UPSRun(cfg())
     d = p.step(obs(now, b=b))
     assert not d.defer_automatic_start
     assert d.claim_new_outage_session
@@ -98,7 +98,7 @@ def test_soc_or_ttg_threshold_requires_generator(b, now, expected_text):
 
 
 def test_max_wait_requires_generator():
-    p = OutagePowerPolicy(cfg(max_start_delay=100))
+    p = UPSRun(cfg(max_start_delay=100))
     assert p.step(obs(0)).defer_automatic_start
     d = p.step(obs(100, b=battery(sample=2)))
     assert not d.defer_automatic_start
@@ -117,21 +117,21 @@ def test_max_wait_requires_generator():
     ],
 )
 def test_bad_required_battery_data_fails_safe_to_generator(bad_battery):
-    p = OutagePowerPolicy(cfg())
+    p = UPSRun(cfg())
     d = p.step(obs(10, b=bad_battery))
     assert not d.defer_automatic_start
     assert d.claim_new_outage_session
-    assert p.state == OutagePowerState.GENERATOR_REQUIRED
+    assert p.state == UPSRunState.GENERATOR_REQUIRED
 
 
 def test_ttg_is_not_required_when_battery_is_not_discharging():
-    p = OutagePowerPolicy(cfg())
+    p = UPSRun(cfg())
     d = p.step(obs(10, b=battery(70, None, discharging=False)))
     assert d.defer_automatic_start
 
 
 def test_stale_telemetry_fails_safe_while_discharging():
-    p = OutagePowerPolicy(cfg(telemetry_stale_time=10))
+    p = UPSRun(cfg(telemetry_stale_time=10))
     assert p.step(obs(0, b=battery(sample=5))).defer_automatic_start
     d = p.step(obs(11, b=battery(sample=5)))
     assert not d.defer_automatic_start
@@ -139,7 +139,7 @@ def test_stale_telemetry_fails_safe_while_discharging():
 
 
 def test_fresh_sample_extends_telemetry_freshness():
-    p = OutagePowerPolicy(cfg(telemetry_stale_time=10))
+    p = UPSRun(cfg(telemetry_stale_time=10))
     p.step(obs(0, b=battery(sample=5)))
     d = p.step(obs(9, b=battery(sample=6)))
     assert d.defer_automatic_start
@@ -147,16 +147,16 @@ def test_fresh_sample_extends_telemetry_freshness():
 
 
 def test_grid_return_cancels_wait():
-    p = OutagePowerPolicy(cfg())
+    p = UPSRun(cfg())
     p.step(obs(10))
     d = p.step(obs(20, grid=True, b=battery(sample=2)))
     assert not d.defer_automatic_start
     assert p.waiting_since is None
-    assert p.state == OutagePowerState.IDLE
+    assert p.state == UPSRunState.IDLE
 
 
 def test_manual_request_bypasses_wait():
-    p = OutagePowerPolicy(cfg())
+    p = UPSRun(cfg())
     d = p.step(obs(10, manual_pending=True))
     assert not d.defer_automatic_start
     assert not d.claim_new_outage_session
@@ -164,14 +164,14 @@ def test_manual_request_bypasses_wait():
 
 
 def test_cycling_can_claim_immediate_automatic_start_when_delayed_start_disabled():
-    p = OutagePowerPolicy(cfg(delayed_start_enabled=False, charge_cycle_enabled=True))
+    p = UPSRun(cfg(delayed_start_enabled=False, charge_cycle_enabled=True))
     d = p.step(obs(10))
     assert not d.defer_automatic_start
     assert d.claim_new_outage_session
 
 
 def test_cycle_owned_session_stops_at_target_soc():
-    p = OutagePowerPolicy(cfg())
+    p = UPSRun(cfg())
     d = p.step(
         obs(
             100,
@@ -183,11 +183,11 @@ def test_cycle_owned_session_stops_at_target_soc():
         )
     )
     assert d.request_cycle_stop
-    assert p.state == OutagePowerState.TARGET_REACHED
+    assert p.state == UPSRunState.TARGET_REACHED
 
 
 def test_cycle_does_not_stop_before_target():
-    p = OutagePowerPolicy(cfg())
+    p = UPSRun(cfg())
     d = p.step(
         obs(
             100,
@@ -199,7 +199,7 @@ def test_cycle_does_not_stop_before_target():
         )
     )
     assert not d.request_cycle_stop
-    assert p.state == OutagePowerState.CHARGING
+    assert p.state == UPSRunState.CHARGING
 
 
 @pytest.mark.parametrize(
@@ -213,7 +213,7 @@ def test_cycle_does_not_stop_before_target():
 def test_manual_external_or_unowned_session_is_never_stopped_by_target(
     reason, cycle_owned, manual_override
 ):
-    p = OutagePowerPolicy(cfg())
+    p = UPSRun(cfg())
     d = p.step(
         obs(
             100,
@@ -229,17 +229,17 @@ def test_manual_external_or_unowned_session_is_never_stopped_by_target(
 
 
 def test_invalid_threshold_configuration_disables_optimization_only():
-    p = OutagePowerPolicy(cfg(start_soc=80, target_soc=40))
+    p = UPSRun(cfg(start_soc=80, target_soc=40))
     d = p.step(obs())
     assert not d.defer_automatic_start
     assert not d.request_cycle_stop
-    assert p.state == OutagePowerState.DEGRADED
+    assert p.state == UPSRunState.DEGRADED
 
 
 def test_waiting_since_survives_restart_but_freshness_does_not():
-    p = OutagePowerPolicy(cfg(max_start_delay=100))
+    p = UPSRun(cfg(max_start_delay=100))
     p.step(obs(10, b=battery(sample=1)))
-    restored = OutagePowerPolicy.from_dict(p.to_dict(), cfg(max_start_delay=100))
+    restored = UPSRun.from_dict(p.to_dict(), cfg(max_start_delay=100))
     d = restored.step(obs(50, core_delay=False, b=battery(sample=99)))
     assert d.defer_automatic_start
     assert d.outage_delay_already_satisfied
@@ -247,16 +247,16 @@ def test_waiting_since_survives_restart_but_freshness_does_not():
 
 
 def test_restart_wait_preserves_max_delay_elapsed_time():
-    p = OutagePowerPolicy(cfg(max_start_delay=100))
+    p = UPSRun(cfg(max_start_delay=100))
     p.step(obs(10))
-    restored = OutagePowerPolicy.from_dict(p.to_dict(), cfg(max_start_delay=100))
+    restored = UPSRun.from_dict(p.to_dict(), cfg(max_start_delay=100))
     d = restored.step(obs(111, core_delay=False, b=battery(sample=2)))
     assert not d.defer_automatic_start
     assert "максимальная" in (d.reason or "")
 
 
 def test_status_exposes_wait_and_battery_information():
-    p = OutagePowerPolicy(cfg(max_start_delay=100))
+    p = UPSRun(cfg(max_start_delay=100))
     b = battery(71, 123)
     p.step(obs(10, b=b))
     attrs = p.status_attributes(40, b)
@@ -269,7 +269,7 @@ def test_status_exposes_wait_and_battery_information():
 @pytest.mark.parametrize("waiting", [float("nan"), float("inf"), -1])
 def test_invalid_persisted_wait_timestamp_is_rejected(waiting):
     with pytest.raises(ValueError, match="waiting_since"):
-        OutagePowerPolicy.from_dict({"waiting_since": waiting}, cfg())
+        UPSRun.from_dict({"waiting_since": waiting}, cfg())
 
 
 def test_ha_cache_timestamp_survives_adapter_snapshot():
