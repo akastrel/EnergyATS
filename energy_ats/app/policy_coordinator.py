@@ -71,6 +71,7 @@ class PolicyCoordinator:
         outage_decision: OutagePowerDecision,
         *,
         grid_ready: bool | None,
+        exercise_side_events: tuple[SupervisorEvent, ...] = (),
     ) -> PolicyCoordinationResult:
         """Разрешить policy-конфликты и выполнить один шаг Supervisor.
 
@@ -78,7 +79,8 @@ class PolicyCoordinator:
         этого вызова. Здесь выполняются только меж-policy transitions.
         """
 
-        events = [*exercise_decision.events, *outage_decision.events]
+        exercise_events = [*exercise_decision.events, *exercise_side_events]
+        outage_events = list(outage_decision.events)
         session_before = self.supervisor.session
         cycle_return_before = (
             self.supervisor.phase == SupervisorPhase.RETURNING_TO_UPS
@@ -130,7 +132,7 @@ class PolicyCoordinator:
             and self.supervisor.session.generator == self.exercise_scheduler.owned_slot
             and grid_ready is False
         ):
-            events.extend(
+            exercise_events.extend(
                 self.exercise_scheduler.handoff_to_outage(
                     self.supervisor.session.generator,
                     exercise_observation,
@@ -145,7 +147,7 @@ class PolicyCoordinator:
             and self.supervisor.session is not None
             and self.supervisor.session.reason != SessionReason.GRID_OUTAGE
         ):
-            events.extend(
+            exercise_events.extend(
                 self.exercise_scheduler.cancel_unstarted(
                     exercise_observation,
                     "начата пользовательская managed-сессия",
@@ -159,7 +161,7 @@ class PolicyCoordinator:
             self.supervisor.phase == SupervisorPhase.RECOVERY_REQUIRED
             and self.exercise_scheduler.owned_slot is not None
         ):
-            events.extend(
+            exercise_events.extend(
                 self.exercise_scheduler.fail_active(
                     exercise_observation,
                     "EnergyATS перешёл в RECOVERY_REQUIRED во время пробного запуска.",
@@ -168,6 +170,12 @@ class PolicyCoordinator:
 
         return PolicyCoordinationResult(
             supervisor_decision=supervisor_decision,
-            events=tuple((*supervisor_decision.events, *events)),
+            events=tuple(
+                (
+                    *supervisor_decision.events,
+                    *exercise_events,
+                    *outage_events,
+                )
+            ),
             exercise_shutdown_slot=self.exercise_scheduler.authorized_shutdown_slot,
         )
