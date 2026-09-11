@@ -315,7 +315,7 @@ async def test_app_status_exposes_load_manager_diagnostics(tmp_path):
 
     hardware = app._apply_bus_model(app.adapter.snapshot())
     app._refresh_component_views(2.0, hardware)
-    payload = app._status_payload(2.0, app._supervisor_observation(hardware))
+    payload = app._status_payload(2.0, app._supervisor_observation(hardware), hardware)
     attrs = payload["attributes"]
     assert attrs["load_management_enabled"] is True
     assert attrs["load_manager_phase"] == "stable"
