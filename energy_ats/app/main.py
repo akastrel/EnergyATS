@@ -1,4 +1,4 @@
-"""Composition root EnergyATS: HA -> observations -> policy -> hardware commands."""
+"""Composition root EnergyATS: HA -> observations -> Supervisor -> hardware commands."""
 
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ from domain import (
 )
 from energy_supervisor import (
     EnergySupervisor,
+    ExerciseDirective,
     SupervisorConfig,
     SupervisorDecision,
     SupervisorObservation,
@@ -56,7 +57,6 @@ from outage_power_policy import (
     OutagePowerPolicy,
     OutagePowerState,
 )
-from policy_coordinator import PolicyCoordinator
 from power_transfer import PowerTransferController, TransferAction, TransferPhase
 from state_store import StateStore
 
@@ -115,7 +115,7 @@ _GENERATOR_PHASE_TEXT = {
 
 
 class EnergySupervisorApp:
-    """Связывает чистые FSM с Home Assistant; собственной policy не содержит."""
+    """Связывает доменные компоненты с Home Assistant; собственной policy не содержит."""
 
     def __init__(self, options: dict[str, Any], token: str) -> None:
         self.options = {**DEFAULT_OPTIONS, **options}
@@ -156,11 +156,6 @@ class EnergySupervisorApp:
             exercise_configs,
             load_manager_config,
             outage_power_config,
-        )
-        self.policy_coordinator = PolicyCoordinator(
-            self.supervisor,
-            self.exercise_scheduler,
-            self.outage_power_policy,
         )
 
         self._pending_action_records: list[dict[str, str]] = []
@@ -287,12 +282,12 @@ class EnergySupervisorApp:
         observation = self._supervisor_observation(hardware)
         exercise_observation = self._exercise_observation(now, hardware, observation)
         exercise_decision = self.exercise_scheduler.step(exercise_observation)
-        exercise_side_events: list[SupervisorEvent] = []
+        exercise_events = list(exercise_decision.events)
 
         for warning in exercise_decision.warnings:
             if await self.adapter.publish_user_notification(warning.message):
                 sent_at = datetime.fromtimestamp(now, self.local_time_zone)
-                exercise_side_events.append(
+                exercise_events.append(
                     self.exercise_scheduler.confirm_warning(
                         warning.slot,
                         warning.window_date,
@@ -307,16 +302,28 @@ class EnergySupervisorApp:
         outage_decision = self.outage_power_policy.step(
             self._outage_power_observation(now, hardware, observation)
         )
-        coordination = self.policy_coordinator.step(
+
+        # REQ-TRACE-01: system arbitration happens only in EnergySupervisor.
+        # Exercise/UPS Run provide local state/intents; main.py only dispatches
+        # the explicit decision returned by Supervisor.
+        decision = self.supervisor.step(
             now,
             observation,
-            exercise_observation,
-            exercise_decision,
-            outage_decision,
-            grid_ready=hardware.grid_ready,
-            exercise_side_events=tuple(exercise_side_events),
+            exercise_owned_slot=exercise_decision.owned_slot,
+            exercise_desired_running=exercise_decision.desired_running,
+            defer_automatic_start=outage_decision.defer_automatic_start,
+            outage_delay_already_satisfied=(
+                outage_decision.outage_delay_already_satisfied
+            ),
+            claim_new_outage_session=outage_decision.claim_new_outage_session,
+            request_cycle_stop=outage_decision.request_cycle_stop,
+            restore_grid_after_cycle=outage_decision.restore_grid_after_cycle,
         )
-        decision = coordination.supervisor_decision
+        exercise_events.extend(
+            self._dispatch_exercise_directive(decision, exercise_observation)
+        )
+        if decision.begin_post_cycle_wait:
+            self.outage_power_policy.begin_post_cycle_wait(now)
 
         actions_allowed = self.armed and decision.actions_allowed
         load_decision = self.load_manager.step(
@@ -349,8 +356,9 @@ class EnergySupervisorApp:
         authorized_shutdown_slots: set[GeneratorSlot] = set()
         if actions_allowed:
             authorized_shutdown_slots.update(decision.stop_outage_generators)
-        if self.armed and coordination.exercise_shutdown_slot is not None:
-            authorized_shutdown_slots.add(coordination.exercise_shutdown_slot)
+        exercise_shutdown_slot = self.exercise_scheduler.authorized_shutdown_slot
+        if self.armed and exercise_shutdown_slot is not None:
+            authorized_shutdown_slots.add(exercise_shutdown_slot)
 
         generator_actions: list[GeneratorAction] = []
         shutdown_errors: list[str] = []
@@ -402,8 +410,42 @@ class EnergySupervisorApp:
         await self._finish_tick(
             now,
             hardware,
-            tuple((*coordination.events, *load_events)),
+            tuple(
+                (
+                    *decision.events,
+                    *exercise_events,
+                    *outage_decision.events,
+                    *load_events,
+                )
+            ),
         )
+
+    def _dispatch_exercise_directive(
+        self,
+        decision: SupervisorDecision,
+        observation: ExerciseObservation,
+    ) -> tuple[SupervisorEvent, ...]:
+        """Механически применить решение Supervisor к локальной FSM Exercise."""
+        directive = decision.exercise_directive
+        if directive == ExerciseDirective.NONE:
+            return ()
+
+        slot = decision.exercise_slot
+        if slot is None:
+            raise RuntimeError(
+                f"Supervisor вернул {directive.value} без exercise_slot"
+            )
+        reason = decision.exercise_reason or directive.value
+
+        if directive == ExerciseDirective.CANCEL_UNSTARTED:
+            return self.exercise_scheduler.cancel_unstarted(observation, reason)
+        if directive == ExerciseDirective.HANDOFF_TO_OUTAGE:
+            return self.exercise_scheduler.handoff_to_outage(slot, observation)
+        if directive == ExerciseDirective.HANDOFF_TO_MANUAL:
+            return self.exercise_scheduler.handoff_to_manual(slot, observation)
+        if directive == ExerciseDirective.FAIL_ACTIVE:
+            return self.exercise_scheduler.fail_active(observation, reason)
+        raise RuntimeError(f"Неизвестная ExerciseDirective: {directive!r}")
 
     def _apply_bus_model(self, hardware: HardwareSnapshot) -> HardwareSnapshot:
         session = self.supervisor.session
@@ -717,7 +759,6 @@ class EnergySupervisorApp:
         if not needs_reset:
             self.supervisor.report_recovery_reset_not_needed()
             return
-
         blocker = self._recovery_blocker(hardware)
         if blocker is not None:
             self.supervisor.reject_recovery_reset(f"Сброс отклонён: {blocker}")
@@ -1269,7 +1310,7 @@ class EnergySupervisorApp:
         if self.load_manager.config.enabled:
             parts.append(f"load_manager={self.load_manager.phase.value}")
         if self.outage_power_policy.enabled:
-            parts.append(f"outage_policy={self.outage_power_policy.state.value}")
+            parts.append(f"ups_run={self.outage_power_policy.state.value}")
         exercise_slot = self.exercise_scheduler.owned_slot
         if exercise_slot is not None and self.exercise_scheduler.active_attempt is not None:
             parts.append(
