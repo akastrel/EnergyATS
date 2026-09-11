@@ -224,6 +224,8 @@ Safety / Recovery
 
 **Решение:** EnergyATS снимает дом с generator supply, штатно останавливает управляемый generator и остаётся на доступном `UPS_ONLY`. Автоматический повторный запуск подавляется до восстановления Grid либо до нового явного manual start.
 
+Если для выполнения этой команды **сам EnergyATS** отключил/оставил отключённым Grid path, обязанность вернуть сетевой ввод не исчезает после завершения generator session и должна переживать restart App. После непрерывной `grid_restore_stable_time` EnergyATS возвращает Grid path и снимает эту обязанность только после физического подтверждения Grid path. Это право относится только к изоляции, принадлежащей EnergyATS; произвольный пользовательский или внешний `grid_power=OFF` автоматически не отменяется.
+
 ### REQ-BEH-15. Отказ managed generator
 
 **Ситуация:** выбранный managed generator не запустился либо отказал во время session.
@@ -260,7 +262,7 @@ Safety / Recovery
 - `TC-BEH-06` — Recovery во время Exercise запрещает новые действия, но не оставляет автоматически запущенный двигатель бесконтрольным.
 - `TC-BEH-07` — Grid restore во время cycle-owned session имеет приоритет над Target SoC/UPS-only transition.
 - `TC-BEH-08` — manual override charge cycle отменяет автоматическую остановку по Target SoC.
-- `TC-BEH-09` — manual stop при продолжающемся outage завершает session и подавляет автоматический restart до Grid либо нового manual start.
+- `TC-BEH-09` — manual stop при продолжающемся outage завершает session, подавляет automatic restart и, если Grid path был изолирован самим EnergyATS, после stable Grid восстанавливает именно этот собственный ввод даже после restart App; чужое намеренное отключение Grid не отменяется.
 - `TC-BEH-10` — Load Manager DEGRADED не меняет решение Supervisor о generator/Grid и не создаёт системный Recovery.
 
 ---
@@ -283,7 +285,7 @@ house_powered_by_generator = OFF
 
 #### REQ-GRID-02. Намеренное отключение Grid
 
-`grid_input_ready = ON` при `grid_power = OFF` означает исправную внешнюю Grid, намеренно отключённую управляющей схемой. Это не является физическим outage и само по себе не запускает automatic outage-session.
+`grid_input_ready = ON` при `grid_power = OFF` означает исправную внешнюю Grid, намеренно отключённую управляющей схемой. Это не является физическим outage и само по себе не запускает automatic outage-session. Исключение — сохраняемая EnergyATS-owned обязанность восстановления после REQ-BEH-14: она не превращает произвольный `grid_power=OFF` в право auto-reconnect.
 
 #### REQ-GRID-03. Outage определяется физическим входом
 
@@ -371,7 +373,7 @@ REMOTE OFF управляемого generator разрешается тольк�
 
 #### REQ-STOP-03. Cooldown и подтверждённая остановка
 
-После снятия нагрузки выполняются штатный cooldown и REMOTE OFF; завершение требует подтверждённых `RUNNING=OFF` и `REMOTE=OFF`.
+После снятия нагрузки выполняются штатный cooldown и REMOTE OFF; завершение требует подтверждённых `RUNNING=OFF` и `REMOTE=OFF`. Если после подтверждённого снятия нагрузки managed generator получает stop fault либо не подтверждает остановку в установленный lifecycle timeout, текущий сценарий завершается системным Recovery/critical indication. Запуск SECONDARY как fallback для ошибки остановки после уже выполненного возврата дома на Grid запрещён.
 
 #### REQ-STOP-04. Manual stop не расширяет право на внешний generator
 
@@ -387,6 +389,7 @@ REMOTE OFF управляемого generator разрешается тольк�
 - `TC-CORE-06` (legacy #6) — manual start создаёт managed PRIMARY session и выполняет штатный transfer.
 - `TC-CORE-07` (legacy #7) — после устойчивого Grid restore дом сначала возвращается на Grid, затем generator штатно останавливается.
 - `TC-CORE-21` (legacy #21) — повторная потеря Grid во время возврата не приводит к слепому развороту незавершённой силовой операции.
+- `TC-CORE-24` — после подтверждённого возврата manual session на Grid stop fault managed generator переводит систему в Recovery без fallback на второй generator.
 
 ---
 
@@ -501,6 +504,7 @@ HA helper `input_boolean.generator_test_mode` маркирует новый вн
 - `TC-CORE-16` (legacy #16) — внешний outage-related generator после stable Grid корректно завершается разрешённым cleanup.
 - `TC-CORE-17` (legacy #17) — два outage-related generator после stable Grid оба корректно завершаются, если подпадают под cleanup.
 - `TC-CORE-18` (legacy #18) — внешний TEST_RUN не останавливается только из-за возврата Grid.
+- `TC-CORE-25` — после потери напряжения generator bus при всё ещё подтверждённо ON selector разрешён только безопасный break/de-select; это не должно преждевременно сорвать допустимый медленный fallback SECONDARY.
 
 ---
 
@@ -682,7 +686,7 @@ Blocked-by-presence attempt фиксируется как `DEFERRED`; следу
 
 #### REQ-EXERCISE-06. Presence проверяется непосредственно перед start
 
-До окончания grace period появление семьи перед физическим стартом отменяет текущую попытку.
+До окончания grace period появление семьи **либо потеря достоверного подтверждения отсутствия** (`unknown/unavailable`) до фактического REMOTE ON отменяет текущую ordinary attempt как `DEFERRED`. Forced Exercise использует отдельное правило REQ-EXERCISE-07/08.
 
 #### REQ-EXERCISE-07. Forced date отменяет только presence restriction
 
@@ -789,7 +793,7 @@ Exercise, переданный outage, фиксируется как `INTERRUPTE
 - `TC-EX-05` (legacy #28) — после исчезновения presence в следующем разрешённом window Exercise выполняется.
 - `TC-EX-06` (legacy #29) — перед forced Exercise реально отправляется warning за требуемый lead.
 - `TC-EX-07` (legacy #30) — пропущенный из-за offline warning не создаёт неожиданного forced catch-up.
-- `TC-EX-08` (legacy #31) — появление человека непосредственно перед ordinary start даёт DEFERRED.
+- `TC-EX-08` (legacy #31) — появление человека либо `unknown/unavailable` presence непосредственно перед ordinary REMOTE ON даёт DEFERRED и не запускает generator.
 - `TC-EX-09` (legacy #32) — forced start игнорирует presence, но не Safety/E-stop/Recovery/unknown-state.
 - `TC-EX-10` (legacy #33) — PRIMARY/SECONDARY role не меняет индивидуальный schedule.
 - `TC-EX-11` (legacy #34) — failure A Exercise не запускает B как fallback.
@@ -894,15 +898,15 @@ Admission/overload/shedding используют `sensor.generator_power` в W. 
 
 #### REQ-LOAD-14. Условия валидного measurement
 
-Power decision разрешено только при confirmed generator supply, known bus owner, valid limits, healthy meter, fresh numeric power и завершённом stabilization после последнего load change.
+Power decision разрешено только при confirmed generator supply, known bus owner, valid limits, healthy meter, **непрерывно свежем** numeric power stream и завершённом stabilization после последнего load change. Свежесть относится не только к значению entity, но и к появлению новых samples.
 
 #### REQ-LOAD-15. Несколько свежих samples
 
-Один случайный sample не подтверждает steady load; в stabilization window требуется несколько свежих измерений.
+Один случайный sample не подтверждает steady load; в stabilization window требуется несколько свежих измерений. Gap длиннее допустимого freshness interval разрывает непрерывность measurement/overload timer и требует доказательства заново.
 
 #### REQ-LOAD-16. Meter — soft dependency
 
-Meter failure/stale/unknown не блокирует App, GC/TPC/core decision, не создаёт system Recovery и не является основанием stop generator. Он запрещает только новые решения, которым нужна достоверная мощность.
+Meter failure/stale/unknown, включая остановившийся поток новых samples при остающемся доступным entity, не блокирует App, GC/TPC/core decision, не создаёт system Recovery и не является основанием stop generator. Load Manager переходит в локальный DEGRADED и запрещает новые power-based решения.
 
 #### REQ-LOAD-17. Meter unavailable до restore groups
 
@@ -910,11 +914,11 @@ Shed groups остаются OFF; вслепую добавлять их на ge
 
 #### REQ-LOAD-18. Meter отказал при устойчивой работе
 
-Текущее G1/G2 state не меняется только из-за потери meter; measurement-based decisions приостанавливаются.
+Текущее G1/G2 state не меняется только из-за потери meter; measurement-based decisions приостанавливаются. Любые незавершённые overload/admission timers, непрерывность которых нельзя доказать через gap, сбрасываются.
 
 #### REQ-LOAD-19. Meter recovered
 
-После recovery meter сначала проходит новый stabilization window; первый sample не используется как shortcut.
+После recovery meter сначала проходит новый stabilization window; первый sample не используется как shortcut и не продолжает старый overload/admission timer.
 
 ### 9.5. Admission
 
@@ -954,11 +958,11 @@ Load Manager не заканчивается после startup/admission; overl
 
 #### REQ-LOAD-28. Sustained nominal overload
 
-`nominal < P <= maximum` допускается кратковременно; shedding начинается только после `nominal_overload_time` непрерывного превышения.
+`nominal < P <= maximum` допускается кратковременно; shedding начинается только после `nominal_overload_time` **непрерывно наблюдаемого** превышения. Gap/stale stream разрывает continuity и сбрасывает этот timer.
 
 #### REQ-LOAD-29. Maximum overload
 
-`P > maximum` после отдельного короткого confirmation запускает ускоренный shedding; одиночный spike не должен переключать groups.
+`P > maximum` после отдельного короткого confirmation запускает ускоренный shedding; одиночный spike не должен переключать groups. Confirmation требует непрерывно свежих samples и также сбрасывается при stale gap.
 
 #### REQ-LOAD-30. Shed по одной группе
 
@@ -1051,6 +1055,7 @@ load_restore_retry_interval = 300 s
 - `TC-LOAD-22` (legacy #75) — unavailable load switch/meter не переводит core ATS в Recovery и не блокирует Grid return.
 - `TC-LOAD-23` (legacy #76) — disabled Load Manager не выдаёт G1/G2 commands и не меняет обычный ATS flow.
 - `TC-LOAD-24` (legacy #77) — invalid/missing owner power metadata даёт Load Manager DEGRADED без остановки core ATS.
+- `TC-LOAD-25` — stale gap потока power samples уже в `STABLE` переводит Load Manager в `DEGRADED`, сбрасывает overload continuity, а первый новый sample после восстановления не вызывает immediate shedding/admission без нового stabilization.
 
 ---
 
@@ -1090,7 +1095,9 @@ Restart во время неподтверждённой физической tr
 
 #### REQ-FAULT-02. Generator control выбран, feedback не пришёл
 
-Если generator source command устойчиво активна, generator доступен, а expected feedback не появился за timeout, это transfer/feedback fault.
+Если generator source command устойчиво активна, **generator source доступен**, а expected feedback не появился за timeout, это transfer/feedback fault. Исчезновение generator voltage/RUNNING само по себе не доказывает положение generator selector/contact: отсутствие напряжения нельзя трактовать как подтверждение размыкания.
+
+Если при потере generator source control state достоверно показывает `generator_selected=ON`, а требуемое направление — снять generator source/изолировать дом перед fallback или возвратом, разрешена только безопасная **break**-команда `DESELECT_GENERATOR` с последующим физическим подтверждением. Отсутствующий feedback не разрешает make-команду и не считается подтверждением уже выполненного размыкания.
 
 #### REQ-FAULT-03. Grid control выбран, feedback не пришёл
 
@@ -1124,6 +1131,8 @@ Recovery не расширяет право на external generator, кроме 
 - `TC-CORE-20` (legacy #20) — transfer confirmation timeout приводит к контролируемому Recovery, а не бесконечному ожиданию/повтору.
 - `TC-CORE-22` (legacy #22) — Emergency Stop блокирует обычные automatic/manual starts.
 - `TC-CORE-23` (legacy #23) — restart после незавершённой physical transaction не продолжает её вслепую.
+- `TC-CORE-24` — stop fault managed generator после уже подтверждённого manual return на Grid даёт Recovery без запуска fallback generator.
+- `TC-CORE-25` — потеря generator voltage при `generator_selected=ON` разрешает безопасный DESELECT и не должна обрывать допустимый SECONDARY start более коротким stale-topology timeout.
 
 Feature-specific restart cases дополнительно описаны `TC-EX-19..21`, `TC-LOAD-17`, `TC-UPS-15..17`.
 
@@ -1301,12 +1310,12 @@ PHYSICAL_POWER_TOPOLOGY_RU.md
 | Область требований | Test cases | Основная автоматическая проверка | Физическая проверка |
 |---|---|---|---|
 | `REQ-BEH-01..18` — пересечения режимов | `TC-BEH-01..10` | Supervisor/integration scenarios | для transfer/start/stop конфликтов — да |
-| `REQ-GRID-*`, `REQ-AUTO-*`, `REQ-MANUAL-*`, `REQ-RETURN-*`, `REQ-STOP-*` | `TC-CORE-01..07`, `TC-CORE-21` | core ATS integration | да |
-| `REQ-BUS-*`, `REQ-EXT-*`, `REQ-FALLBACK-*`, `REQ-OUTRUN-*` | `TC-CORE-08..18` | bus/supervisor integration | да для owner/takeover/fallback |
+| `REQ-GRID-*`, `REQ-AUTO-*`, `REQ-MANUAL-*`, `REQ-RETURN-*`, `REQ-STOP-*` | `TC-CORE-01..07`, `TC-CORE-21/24` | core ATS integration | да |
+| `REQ-BUS-*`, `REQ-EXT-*`, `REQ-FALLBACK-*`, `REQ-OUTRUN-*` | `TC-CORE-08..18`, `TC-CORE-25` | bus/supervisor/TPC integration | да для owner/takeover/fallback |
 | `REQ-DELAY-*`, `REQ-CYCLE-*` | `TC-UPS-01..17`, `TC-BEH-01/07/08/09` | UPS Run + app integration | да для реального Generator->UPS/Grid cycle |
 | `REQ-EXERCISE-*` | `TC-EX-01..31`, `TC-BEH-02..06` | scheduler + app integration | минимальный physical Exercise set обязателен |
-| `REQ-LOAD-*` | `TC-LOAD-01..24`, `TC-BEH-10` | LoadManager + app integration | да для pre-shed/admission/overload |
-| `REQ-START-*`, `REQ-FAULT-*` | `TC-CORE-14/15/19/20/22/23` + feature restart cases | persistence/recovery integration | часть recovery cases физически |
+| `REQ-LOAD-*` | `TC-LOAD-01..25`, `TC-BEH-10` | LoadManager + app integration | да для pre-shed/admission/overload |
+| `REQ-START-*`, `REQ-FAULT-*` | `TC-CORE-14/15/19/20/22..25` + feature restart cases | persistence/recovery integration | часть recovery cases физически |
 | `REQ-TRACE-*` | review/CI convention | наличие descriptions/coverage | не применяется |
 
 ### 14.1. Правило полноты
