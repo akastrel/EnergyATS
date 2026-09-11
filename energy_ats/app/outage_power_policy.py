@@ -98,6 +98,7 @@ class OutagePowerPolicy:
         self.config = config or OutagePowerConfig()
         self.state = OutagePowerState.IDLE
         self.waiting_since: float | None = None
+        self.post_cycle_wait = False
         self.last_reason: str | None = None
 
         # Freshness нужна только для delayed start. Measurement state после
@@ -111,12 +112,21 @@ class OutagePowerPolicy:
     def enabled(self) -> bool:
         return self.config.delayed_start_enabled or self.config.charge_cycle_enabled
 
+    def begin_post_cycle_wait(self, now: float) -> None:
+        """Начать следующий battery interval после штатного cycle stop."""
+        self.post_cycle_wait = True
+        self.waiting_since = now
+        self.state = OutagePowerState.WAITING_ON_UPS
+        self.last_reason = "Цикл заряда завершён; ожидаем следующей необходимости запуска."
+        self._last_event_key = None
+
     def step(self, o: OutagePowerObservation) -> OutagePowerDecision:
         events: list[SupervisorEvent] = []
         self._observe_sample(o.now, o.battery.sample_id)
 
         if o.grid_ready is True:
             self._reset_wait()
+            self.post_cycle_wait = False
             self.state = OutagePowerState.IDLE
             self.last_reason = None
             self._last_event_key = None
@@ -124,6 +134,7 @@ class OutagePowerPolicy:
 
         if not self.enabled or not o.automatic_transfer_enabled:
             self._reset_wait()
+            self.post_cycle_wait = False
             self.state = OutagePowerState.IDLE
             self.last_reason = None
             return OutagePowerDecision()
@@ -137,6 +148,7 @@ class OutagePowerPolicy:
 
         if o.session_active:
             self._reset_wait()
+            self.post_cycle_wait = False
             return self._with_session(o, events)
 
         return self._without_session(o, events)
@@ -168,8 +180,12 @@ class OutagePowerPolicy:
             delay_satisfied = True
 
         claim = self.config.charge_cycle_enabled
+        should_wait_on_battery = self.config.delayed_start_enabled or self.post_cycle_wait
 
-        if not self.config.delayed_start_enabled:
+        # При отключённом Delayed Start первый automatic run начинается сразу
+        # после core delay. Но последующие cycling intervals всё равно обязаны
+        # ждать Start SoC/TTG/max-delay, иначе generator тут же перезапустится.
+        if not should_wait_on_battery:
             self.state = OutagePowerState.GENERATOR_REQUIRED
             self.last_reason = "Delayed Start выключен."
             return OutagePowerDecision(
@@ -246,6 +262,13 @@ class OutagePowerPolicy:
         o: OutagePowerObservation,
         events: list[SupervisorEvent],
     ) -> OutagePowerDecision:
+        # Ручная команда, уже ожидающая обработки Supervisor, немедленно
+        # запрещает Target-SoC stop в этом tick.
+        if o.manual_start_pending:
+            self.state = OutagePowerState.IDLE
+            self.last_reason = "Пользователь принял generator-session под ручное управление."
+            return OutagePowerDecision(reason=self.last_reason)
+
         if o.session_reason != SessionReason.GRID_OUTAGE:
             self.state = OutagePowerState.IDLE
             self.last_reason = None
@@ -375,6 +398,7 @@ class OutagePowerPolicy:
         return {
             "state": self.state.value,
             "waiting_since": self.waiting_since,
+            "post_cycle_wait": self.post_cycle_wait,
             "last_reason": self.last_reason,
         }
 
@@ -388,6 +412,10 @@ class OutagePowerPolicy:
         policy.state = OutagePowerState(str(data.get("state", OutagePowerState.IDLE.value)))
         waiting = data.get("waiting_since")
         policy.waiting_since = float(waiting) if waiting is not None else None
+        post_cycle_wait = data.get("post_cycle_wait", False)
+        if type(post_cycle_wait) is not bool:
+            raise ValueError("post_cycle_wait должен быть boolean")
+        policy.post_cycle_wait = post_cycle_wait
         reason = data.get("last_reason")
         policy.last_reason = str(reason) if reason is not None else None
         return policy
