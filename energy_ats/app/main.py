@@ -51,17 +51,17 @@ from load_manager import (
     LoadManagerConfig,
     LoadManagerObservation,
 )
-from outage_power_policy import (
-    OutagePowerConfig,
-    OutagePowerObservation,
-    OutagePowerPolicy,
-    OutagePowerState,
+from ups_run import (
+    UPSRun,
+    UPSRunConfig,
+    UPSRunObservation,
+    UPSRunState,
 )
 from power_transfer import PowerTransferController, TransferAction, TransferPhase
 from state_store import StateStore
 
-APP_VERSION = "1.0.0"
-STATE_SCHEMA_VERSION = 2
+APP_VERSION = "1.0.1"
+STATE_SCHEMA_VERSION = 3
 
 DEFAULT_OPTIONS: dict[str, Any] = {
     "armed": False,
@@ -127,7 +127,7 @@ class EnergySupervisorApp:
         self.client = HomeAssistantClient(token, logger=self.log)
         exercise_configs = self._exercise_configs()
         load_manager_config = self._load_manager_config()
-        outage_power_config = self._outage_power_config()
+        ups_run_config = self._ups_run_config()
         self.adapter = HomeAssistantAdapter(
             self.client,
             armed=self.armed,
@@ -149,13 +149,13 @@ class EnergySupervisorApp:
             self.supervisor,
             self.exercise_scheduler,
             self.load_manager,
-            self.outage_power_policy,
+            self.ups_run,
         ) = self._restore_state(
             saved,
             load_error,
             exercise_configs,
             load_manager_config,
-            outage_power_config,
+            ups_run_config,
         )
 
         self._pending_action_records: list[dict[str, str]] = []
@@ -299,8 +299,8 @@ class EnergySupervisorApp:
                 # Persist it immediately instead of waiting for the end of tick.
                 self._save_state(force=True)
 
-        outage_decision = self.outage_power_policy.step(
-            self._outage_power_observation(now, hardware, observation)
+        ups_run_decision = self.ups_run.step(
+            self._ups_run_observation(now, hardware, observation)
         )
 
         # REQ-TRACE-01: system arbitration happens only in EnergySupervisor.
@@ -311,19 +311,19 @@ class EnergySupervisorApp:
             observation,
             exercise_owned_slot=exercise_decision.owned_slot,
             exercise_desired_running=exercise_decision.desired_running,
-            defer_automatic_start=outage_decision.defer_automatic_start,
+            defer_automatic_start=ups_run_decision.defer_automatic_start,
             outage_delay_already_satisfied=(
-                outage_decision.outage_delay_already_satisfied
+                ups_run_decision.outage_delay_already_satisfied
             ),
-            claim_new_outage_session=outage_decision.claim_new_outage_session,
-            request_cycle_stop=outage_decision.request_cycle_stop,
-            restore_grid_after_cycle=outage_decision.restore_grid_after_cycle,
+            claim_new_outage_session=ups_run_decision.claim_new_outage_session,
+            request_cycle_stop=ups_run_decision.request_cycle_stop,
+            restore_grid_after_cycle=ups_run_decision.restore_grid_after_cycle,
         )
         exercise_events.extend(
             self._dispatch_exercise_directive(decision, exercise_observation)
         )
         if decision.begin_post_cycle_wait:
-            self.outage_power_policy.begin_post_cycle_wait(now)
+            self.ups_run.begin_post_cycle_wait(now)
 
         actions_allowed = self.armed and decision.actions_allowed
         load_decision = self.load_manager.step(
@@ -414,7 +414,7 @@ class EnergySupervisorApp:
                 (
                     *decision.events,
                     *exercise_events,
-                    *outage_decision.events,
+                    *ups_run_decision.events,
                     *load_events,
                 )
             ),
@@ -608,12 +608,12 @@ class EnergySupervisorApp:
             bus=self.generator_bus.status(),
         )
 
-    def _outage_power_observation(
+    def _ups_run_observation(
         self,
         now: float,
         hardware: HardwareSnapshot,
         observation: SupervisorObservation,
-    ) -> OutagePowerObservation:
+    ) -> UPSRunObservation:
         session = self.supervisor.session
         bus_owner = self.generator_bus.status().owner_slot
         core_delay_elapsed = bool(
@@ -627,7 +627,7 @@ class EnergySupervisorApp:
             and observation.power.actual_path == PowerPath.GENERATOR
             and bus_owner == session.generator
         )
-        return OutagePowerObservation(
+        return UPSRunObservation(
             now=now,
             grid_ready=hardware.grid_ready,
             automatic_transfer_enabled=observation.automatic_transfer_enabled,
@@ -904,18 +904,18 @@ class EnergySupervisorApp:
         load_error: str | None,
         exercise_configs: dict[GeneratorSlot, ExerciseConfig],
         load_manager_config: LoadManagerConfig,
-        outage_power_config: OutagePowerConfig,
+        ups_run_config: UPSRunConfig,
     ) -> tuple[
         GeneratorBusTracker,
         EnergySupervisor,
         ExerciseScheduler,
         LoadManager,
-        OutagePowerPolicy,
+        UPSRun,
     ]:
         config = self._supervisor_config(GeneratorSlot.A)
         fresh_scheduler = ExerciseScheduler(exercise_configs)
         fresh_load_manager = LoadManager(load_manager_config)
-        fresh_outage_policy = OutagePowerPolicy(outage_power_config)
+        fresh_ups_run = UPSRun(ups_run_config)
         if load_error is not None:
             supervisor = EnergySupervisor(config)
             supervisor.require_recovery(
@@ -926,7 +926,7 @@ class EnergySupervisorApp:
                 supervisor,
                 fresh_scheduler,
                 fresh_load_manager,
-                fresh_outage_policy,
+                fresh_ups_run,
             )
         if saved is None:
             return (
@@ -934,7 +934,7 @@ class EnergySupervisorApp:
                 EnergySupervisor(config),
                 fresh_scheduler,
                 fresh_load_manager,
-                fresh_outage_policy,
+                fresh_ups_run,
             )
 
         try:
@@ -970,7 +970,7 @@ class EnergySupervisorApp:
                 supervisor,
                 fresh_scheduler,
                 fresh_load_manager,
-                fresh_outage_policy,
+                fresh_ups_run,
             )
 
         # Load Manager persistent state is deliberately isolated from core ATS.
@@ -992,27 +992,25 @@ class EnergySupervisorApp:
                 )
                 manager = fresh_load_manager
 
-        # Delayed Start / Cycling — оптимизация, а не core dependency. Потеря
-        # её state означает консервативный возврат к обычному generator start,
-        # но не системный RECOVERY_REQUIRED.
-        outage_policy = fresh_outage_policy
-        outage_payload = saved.get("outage_power_policy")
-        if outage_payload is not None:
+        # UPS Run — оптимизация, а не core dependency. Потеря её state означает
+        # консервативный возврат к обычному generator start, но не системный
+        # RECOVERY_REQUIRED.
+        ups_run = fresh_ups_run
+        ups_run_payload = saved.get("ups_run")
+        if ups_run_payload is not None:
             try:
-                if not isinstance(outage_payload, dict):
-                    raise ValueError("outage_power_policy должен быть object")
-                outage_policy = OutagePowerPolicy.from_dict(
-                    outage_payload, outage_power_config
-                )
+                if not isinstance(ups_run_payload, dict):
+                    raise ValueError("ups_run должен быть object")
+                ups_run = UPSRun.from_dict(ups_run_payload, ups_run_config)
             except Exception as exc:
                 self.log.warning(
-                    "Не удалось восстановить Delayed Start/Cycling state; "
-                    "используем безопасное начальное состояние: %s",
+                    "Не удалось восстановить UPS Run state; используем безопасное "
+                    "начальное состояние: %s",
                     exc,
                 )
-                outage_policy = fresh_outage_policy
+                ups_run = fresh_ups_run
 
-        return bus, supervisor, scheduler, manager, outage_policy
+        return bus, supervisor, scheduler, manager, ups_run
 
     def _save_state(self, *, force: bool = False) -> None:
         payload = {
@@ -1022,7 +1020,7 @@ class EnergySupervisorApp:
             "generator_bus": self.generator_bus.to_dict(),
             "exercise_scheduler": self.exercise_scheduler.to_dict(),
             "load_manager": self.load_manager.to_dict(),
-            "outage_power_policy": self.outage_power_policy.to_dict(),
+            "ups_run": self.ups_run.to_dict(),
             "pending_actions": list(self._pending_action_records),
         }
         signature = json.dumps(payload, ensure_ascii=False, sort_keys=True)
@@ -1066,8 +1064,8 @@ class EnergySupervisorApp:
             restore_retry_interval=float(self.options["load_restore_retry_interval"]),
         )
 
-    def _outage_power_config(self) -> OutagePowerConfig:
-        return OutagePowerConfig(
+    def _ups_run_config(self) -> UPSRunConfig:
+        return UPSRunConfig(
             delayed_start_enabled=_boolean_option(
                 self.options, "delayed_generator_start_enabled"
             ),
@@ -1179,9 +1177,7 @@ class EnergySupervisorApp:
         local_now = datetime.fromtimestamp(now, self.local_time_zone)
         attributes.update(self.exercise_scheduler.status_attributes(local_now, now))
         attributes.update(self.load_manager.status_attributes())
-        attributes.update(
-            self.outage_power_policy.status_attributes(now, hardware.battery)
-        )
+        attributes.update(self.ups_run.status_attributes(now, hardware.battery))
         exercise_slot = self.exercise_scheduler.owned_slot
         attributes["exercise_active_generator"] = (
             self._profile(exercise_slot).display_name if exercise_slot else None
@@ -1209,12 +1205,12 @@ class EnergySupervisorApp:
                 return _seconds_left(deadline - now)
 
         if (
-            self.outage_power_policy.state == OutagePowerState.WAITING_ON_UPS
-            and self.outage_power_policy.waiting_since is not None
+            self.ups_run.state == UPSRunState.WAITING_ON_UPS
+            and self.ups_run.waiting_since is not None
         ):
             return _seconds_left(
-                self.outage_power_policy.config.max_start_delay
-                - (now - self.outage_power_policy.waiting_since)
+                self.ups_run.config.max_start_delay
+                - (now - self.ups_run.waiting_since)
             )
 
         if (
@@ -1309,8 +1305,8 @@ class EnergySupervisorApp:
             parts.append(f"transfer={transfer}")
         if self.load_manager.config.enabled:
             parts.append(f"load_manager={self.load_manager.phase.value}")
-        if self.outage_power_policy.enabled:
-            parts.append(f"ups_run={self.outage_power_policy.state.value}")
+        if self.ups_run.enabled:
+            parts.append(f"ups_run={self.ups_run.state.value}")
         exercise_slot = self.exercise_scheduler.owned_slot
         if exercise_slot is not None and self.exercise_scheduler.active_attempt is not None:
             parts.append(
