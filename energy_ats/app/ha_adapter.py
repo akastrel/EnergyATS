@@ -18,6 +18,7 @@ from generator_controller import (
 )
 from ha_client import HomeAssistantClient
 from load_manager import LoadAction, LoadActionKind, LoadGroup
+from outage_power_policy import BatteryObservation
 from power_transfer import (
     PowerTransferObservation,
     TransferAction,
@@ -62,6 +63,12 @@ ENTITIES = {
     "generator_frequency": "sensor.generator_frequency",
     "load_g1": "switch.non_critical_loads_first_floor",
     "load_g2": "switch.non_critical_loads_basement_floor",
+    # Battery inputs Delayed Start / Charge Cycling. Это soft dependencies:
+    # отсутствие любого из них не должно блокировать core ATS.
+    "ups_battery_soc": "sensor.ups_battery_charge_level_soc",
+    "ups_battery_ttg_minutes": "sensor.ups_battery_time_remaining_minutes_ttg",
+    "ups_running_on_battery": "binary_sensor.ups_running_on_battery",
+    "ups_ready": "binary_sensor.ups_ready",
 }
 
 ENERGY_ATS_LOG_ENTITY = "update.energy_ats_update"
@@ -102,6 +109,7 @@ class HardwareSnapshot:
     primary_generator: GeneratorSlot | None
     power_transfer: PowerTransferObservation
     load_management: LoadManagementSnapshot
+    battery: BatteryObservation
 
 
 class UnsafeHardwareCommand(RuntimeError):
@@ -236,6 +244,27 @@ class HomeAssistantAdapter:
             },
         )
 
+        battery_entities = (
+            ENTITIES["ups_battery_soc"],
+            ENTITIES["ups_battery_ttg_minutes"],
+            ENTITIES["ups_running_on_battery"],
+            ENTITIES["ups_ready"],
+        )
+        battery_revisions = tuple(
+            self.state_revision(entity_id) for entity_id in battery_entities
+        )
+        battery = BatteryObservation(
+            soc=self.float_state(ENTITIES["ups_battery_soc"]),
+            ttg_minutes=self.float_state(ENTITIES["ups_battery_ttg_minutes"]),
+            discharging=self.bool_state(ENTITIES["ups_running_on_battery"]),
+            ready=self.bool_state(ENTITIES["ups_ready"]),
+            sample_id=(
+                battery_revisions
+                if any(value is not None for value in battery_revisions)
+                else None
+            ),
+        )
+
         return HardwareSnapshot(
             grid_ready=grid_ready,
             automatic_transfer_enabled=(
@@ -260,6 +289,7 @@ class HomeAssistantAdapter:
                 emergency_stop=emergency_stop,
             ),
             load_management=load_management,
+            battery=battery,
         )
 
     def missing_required_entities(
@@ -267,8 +297,9 @@ class HomeAssistantAdapter:
         *,
         include_control_entities: bool = True,
     ) -> list[str]:
-        # Load Manager entities and Nominal/Maximum metadata намеренно не входят
-        # сюда: это soft dependencies и они не могут блокировать старт core ATS.
+        # Load Manager, battery-policy entities and Nominal/Maximum metadata
+        # намеренно не входят сюда: это soft dependencies и они не могут
+        # блокировать старт core ATS.
         state_required = [
             ENTITIES["automatic_transfer"],
             ENTITIES["grid_ready"],
