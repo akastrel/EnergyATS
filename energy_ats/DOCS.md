@@ -313,15 +313,24 @@ EnergyATS сохраняет состояние, необходимое для �
 
 ## 12. Что обязательно проверить физически
 
-Автоматические tests и container smoke не проверяют реальные контакторы, DKG116, генераторы и проводку.
+Автоматические tests и container smoke не проверяют реальные контакторы, DKG116, генераторы, MAP, meter и проводку. Поэтому физический commissioning в `USER_TESTS_RU.md` отбирается по другому принципу: тест остаётся только тогда, когда проверяет уникальный hardware/integration risk.
 
-Перед эксплуатацией пройдите:
+Для базового ATS перед unattended эксплуатацией:
 
-- M1–M10 из `USER_TESTS_RU.md` для core ATS;
-- C1–C4, если используется UPS Run;
-- C5–C6, если используется Scheduled Exercise;
-- C7 для подтверждения реальной fallback/feedback семантики;
-- E12–E18, если включён Load Manager.
+- M1–M7 — core ATS;
+- R1–R4 — restart, реальные переходы и топология;
+- P1 — electrical acceptance каждого generator, включая MAP/заряд АКБ;
+- R5 — если нужен полностью подтверждённый fallback на конкретной feedback-схеме и отказ PRIMARY можно вызвать безопасно;
+- P2 — перед длительной unattended эксплуатацией каждого generator.
+
+Для optional features:
+
+- U1–U2 — UPS Run;
+- X1–X3 — Scheduled Exercise;
+- L1–L3 — Load Manager;
+- L4 — optional meter-loss test, только если данные можно безопасно отключить.
+
+Отдельно не повторяются симметричные A/B permutations, двойной отказ ради проверки software ping-pong, manual Target-override без нового аппаратного эффекта и искусственные feedback faults без безопасного штатного способа. Это automated/HIL territory.
 
 ## 13. Полная документация
 
