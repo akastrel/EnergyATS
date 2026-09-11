@@ -1,4 +1,4 @@
-# Energy ATS 0.6.0 — архитектура
+# Energy ATS 0.7.0 — архитектура
 
 ## 1. Источники истины
 
@@ -24,6 +24,7 @@ EnergyATS — один Home Assistant App и один Python-процесс, н�
 | `energy_supervisor.py` | Основная ATS-policy: outage, managed-сессия, fallback, возврат Grid, recovery |
 | `exercise_scheduler.py` | Maintenance-policy: due/grace/warning, qualifying history и ownership scheduled exercise |
 | `load_manager.py` | Policy некритичных G1/G2: pre-transfer LOAD_SHEDDING, admission, continuous overload control и собственный OFF ownership |
+| `outage_power_policy.py` | Решение ждать на UPS, начать automatic outage-session или завершить собственный charge cycle |
 | `ha_adapter.py` | HA states -> observations и разрешённые HA service calls |
 | `main.py` | Composition root: единый tick, arbitration policy-компонентов, journal, status и log |
 | `state_store.py` | Атомарное сохранение persistent state |
@@ -169,6 +170,7 @@ Supervisor содержит основную ATS-policy, которую нель
 - `STARTING_GENERATOR`;
 - `ON_GENERATOR`;
 - `RETURNING_TO_GRID`;
+- `RETURNING_TO_UPS`;
 - `EXTERNAL_RUNNING`;
 - `RECOVERY_REQUIRED`.
 
@@ -183,6 +185,7 @@ Supervisor содержит основную ATS-policy, которую нель
 - началась ли сессия при отсутствующей Grid;
 - запрошена ли остановка;
 - использован ли единственный fallback;
+- принадлежит ли сессия cycling (`cycle_owned`) и включён ли ручной override;
 - наблюдался ли внешний аппаратный takeover после отказа managed generator.
 
 ### Fallback
@@ -204,6 +207,16 @@ Supervisor содержит основную ATS-policy, которую нель
 4. внешний `TEST_RUN`, `OTHER` и `UNKNOWN` узким outage-cleanup правилом не захватываются.
 
 Load Manager не имеет права задерживать возврат Grid из-за meter/G1/G2 failure.
+
+### Delayed Start / Charge Cycling
+
+`OutagePowerPolicy` не выдаёт аппаратных команд. В едином tick она получает батарейные данные и контекст сессии, затем передаёт Supervisor решение о задержке старта или остановке собственного цикла. Новая automatic outage-session получает `cycle_owned`; manual/external и adopted exercise-сессии автоматически его не получают.
+
+В `RETURNING_TO_UPS` Supervisor требует изоляцию через TPC и только после её подтверждения снимает желание RUNNING у GC. GC выполняет cooldown/stop. Отказ остановки требует Recovery без fallback. Ручной запрос возобновляет штатный запуск того же двигателя и отменяет cycle ownership.
+
+После подтверждённой остановки `post_cycle_wait` сохраняет обязанность восстановить сетевой ввод при устойчивом возврате Grid. Первое краткое появление сети не обнуляет таймер. Новые циклы проходят тот же Load Manager и TPC, что и обычные outage-сессии.
+
+Policy сохраняет начало ожидания и признак межциклового ожидания; Supervisor сохраняет ownership и override. Батарейные измерения проверяются заново по независимым revision SoC/TTG и HA `last_updated`. Отсутствие обновлений более 300 с считается stale; старый cache после restart не становится свежим измерением.
 
 ## 8. ExerciseScheduler
 
@@ -388,7 +401,8 @@ HA snapshot
   -> GeneratorBusTracker
   -> GC/TPC observation refresh
   -> ExerciseScheduler.step()
-  -> EnergySupervisor.step(exercise intent)
+  -> OutagePowerPolicy.step(battery + session context)
+  -> EnergySupervisor.step(exercise + outage policy intent)
   -> explicit Exercise/Supervisor handoff when required
   -> LoadManager.step(supervisor decision + bus/meter/load observations)
   -> G1/G2 soft actions
@@ -413,6 +427,7 @@ Journal содержит:
 - `GeneratorBusTracker`;
 - `ExerciseScheduler`;
 - `LoadManager`;
+- `OutagePowerPolicy`;
 - core `pending_actions`.
 
 Старый совместимый journal без `exercise_scheduler` или `load_manager` получает новый пустой state соответствующего policy-компонента.

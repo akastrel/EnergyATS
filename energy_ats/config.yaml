@@ -1,5 +1,5 @@
 name: "Energy ATS"
-version: "0.6.0"
+version: "0.7.0"
 slug: "energy_ats"
 description: >-
   Energy Supervisor: политика источников, безопасная силовая коммутация и
@@ -40,6 +40,16 @@ options:
   maximum_overload_confirmation_time: 4
   load_restore_retry_interval: 300
 
+  # Delayed Start и циклическая подзарядка — независимые opt-in policy.
+  # Battery/UPS telemetry остаётся soft dependency: при её отказе Delayed Start
+  # отменяется и используется обычный безопасный запуск генератора.
+  delayed_generator_start_enabled: false
+  generator_charge_cycle_enabled: false
+  generator_start_soc: 40
+  generator_target_charge_soc: 80
+  generator_min_ttg_before_start: 60
+  generator_max_start_delay: 21600
+
   # Плановые пробные пуски по умолчанию выключены. После включения Scheduler
   # использует один общий HA entity присутствия семьи.
   family_presence_entity: "group.family"
@@ -74,6 +84,13 @@ schema:
   nominal_overload_time: "float(0,300)"
   maximum_overload_confirmation_time: "float(0,60)"
   load_restore_retry_interval: "float(0,3600)"
+
+  delayed_generator_start_enabled: bool
+  generator_charge_cycle_enabled: bool
+  generator_start_soc: "float(1,99)"
+  generator_target_charge_soc: "float(1,100)"
+  generator_min_ttg_before_start: "float(0,1440)"
+  generator_max_start_delay: "float(0,604800)"
 
   family_presence_entity: str
 

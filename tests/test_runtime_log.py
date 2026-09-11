@@ -18,6 +18,7 @@ from generator_controller import (
 )
 from load_manager import LoadManager, LoadManagerConfig
 from main import EnergySupervisorApp
+from outage_power_policy import OutagePowerPolicy
 from power_transfer import PowerTransferStatus, TransferPhase
 
 
@@ -89,6 +90,7 @@ def app_for_log() -> EnergySupervisorApp:
         }
     )
     app.load_manager = LoadManager(LoadManagerConfig(enabled=False))
+    app.outage_power_policy = OutagePowerPolicy()
     app.armed = True
     app._last_runtime_signature = None
     app.log = logging.getLogger("test_runtime_log")

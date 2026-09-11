@@ -18,6 +18,7 @@ from generator_controller import (
 )
 from ha_client import HomeAssistantClient
 from load_manager import LoadAction, LoadActionKind, LoadGroup
+from outage_power_policy import BatteryObservation
 from power_transfer import (
     PowerTransferObservation,
     TransferAction,
@@ -62,6 +63,12 @@ ENTITIES = {
     "generator_frequency": "sensor.generator_frequency",
     "load_g1": "switch.non_critical_loads_first_floor",
     "load_g2": "switch.non_critical_loads_basement_floor",
+    # Battery inputs Delayed Start / Charge Cycling. Это soft dependencies:
+    # отсутствие любого из них не должно блокировать core ATS.
+    "ups_battery_soc": "sensor.ups_battery_charge_level_soc",
+    "ups_battery_ttg_minutes": "sensor.ups_battery_time_remaining_minutes_ttg",
+    "ups_running_on_battery": "binary_sensor.ups_running_on_battery",
+    "ups_ready": "binary_sensor.ups_ready",
 }
 
 ENERGY_ATS_LOG_ENTITY = "update.energy_ats_update"
@@ -102,6 +109,7 @@ class HardwareSnapshot:
     primary_generator: GeneratorSlot | None
     power_transfer: PowerTransferObservation
     load_management: LoadManagementSnapshot
+    battery: BatteryObservation
 
 
 class UnsafeHardwareCommand(RuntimeError):
@@ -236,6 +244,17 @@ class HomeAssistantAdapter:
             },
         )
 
+        battery = BatteryObservation(
+            soc=self.float_state(ENTITIES["ups_battery_soc"]),
+            ttg_minutes=self.float_state(ENTITIES["ups_battery_ttg_minutes"]),
+            discharging=self.bool_state(ENTITIES["ups_running_on_battery"]),
+            ready=self.bool_state(ENTITIES["ups_ready"]),
+            sample_id=self.state_revision(ENTITIES["ups_battery_soc"]),
+            ttg_sample_id=self.state_revision(ENTITIES["ups_battery_ttg_minutes"]),
+            soc_updated_at=self.state_updated_at(ENTITIES["ups_battery_soc"]),
+            ttg_updated_at=self.state_updated_at(ENTITIES["ups_battery_ttg_minutes"]),
+        )
+
         return HardwareSnapshot(
             grid_ready=grid_ready,
             automatic_transfer_enabled=(
@@ -260,6 +279,7 @@ class HomeAssistantAdapter:
                 emergency_stop=emergency_stop,
             ),
             load_management=load_management,
+            battery=battery,
         )
 
     def missing_required_entities(
@@ -267,8 +287,9 @@ class HomeAssistantAdapter:
         *,
         include_control_entities: bool = True,
     ) -> list[str]:
-        # Load Manager entities and Nominal/Maximum metadata намеренно не входят
-        # сюда: это soft dependencies и они не могут блокировать старт core ATS.
+        # Load Manager, battery-policy entities and Nominal/Maximum metadata
+        # намеренно не входят сюда: это soft dependencies и они не могут
+        # блокировать старт core ATS.
         state_required = [
             ENTITIES["automatic_transfer"],
             ENTITIES["grid_ready"],
@@ -489,6 +510,10 @@ class HomeAssistantAdapter:
         # state всё же считается новым sample; одинаковое повторное чтение — нет.
         state = self.client.get_state(entity_id)
         return state if state not in (None, "unknown", "unavailable") else None
+
+    def state_updated_at(self, entity_id: str) -> float | None:
+        getter = getattr(self.client, "get_state_updated_at", None)
+        return getter(entity_id) if callable(getter) else None
 
     @staticmethod
     def _generator_service(

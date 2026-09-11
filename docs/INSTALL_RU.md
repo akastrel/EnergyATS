@@ -1,4 +1,4 @@
-# Установка и обновление Energy ATS 0.6.0
+# Установка и обновление Energy ATS 0.7.0
 
 Перед установкой или commissioning прочитать:
 
@@ -180,6 +180,10 @@ load_restore_retry_interval = 300 s
 
 При первом обновлении рекомендуется оставить `load_management_enabled=false`, проверить новые entities и status, затем включать функцию отдельно.
 
+### Delayed Start / Charge Cycling
+
+При обновлении обе функции остаются выключенными. Для включения используйте [отдельное руководство](DELAYED_START_RU.md): оно описывает все шесть параметров, необходимые батарейные сигналы и проверку их достоверности. В HA configuration доступны русские и английские названия и пояснения.
+
 ### Scheduled Exercise
 
 Scheduled Exercise остаётся отдельно конфигурируемым для A/B; presence задаётся `family_presence_entity`.
@@ -239,7 +243,7 @@ load_management_enabled: true
 
 Journal 0.3.x несовместим с моделью 0.4 и намеренно не мигрируется.
 
-Обновления 0.4 -> 0.5 -> 0.6 сохраняют `schema_version = 2`. Старый совместимый journal без `exercise_scheduler` или `load_manager` получает свежий state соответствующего policy-компонента.
+Обновления 0.4 -> 0.5 -> 0.6 -> 0.7 сохраняют `schema_version = 2`. Старый совместимый journal без `exercise_scheduler`, `load_manager` или `outage_power_policy` получает свежий state соответствующего policy-компонента. Старые сессии без `cycle_owned` остаются вне cycling ownership. Устойчивое ожидание и cycle-owned RUNNING восстанавливаются; restart во время незавершённого силового перехода/остановки требует Recovery по обычным правилам.
 
 Load Manager сохраняет собственное `shed_by_energy_ats` ownership, pending consumer action и retry state. Measurement samples не восстанавливаются: после restart power-based решение должно быть доказано новым stabilization window.
 

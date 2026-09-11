@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime
 from typing import Any
 
 import aiohttp
@@ -49,6 +50,14 @@ class HomeAssistantClient:
         self._state_revision_counter = 0
         self._state_revisions: dict[str, int] = {}
         self.connected = asyncio.Event()
+
+    def get_state_updated_at(self, entity_id: str) -> float | None:
+        """Возраст HA cache не обнуляется при reconnect/restart приложения."""
+        state = self.states.get(entity_id, {})
+        try:
+            return datetime.fromisoformat(state["last_updated"]).timestamp()
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return None
 
     async def connect(self) -> None:
         """Авторизоваться, загрузить state cache и подписаться на state_changed."""
