@@ -36,9 +36,10 @@ jobs:
           -t energy-ats:ci
           energy_ats
 
-      - name: Import production runtime inside container
+      - name: Run production HA transport and command smoke
         run: >-
           docker run --rm
           --entrypoint python3
+          -v "$PWD/tests/container_smoke.py:/smoke.py:ro"
           energy-ats:ci
-          -c "import sys; sys.path.insert(0, '/app'); import main; print(main.APP_VERSION)"
+          /smoke.py
