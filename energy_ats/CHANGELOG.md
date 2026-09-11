@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.0.0
+
+Архитектурная стабилизация EnergyATS после Exercise, Load Manager и UPS Run / Charge Cycling. Версия 1.0.0 фиксирует единую модель верхнеуровневого поведения перед физическим commissioning.
+
+- `EnergySupervisor` теперь является единственным центром системных решений: Manual, Grid outage, fallback, возврат Grid, Recovery и пересечения с Exercise/UPS Run разрешаются в одном месте. Дополнительный `PolicyCoordinator` не используется.
+- `main.py` оставлен composition/I/O/dispatch слоем: Scheduler и UPS Run передают локальные факты/условия, Supervisor принимает решение, GC/TPC безопасно исполняют его, Load Manager управляет только G1/G2.
+- `REQUIREMENTS_RU.md` переработан в цельную спецификацию с `REQ-BEH-*`, стабильными `TC-*` identifiers и traceability `requirement -> Supervisor branch -> automated/physical test`.
+- Уже RUNNING исправный Exercise-generator при подтверждённом outage может быть принят той же outage-session без `REMOTE OFF -> cold start`; при manual reserve request тот же run может быть передан manual managed-session.
+- Exercise -> Manual handoff фиксируется как нейтральный `INTERRUPTED_BY_MANUAL`, а не как технический failure; до явного handoff Scheduler сохраняет обязанность безопасной остановки своего auto-run.
+- Manual stop при продолжающемся outage теперь явно переводит дом `Generator -> UPS_ONLY`, после подтверждённого снятия нагрузки штатно останавливает managed generator и подавляет automatic restart до восстановления Grid либо нового manual start.
+- Stable Grid имеет приоритет над завершением automatic charge cycle; manual override снимает cycle ownership. Исправлена same-tick гонка, при которой уже отменённый пользователем cycle мог ошибочно создать новый post-cycle UPS wait.
+- Recovery имеет абсолютный приоритет, но не оставляет автоматически запущенный Exercise без ответственного за будущий stop.
+- `ARCHITECTURE_RU.md` синхронизирован с моделью: Exercise Scheduler, UPS Run и Load Manager являются специализированными подсистемами, а не конкурирующими верхнеуровневыми policy.
+- Удалён устаревший отдельный `GENERATOR_EXERCISE_REQUIREMENTS_RU.md`; согласованные требования находятся в общей спецификации.
+- Добавлены Supervisor/integration regression tests для конфликтов Exercise / Manual / Outage / UPS Run / Recovery и manual-stop/cycle boundary case.
+- Обновлён набор физических испытаний для проверки новых handoff и `Generator -> UPS_ONLY` сценариев перед вводом 1.0.0 в эксплуатацию.
+
+---
+
 ## 0.7.0
 
 Добавлены Delayed Generator Start и Long Outage Charge Cycling по разделу 25 требований.
