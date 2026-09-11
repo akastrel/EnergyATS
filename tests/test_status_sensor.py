@@ -65,19 +65,20 @@ def app_with_fake(tmp_path):
     return app, fake
 
 
-def normal_observation(app: EnergySupervisorApp, now: float):
+def normal_state(app: EnergySupervisorApp, now: float):
     hardware = app.adapter.snapshot()
     app._sync_generator_configuration(hardware)
     hardware = app._apply_bus_model(hardware)
     app._refresh_component_views(now, hardware)
     observation = app._supervisor_observation(hardware)
     app.supervisor.step(now, observation)
-    return app._supervisor_observation(hardware)
+    return app._supervisor_observation(hardware), hardware
 
 
 def test_status_payload_exposes_current_v04_contract(tmp_path):
     app, _ = app_with_fake(tmp_path)
-    payload = app._status_payload(100.0, normal_observation(app, 100.0))
+    observation, hardware = normal_state(app, 100.0)
+    payload = app._status_payload(100.0, observation, hardware)
 
     assert payload["state"] == "Питание от основной сети"
     attrs = payload["attributes"]
@@ -100,7 +101,8 @@ def test_status_reports_ups_only_when_grid_is_intentionally_isolated(tmp_path):
     app, fake = app_with_fake(tmp_path)
     fake.states[ENTITIES["grid_power"]] = "off"
     fake.states[ENTITIES["house_grid"]] = "off"
-    payload = app._status_payload(100.0, normal_observation(app, 100.0))
+    observation, hardware = normal_state(app, 100.0)
+    payload = app._status_payload(100.0, observation, hardware)
     assert payload["state"] == "В доме работает только UPS линия"
     assert payload["attributes"]["source"] == "ups_only"
 
@@ -108,9 +110,9 @@ def test_status_reports_ups_only_when_grid_is_intentionally_isolated(tmp_path):
 @pytest.mark.asyncio
 async def test_status_publication_is_deduplicated(tmp_path):
     app, fake = app_with_fake(tmp_path)
-    observation = normal_observation(app, 100.0)
-    await app._publish_status(100.0, observation)
-    await app._publish_status(100.0, observation)
+    observation, hardware = normal_state(app, 100.0)
+    await app._publish_status(100.0, observation, hardware)
+    await app._publish_status(100.0, observation, hardware)
     assert len(fake.published) == 1
     entity_id, state, attributes = fake.published[0]
     assert entity_id == ENERGY_ATS_STATUS_ENTITY
@@ -120,7 +122,7 @@ async def test_status_publication_is_deduplicated(tmp_path):
 
 def test_grid_restore_remaining_time_uses_only_current_supervisor_phase(tmp_path):
     app, _ = app_with_fake(tmp_path)
-    observation = normal_observation(app, 100.0)
+    observation, _ = normal_state(app, 100.0)
     app.supervisor.session = GeneratorSession.begin(
         SessionReason.GRID_OUTAGE,
         GeneratorSlot.A,
