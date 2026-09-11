@@ -1112,6 +1112,10 @@ Load Manager также не создаёт нового силового пут
 76. `load_management_enabled = false` -> EnergyATS не выдаёт команды G1/G2, а core ATS выполняет обычный запуск/transfer/return без зависимости от Load Manager;
 77. Nominal/Maximum текущего bus owner отсутствуют или некорректны -> Load Manager переходит в DEGRADED, не выполняет power-based admission/shedding, а core ATS продолжает работу.
 
+### 22.4. Delayed Start и Charge Cycling
+
+Обязательные сценарии 78–94 приведены в разделе 25.5. Сквозные автоматические проверки находятся в `tests/test_outage_power_app.py`; каждый тест содержит краткое описание проверяемого поведения.
+
 ---
 
 ## 23. Load Management
@@ -1496,23 +1500,18 @@ Nominal/Maximum Power не дублируются в EnergyATS options: они �
 
 ### 23.12. Минимальная наблюдаемая state machine
 
-Реализация может выбирать внутренние детали, но пользовательская/диагностическая логика должна однозначно различать как минимум состояния со следующим смыслом:
+Load Manager использует шесть крупных состояний:
 
 ```text
 DISABLED
 IDLE
-WAITING_FOR_GENERATOR
 LOAD_SHEDDING
-MEASURING_BASE_LOAD
-RESTORING_G1
-MEASURING_AFTER_G1
-RESTORING_G2
-MEASURING_AFTER_G2
+MEASURING
 STABLE
-OVERLOAD_CONTROL
-RESTORING_ON_GRID
 DEGRADED
 ```
+
+Конкретная операция и её причина наблюдаются отдельно от состояния: ожидание генератора, предварительное снятие нагрузки, измерение после изменения группы, возврат G1/G2, контроль перегрузки и восстановление собственных отключений на Grid. Для каждого шага G1/G2 не требуется отдельное состояние FSM.
 
 `DEGRADED` относится только к Load Manager и не должен автоматически означать `RECOVERY_REQUIRED` всей EnergyATS.
 
@@ -1544,7 +1543,7 @@ REQUIREMENTS_RU.md
 
 Delayed Generator Start предназначен для того, чтобы при физическом исчезновении Grid не запускать генератор немедленно, если критическая UPS-линия уже автоматически продолжает работать от МАП/АКБ и батарея имеет достаточный запас.
 
-Long Outage Charge Cycling предназначен для многосуточного/многосуточного отключения: генератор периодически запускается для подзаряда батареи, после чего система снова может некоторое время работать только от UPS.
+Long Outage Charge Cycling предназначен для многосуточного отключения: генератор периодически запускается для подзаряда батареи, после чего система снова может некоторое время работать только от UPS.
 
 Эта policy отвечает только на вопрос **нужен ли генератор сейчас**. Она не дублирует Generator Controller, TPC, Load Manager или fallback-логику.
 
@@ -1558,11 +1557,7 @@ delayed_generator_start_enabled = false
 
 ### REQ-DELAY-02. Delayed Start не управляет UPS
 
-Фраза «UPS поддерживает критическую линию» не означает отдельную команду EnergyATS и не требует нового UPS-contactor.
-
-МАП уже физически выполняет это автоматически при исчезновении внешнего AC. EnergyATS только наблюдает батарейные данные и описывает такое состояние как `UPS_ONLY`.
-
-Для Delayed Start не требуется отдельная команда `connect_battery` или иной исполнительный механизм UPS.
+МАП автоматически поддерживает критическую UPS-линию от АКБ при исчезновении внешнего AC. EnergyATS наблюдает батарейные данные и описывает это состояние как `UPS_ONLY`; отдельной команды управления UPS нет.
 
 ### REQ-DELAY-03. Когда разрешено ожидать на UPS
 
@@ -1580,29 +1575,17 @@ delayed_generator_start_enabled = false
 
 Во время ожидания на UPS generator требуется запустить, если выполнено хотя бы одно условие:
 
-```text
-battery_soc <= generator_start_soc
-```
+- заряд батареи снизился до порога запуска или ниже (`battery_soc <= generator_start_soc`);
+- прогноз оставшейся работы при разряде сократился до заданного минимума или ниже (`battery_ttg <= generator_min_ttg_before_start`);
+- истекло максимальное время текущего ожидания на UPS (`time_in_current_ups_only_wait >= generator_max_start_delay`).
 
-или
-
-```text
-battery_ttg <= generator_min_ttg_before_start
-```
-
-или
-
-```text
-time_in_current_ups_only_wait >= generator_max_start_delay
-```
-
-Условия объединяются по OR.
+Для запуска достаточно любого одного условия (OR).
 
 `generator_max_start_delay` отсчитывается от начала текущего периода ожидания в `UPS_ONLY`: для первого цикла — после подтверждённого outage и `grid_failure_delay`, для последующих циклов — после завершения предыдущего charge cycle и возврата в `UPS_ONLY`.
 
 ### REQ-DELAY-05. Fail-safe при недостоверных батарейных данных
 
-Delayed Start является оптимизацией расхода топлива, а не обязательной зависимостью core ATS.
+Delayed Start является оптимизацией расхода топлива и минимизацией времени работы генератора, а не обязательной зависимостью core ATS.
 
 Если необходимые для решения SoC/TTG/critical-state данные отсутствуют, `unknown/unavailable`, stale либо явно некорректны, EnergyATS не должен бесконечно продолжать ожидание.
 
@@ -1648,11 +1631,7 @@ Delayed Start и Charge Cycling являются независимыми раз
 
 ### REQ-CYCLE-02. Порог окончания зарядного цикла
 
-При включённом Charge Cycling задаётся:
-
-```text
-generator_target_charge_soc
-```
+При включённом Charge Cycling задаётся целевой уровень заряда батарей (`generator_target_charge_soc`).
 
 Когда батарея достигает этого уровня при продолжающемся outage, автоматически запущенный charge-cycle generator может быть остановлен при выполнении остальных требований этого раздела.
 

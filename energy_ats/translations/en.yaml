@@ -45,6 +45,25 @@ configuration:
     name: "Load Manager restore retry, s"
     description: "Minimum delay before retrying a group shed by overload or rejected during admission."
 
+  delayed_generator_start_enabled:
+    name: "Delayed generator start"
+    description: "After the grid failure delay, wait on UPS until the SoC, TTG or maximum wait threshold. Invalid battery data cancels the wait."
+  generator_charge_cycle_enabled:
+    name: "Generator charge cycling"
+    description: "During a long outage, finish owned automatic sessions at the target SoC. Manual and external runs are not stopped by SoC."
+  generator_start_soc:
+    name: "Generator start battery SoC, %"
+    description: "End the UPS wait at or below this charge level. Must be lower than the target charge level."
+  generator_target_charge_soc:
+    name: "Target battery charge, %"
+    description: "Complete an owned automatic charge cycle at this level. Must exceed start SoC and be no higher than 100%."
+  generator_min_ttg_before_start:
+    name: "Minimum UPS time remaining, min"
+    description: "End the wait at or below this TTG while discharging. This threshold is ignored during charging or float."
+  generator_max_start_delay:
+    name: "Maximum UPS wait, s"
+    description: "Limit for each UPS wait; 21600 s = 6 h. Elapsed time survives restart and resets after a completed charge cycle."
+
   family_presence_entity:
     name: "Family presence HA entity"
     description: "Home Assistant entity used by the exercise scheduler to determine family presence. home/not_home and on/off are supported."

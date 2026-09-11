@@ -254,6 +254,7 @@ class EnergySupervisor:
         exercise_desired_running: bool = False,
         defer_automatic_start: bool = False,
         outage_delay_already_satisfied: bool = False,
+        restore_grid_after_cycle: bool = False,
     ) -> SupervisorDecision:
         self._stop_outage_generators.clear()
         if not self.initialized:
@@ -295,6 +296,7 @@ class EnergySupervisor:
                 exercise_owned_slot,
                 defer_automatic_start=defer_automatic_start,
                 outage_delay_already_satisfied=outage_delay_already_satisfied,
+                restore_grid_after_cycle=restore_grid_after_cycle,
             )
         else:
             self._with_session(now, o)
@@ -336,8 +338,14 @@ class EnergySupervisor:
         *,
         defer_automatic_start: bool,
         outage_delay_already_satisfied: bool,
+        restore_grid_after_cycle: bool,
     ) -> None:
         self.desired_generators = _stopped_generators()
+
+        if restore_grid_after_cycle and self._grid_stable(now):
+            self.desired_source = PowerSource.GRID
+            self.phase = SupervisorPhase.RETURNING_TO_GRID
+            return
 
         outage_slots = self._outage_slots(o)
         if outage_slots and self._grid_stable(now):
@@ -416,6 +424,7 @@ class EnergySupervisor:
 
         if self.phase == SupervisorPhase.RETURNING_TO_UPS:
             if self._grid_stable(now):
+                self.session.stop_requested = False
                 self.phase = SupervisorPhase.RETURNING_TO_GRID
                 self.desired_source = PowerSource.GRID
                 return
@@ -598,13 +607,18 @@ class EnergySupervisor:
         assert self.session is not None
         slot = self.session.generator
         self.desired_source = PowerSource.UPS_ONLY
+        managed = o.generators[slot]
+        if _generator_failed(managed):
+            self._require_recovery(
+                managed.fault or "Ошибка генератора при завершении charge cycle."
+            )
+            return
 
         if o.power.transition_in_progress or o.power.actual_path != PowerPath.ISOLATED:
             self.desired_generators[slot] = True
             return
 
         self.desired_generators[slot] = False
-        managed = o.generators[slot]
         if managed.running is False and managed.remote_on is False:
             self._event(
                 "info",
@@ -648,8 +662,10 @@ class EnergySupervisor:
                 self.session.cycle_owned = False
                 self.session.stop_requested = False
                 if self.phase == SupervisorPhase.RETURNING_TO_UPS:
-                    self.phase = SupervisorPhase.ON_GENERATOR
-                    self.desired_source = PowerSource.GENERATOR
+                    # Двигатель мог уже штатно остановиться. Возобновление
+                    # проходит через обычный startup, а не через failure/fallback.
+                    self.phase = SupervisorPhase.STARTING_GENERATOR
+                    self.desired_source = PowerSource.UPS_ONLY
                     self.desired_generators[self.session.generator] = True
                 self._event(
                     "info",

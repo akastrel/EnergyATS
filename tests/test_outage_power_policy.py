@@ -264,3 +264,22 @@ def test_status_exposes_wait_and_battery_information():
     assert attrs["battery_soc"] == 71
     assert attrs["delayed_start_elapsed_seconds"] == 30
     assert attrs["delayed_start_remaining_seconds"] == 70
+
+
+@pytest.mark.parametrize("waiting", [float("nan"), float("inf"), -1])
+def test_invalid_persisted_wait_timestamp_is_rejected(waiting):
+    with pytest.raises(ValueError, match="waiting_since"):
+        OutagePowerPolicy.from_dict({"waiting_since": waiting}, cfg())
+
+
+def test_ha_cache_timestamp_survives_adapter_snapshot():
+    from ha_adapter import ENTITIES, HomeAssistantAdapter
+    from ha_client import HomeAssistantClient
+
+    client = HomeAssistantClient("test")
+    client.states[ENTITIES["ups_battery_soc"]] = {
+        "state": "80",
+        "last_updated": "2026-09-11T00:00:00+00:00",
+    }
+    snapshot = HomeAssistantAdapter(client, armed=False).snapshot()
+    assert snapshot.battery.soc_updated_at == 1789084800

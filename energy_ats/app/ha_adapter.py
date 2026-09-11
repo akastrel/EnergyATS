@@ -244,25 +244,15 @@ class HomeAssistantAdapter:
             },
         )
 
-        battery_entities = (
-            ENTITIES["ups_battery_soc"],
-            ENTITIES["ups_battery_ttg_minutes"],
-            ENTITIES["ups_running_on_battery"],
-            ENTITIES["ups_ready"],
-        )
-        battery_revisions = tuple(
-            self.state_revision(entity_id) for entity_id in battery_entities
-        )
         battery = BatteryObservation(
             soc=self.float_state(ENTITIES["ups_battery_soc"]),
             ttg_minutes=self.float_state(ENTITIES["ups_battery_ttg_minutes"]),
             discharging=self.bool_state(ENTITIES["ups_running_on_battery"]),
             ready=self.bool_state(ENTITIES["ups_ready"]),
-            sample_id=(
-                battery_revisions
-                if any(value is not None for value in battery_revisions)
-                else None
-            ),
+            sample_id=self.state_revision(ENTITIES["ups_battery_soc"]),
+            ttg_sample_id=self.state_revision(ENTITIES["ups_battery_ttg_minutes"]),
+            soc_updated_at=self.state_updated_at(ENTITIES["ups_battery_soc"]),
+            ttg_updated_at=self.state_updated_at(ENTITIES["ups_battery_ttg_minutes"]),
         )
 
         return HardwareSnapshot(
@@ -520,6 +510,10 @@ class HomeAssistantAdapter:
         # state всё же считается новым sample; одинаковое повторное чтение — нет.
         state = self.client.get_state(entity_id)
         return state if state not in (None, "unknown", "unavailable") else None
+
+    def state_updated_at(self, entity_id: str) -> float | None:
+        getter = getattr(self.client, "get_state_updated_at", None)
+        return getter(entity_id) if callable(getter) else None
 
     @staticmethod
     def _generator_service(

@@ -64,6 +64,9 @@ class BatteryObservation:
     discharging: bool | None
     ready: bool | None
     sample_id: Hashable | None = None
+    ttg_sample_id: Hashable | None = None
+    soc_updated_at: float | None = None
+    ttg_updated_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -79,6 +82,8 @@ class OutagePowerObservation:
     session_cycle_owned: bool = False
     session_manual_override: bool = False
     manual_start_pending: bool = False
+    grid_stable: bool = True
+    grid_supply_restored: bool = True
 
 
 @dataclass(frozen=True)
@@ -87,6 +92,7 @@ class OutagePowerDecision:
     outage_delay_already_satisfied: bool = False
     claim_new_outage_session: bool = False
     request_cycle_stop: bool = False
+    restore_grid_after_cycle: bool = False
     reason: str | None = None
     events: tuple[SupervisorEvent, ...] = ()
 
@@ -101,11 +107,12 @@ class OutagePowerPolicy:
         self.post_cycle_wait = False
         self.last_reason: str | None = None
 
-        # Freshness нужна только для delayed start. Measurement state после
-        # restart намеренно не восстанавливается: первое полученное значение
-        # считается новым наблюдением, а не старым накопленным доказательством.
+        # SoC и TTG проверяются отдельно: обновление одного сигнала не делает
+        # второй свежим. При restart используем также timestamps из HA cache.
         self._last_sample_id: Hashable | None = None
         self._last_sample_at: float | None = None
+        self._last_ttg_sample_id: Hashable | None = None
+        self._last_ttg_sample_at: float | None = None
         self._last_event_key: str | None = None
 
     @property
@@ -117,14 +124,30 @@ class OutagePowerPolicy:
         self.post_cycle_wait = True
         self.waiting_since = now
         self.state = OutagePowerState.WAITING_ON_UPS
-        self.last_reason = "Цикл заряда завершён; ожидаем следующей необходимости запуска."
+        self.last_reason = (
+            "Цикл заряда завершён; ожидаем следующей необходимости запуска."
+        )
         self._last_event_key = None
 
     def step(self, o: OutagePowerObservation) -> OutagePowerDecision:
         events: list[SupervisorEvent] = []
         self._observe_sample(o.now, o.battery.sample_id)
+        ttg_sample = (
+            o.battery.ttg_sample_id
+            if o.battery.ttg_sample_id is not None
+            else o.battery.sample_id
+        )
+        if ttg_sample is not None and ttg_sample != self._last_ttg_sample_id:
+            self._last_ttg_sample_id = ttg_sample
+            self._last_ttg_sample_at = o.now
 
         if o.grid_ready is True:
+            # Короткое появление сети не обнуляет текущий battery interval.
+            # После cycle stop сетевой ввод изолирован нами: обязанность
+            # вернуть его сохраняется до подтверждения Grid supply.
+            restore_grid = self.post_cycle_wait and not o.session_active
+            if not o.grid_stable or (restore_grid and not o.grid_supply_restored):
+                return OutagePowerDecision(restore_grid_after_cycle=restore_grid)
             self._reset_wait()
             self.post_cycle_wait = False
             self.state = OutagePowerState.IDLE
@@ -132,9 +155,13 @@ class OutagePowerPolicy:
             self._last_event_key = None
             return OutagePowerDecision()
 
+        if o.grid_ready is not False:
+            return OutagePowerDecision()
+
         if not self.enabled or not o.automatic_transfer_enabled:
             self._reset_wait()
-            self.post_cycle_wait = False
+            # Отключение оптимизации не снимает обязанность вернуть сетевой
+            # ввод, ранее изолированный при нашем cycle stop.
             self.state = OutagePowerState.IDLE
             self.last_reason = None
             return OutagePowerDecision()
@@ -180,7 +207,9 @@ class OutagePowerPolicy:
             delay_satisfied = True
 
         claim = self.config.charge_cycle_enabled
-        should_wait_on_battery = self.config.delayed_start_enabled or self.post_cycle_wait
+        should_wait_on_battery = (
+            self.config.delayed_start_enabled or self.post_cycle_wait
+        )
 
         # При отключённом Delayed Start первый automatic run начинается сразу
         # после core delay. Но последующие cycling intervals всё равно обязаны
@@ -266,7 +295,9 @@ class OutagePowerPolicy:
         # запрещает Target-SoC stop в этом tick.
         if o.manual_start_pending:
             self.state = OutagePowerState.IDLE
-            self.last_reason = "Пользователь принял generator-session под ручное управление."
+            self.last_reason = (
+                "Пользователь принял generator-session под ручное управление."
+            )
             return OutagePowerDecision(reason=self.last_reason)
 
         if o.session_reason != SessionReason.GRID_OUTAGE:
@@ -289,8 +320,12 @@ class OutagePowerPolicy:
             return OutagePowerDecision(reason=self.last_reason)
 
         soc = o.battery.soc
-        if not _valid_soc(soc):
-            reason = "SoC батареи недоступен или некорректен; cycling не завершает generator-session."
+        if (
+            not _valid_soc(soc)
+            or self._telemetry_stale(o.now, o.battery.soc_updated_at)
+            or o.battery.ready is not True
+        ):
+            reason = "SoC или готовность батареи недостоверны; cycling не завершает generator-session."
             self.state = OutagePowerState.DEGRADED
             self.last_reason = reason
             self._emit_once(events, "cycle_soc_invalid", "warning", reason)
@@ -331,13 +366,15 @@ class OutagePowerPolicy:
             return "состояние готовности UPS/Battery неизвестно."
         if not _valid_soc(b.soc):
             return "SoC батареи недоступен или некорректен."
+        if self._telemetry_stale(o.now, b.soc_updated_at):
+            return "телеметрия SoC батареи устарела."
         if b.discharging is None:
             return "неизвестно, разряжается ли батарея."
         if b.discharging:
             if not _valid_nonnegative(b.ttg_minutes):
                 return "TTG батареи недоступен или некорректен при разряде."
-            if self._telemetry_stale(o.now):
-                return "телеметрия батареи устарела."
+            if self._stale(o.now, self._last_ttg_sample_at, b.ttg_updated_at):
+                return "телеметрия TTG батареи устарела."
         return None
 
     def _observe_sample(self, now: float, sample_id: Hashable | None) -> None:
@@ -347,10 +384,22 @@ class OutagePowerPolicy:
             self._last_sample_id = sample_id
             self._last_sample_at = now
 
-    def _telemetry_stale(self, now: float) -> bool:
+    def _telemetry_stale(self, now: float, updated_at: float | None = None) -> bool:
+        return self._stale(now, self._last_sample_at, updated_at)
+
+    def _stale(
+        self, now: float, observed_at: float | None, updated_at: float | None
+    ) -> bool:
         return (
-            self._last_sample_at is None
-            or now - self._last_sample_at > self.config.telemetry_stale_time
+            observed_at is None
+            or now - observed_at > self.config.telemetry_stale_time
+            or (
+                updated_at is not None
+                and (
+                    not math.isfinite(updated_at)
+                    or now - updated_at > self.config.telemetry_stale_time
+                )
+            )
         )
 
     def _reset_wait(self) -> None:
@@ -368,7 +417,9 @@ class OutagePowerPolicy:
         self._last_event_key = key
         events.append(SupervisorEvent(level, message))
 
-    def status_attributes(self, now: float, battery: BatteryObservation) -> dict[str, object]:
+    def status_attributes(
+        self, now: float, battery: BatteryObservation
+    ) -> dict[str, object]:
         elapsed = (
             max(0.0, now - self.waiting_since)
             if self.waiting_since is not None
@@ -384,8 +435,10 @@ class OutagePowerPolicy:
             "charge_cycle_enabled": self.config.charge_cycle_enabled,
             "charge_cycle_state": self.state.value,
             "delayed_start_reason": self.last_reason,
-            "battery_soc": battery.soc,
-            "battery_ttg_minutes": battery.ttg_minutes,
+            "battery_soc": battery.soc if _valid_soc(battery.soc) else None,
+            "battery_ttg_minutes": (
+                battery.ttg_minutes if _valid_nonnegative(battery.ttg_minutes) else None
+            ),
             "battery_discharging": battery.discharging,
             "battery_ready": battery.ready,
             "generator_start_soc": self.config.start_soc,
@@ -409,9 +462,17 @@ class OutagePowerPolicy:
         config: OutagePowerConfig,
     ) -> "OutagePowerPolicy":
         policy = cls(config)
-        policy.state = OutagePowerState(str(data.get("state", OutagePowerState.IDLE.value)))
+        policy.state = OutagePowerState(
+            str(data.get("state", OutagePowerState.IDLE.value))
+        )
         waiting = data.get("waiting_since")
         policy.waiting_since = float(waiting) if waiting is not None else None
+        if policy.waiting_since is not None and (
+            not math.isfinite(policy.waiting_since) or policy.waiting_since < 0
+        ):
+            raise ValueError(
+                "waiting_since должен быть конечным неотрицательным временем"
+            )
         post_cycle_wait = data.get("post_cycle_wait", False)
         if type(post_cycle_wait) is not bool:
             raise ValueError("post_cycle_wait должен быть boolean")

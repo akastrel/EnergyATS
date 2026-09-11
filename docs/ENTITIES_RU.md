@@ -1,4 +1,4 @@
-# Home Assistant entities и команды — Energy ATS 0.6.0
+# Home Assistant entities и команды — Energy ATS 0.7.0
 
 Этот документ описывает фактический HA-контракт текущей реализации. Физический смысл сигналов задаёт `PHYSICAL_POWER_TOPOLOGY_RU.md`, policy — `REQUIREMENTS_RU.md`.
 
@@ -127,6 +127,12 @@ sensor.generator_frequency
 
 Все entities этого раздела являются soft dependencies относительно core ATS. Их отсутствие, `unknown/unavailable`, отказ Modbus или ошибка команды G1/G2 не должны сами по себе переводить Supervisor/TPC/GC в `RECOVERY_REQUIRED` либо блокировать возврат Grid.
 
+### Батарейные soft dependencies
+
+Delayed Start / Charge Cycling используют `sensor.ups_battery_charge_level_soc`, `sensor.ups_battery_time_remaining_minutes_ttg`, `binary_sensor.ups_running_on_battery` и `binary_sensor.ups_ready`. Их смысл и проверка достоверности приведены в [руководстве](DELAYED_START_RU.md#батарейные-сигналы).
+
+Отсутствие этих entities не блокирует startup core ATS. При выключенных функциях они не влияют на управление.
+
 ## 4. Управляющие buttons генераторов
 
 Для каждого генератора используются две физические команды заслонки:
@@ -240,6 +246,7 @@ unknown
 ```text
 load_management_enabled
 load_manager_phase
+load_manager_operation
 load_manager_degraded_reason
 generator_power
 active_generator_nominal_power
@@ -259,22 +266,30 @@ load_last_reason
 ```text
 disabled
 idle
-waiting_for_generator
 load_shedding
-measuring_base_load
-restoring_g1
-measuring_after_g1
-restoring_g2
-measuring_after_g2
+measuring
 stable
-overload_control
-restoring_on_grid
 degraded
 ```
 
 `degraded` относится только к Load Manager и сам по себе не означает системный `recovery_required`.
 
 Exercise Scheduler также публикует свои due/history/active attributes в этом же status sensor; их точный набор формируется Scheduler-ом.
+
+### Delayed Start / Charge Cycling attributes
+
+| Attribute | Значение |
+|---|---|
+| `delayed_start_enabled`, `charge_cycle_enabled` | Разрешение функций |
+| `charge_cycle_state`, `delayed_start_reason` | Состояние policy и причина текущего решения |
+| `battery_soc`, `battery_ttg_minutes` | Заряд и оставшиеся минуты; некорректное значение — `null` |
+| `battery_discharging`, `battery_ready` | Разряд и готовность UPS |
+| `generator_start_soc`, `generator_target_charge_soc` | Пороги заряда |
+| `delayed_start_elapsed_seconds`, `delayed_start_remaining_seconds` | Время текущего ожидания и остаток, секунды |
+| `cycle_session_owned_by_energy_ats` | Право cycling завершить эту сессию |
+| `session_manual_override` | Пользователь запретил автоматическое завершение по Target SoC |
+
+Состояния policy: `idle`, `waiting_on_ups`, `generator_required`, `charging`, `target_reached`, `degraded`. `returning_to_ups` — фаза Supervisor при снятии питания дома с генератора и его остановке. Source продолжает отражать фактически наблюдаемое питание, а не цель переключения.
 
 ## 7. Logbook и уведомления
 

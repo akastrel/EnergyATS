@@ -2,7 +2,7 @@
 
 Home Assistant App для управления резервным электроснабжением дома с двумя генераторами и подтверждаемой коммутацией основных контакторов.
 
-Текущая версия: **0.6.0** (`experimental`).
+Текущая версия: **0.7.0** (`experimental`).
 
 ## Источники истины
 
@@ -41,6 +41,14 @@ main.py                   единый tick, arbitration, journal, status/log
 - `armed: false` запрещает реальные аппаратные switch/button calls.
 
 A/B остаются стабильными машинными слотами. Пользовательские имя, модель и паспортные мощности читаются из Home Assistant.
+
+## Delayed Start и Charge Cycling — 0.7
+
+Обе функции выключены по умолчанию и включаются независимо. Delayed Start после подтверждённого исчезновения сети оставляет критическую линию на UPS до достижения Start SoC, минимального TTG или максимальной задержки. Недостоверные батарейные данные отменяют ожидание и возвращают обычный запуск ATS.
+
+Charge Cycling завершает только собственную автоматическую outage-сессию при достижении Target SoC: TPC снимает дом с генератора, подтверждается снятие нагрузки, GC выполняет cooldown/stop, затем начинается новое ожидание на UPS. Ручной запрос отменяет cycling для текущей сессии; внешний генератор по Target SoC не останавливается. Устойчивый возврат сети имеет приоритет, в том числе между циклами.
+
+Настройки, батарейные entities и наблюдаемость описаны в [руководстве Delayed Start / Charge Cycling](docs/DELAYED_START_RU.md). Сценарии 78–94 из требований проверяются в `tests/test_outage_power_app.py`.
 
 ## Load Manager — 0.6
 
@@ -159,7 +167,7 @@ input_boolean.automatic_generator_transfer
 input_boolean.generator_test_mode
 ```
 
-При обновлении с 0.3.x старый persistent journal не мигрируется: внутренняя модель 0.4 принципиально другая. Обновления 0.4 -> 0.5 -> 0.6 используют совместимый top-level journal schema; новые policy-секции получают собственный state при отсутствии старых данных.
+При обновлении с 0.3.x старый persistent journal не мигрируется: внутренняя модель 0.4 принципиально другая. Обновления 0.4 -> 0.5 -> 0.6 -> 0.7 используют совместимый top-level journal schema; новые policy-секции получают собственный state при отсутствии старых данных.
 
 Подробно: [`docs/INSTALL_RU.md`](docs/INSTALL_RU.md).
 
@@ -208,6 +216,6 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-Тесты моделируют HA states, ES/TPC/GC, аппаратный FIFO-owner, scheduled exercise, Load Manager, restart/handoff и фактические service calls к fake Home Assistant.
+Тесты моделируют HA states, ES/TPC/GC, аппаратный FIFO-owner, scheduled exercise, Load Manager, Delayed Start/Charge Cycling, restart/handoff и фактические service calls к fake Home Assistant.
 
 Зелёный CI подтверждает программную модель, но не заменяет commissioning на реальных контакторах, generator-bus meter, G1/G2, генераторах, DKG116 и MAP.

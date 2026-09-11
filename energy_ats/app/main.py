@@ -318,6 +318,7 @@ class EnergySupervisorApp:
             outage_delay_already_satisfied=(
                 outage_decision.outage_delay_already_satisfied
             ),
+            restore_grid_after_cycle=outage_decision.restore_grid_after_cycle,
         )
 
         # Cycling ownership создаётся только у новой обычной automatic outage
@@ -684,6 +685,21 @@ class EnergySupervisorApp:
             session_cycle_owned=bool(session is not None and session.cycle_owned),
             session_manual_override=bool(session is not None and session.manual_override),
             manual_start_pending=self.supervisor.manual_start_pending,
+            grid_stable=bool(
+                hardware.grid_ready is True
+                and (
+                    self.supervisor.config.grid_restore_stable_time == 0
+                    or (
+                        self.supervisor.grid_ready_since is not None
+                        and now - self.supervisor.grid_ready_since
+                        >= self.supervisor.config.grid_restore_stable_time
+                    )
+                )
+            ),
+            grid_supply_restored=(
+                observation.power.actual_source == PowerSource.GRID
+                and not observation.power.transition_in_progress
+            ),
         )
 
     def _exercise_observation(
