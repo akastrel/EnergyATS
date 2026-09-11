@@ -1,8 +1,12 @@
-# Home Assistant entities и команды — Energy ATS 0.7.0
+# Home Assistant entities и команды — Energy ATS 1.0.3
 
-Этот документ описывает фактический HA-контракт текущей реализации. Физический смысл сигналов задаёт `PHYSICAL_POWER_TOPOLOGY_RU.md`, policy — `REQUIREMENTS_RU.md`.
+Этот документ описывает фактический HA contract текущей реализации.
 
-A/B — стабильные аппаратные слоты. Пользовательские имена, модели и паспортные мощности читаются отдельно и не меняют внутренний смысл слотов.
+- физический смысл сигналов: `PHYSICAL_POWER_TOPOLOGY_RU.md`;
+- нормативное поведение: `REQUIREMENTS_RU.md`;
+- установка/обновление: `INSTALL_RU.md`.
+
+A/B — стабильные внутренние physical slots. Пользовательские имена, модели и паспортные мощности читаются отдельно и не меняют смысл slot identity.
 
 ## 1. Helper-ы EnergyATS
 
@@ -15,17 +19,17 @@ input_boolean.generator_test_mode
 
 ### `input_boolean.automatic_generator_transfer`
 
-Разрешает автоматическую outage-сессию после физического исчезновения Grid. Ручная команда `start_generator` от него не зависит.
+Разрешает automatic outage session после физического исчезновения Grid. Manual `start_generator` от этого helper не зависит.
 
 ### `input_boolean.generator_test_mode`
 
-Явный классификатор **нового фронта RUNNING** как `TEST_RUN`.
+Положительный маркер **нового внешнего RUNNING** как `TEST_RUN`.
 
-Helper не запускает и не останавливает двигатель. Он только сообщает `GeneratorBusTracker`, что новый запуск является тестовым и не должен автоматически останавливаться правилом завершения outage. Если helper вообще отсутствует, это трактуется как `OFF`; существующий `unknown/unavailable` остаётся неопределённым.
+Helper не запускает и не останавливает generator. Scheduled Exercise знает происхождение собственного run напрямую и не требует переключения этого helper.
 
-## 2. Обязательные входные entities core ATS
+Если entity вообще отсутствует, это трактуется как `OFF`; если существующий entity временно `unknown/unavailable`, его состояние остаётся неопределённым.
 
-### Grid и основные контакторы
+## 2. Core Grid / transfer entities
 
 ```text
 binary_sensor.grid_input_ready
@@ -38,14 +42,18 @@ switch.use_generator_as_power_source
 Смысл:
 
 - `grid_input_ready` — физическая доступность/пригодность внешней Grid;
-- `house_powered_by_grid` — подтверждение цепи управления основного Grid-контактора;
-- `house_powered_by_generator` — подтверждение цепи управления основного Generator-контактора;
-- `grid_power` — разрешение Grid-ветви;
-- `use_generator_as_power_source` — выбор основной парой контакторов Generator (`ON`) / Grid (`OFF`).
+- `house_powered_by_grid` — feedback управляющей цепи основного Grid contactor;
+- `house_powered_by_generator` — feedback управляющей цепи основного Generator contactor;
+- `grid_power` — разрешение Grid branch;
+- `use_generator_as_power_source` — selector основной пары контакторов: `ON` Generator / `OFF` Grid.
 
-`house_powered_by_*` **не являются независимым измерением напряжения после силовых контактов**.
+Важно: `house_powered_by_*` находятся в управляющих цепях и не являются независимым силовым измерением после контактора.
 
-### Генераторы
+Успешный HA service call также не считается физическим подтверждением transfer.
+
+## 3. Core generator entities
+
+Для A/B:
 
 ```text
 binary_sensor.generator_a_is_running
@@ -54,19 +62,35 @@ switch.generator_a_remote_start
 switch.generator_b_remote_start
 ```
 
-`generator_*_is_running` используется как физическое подтверждение работающего генератора/наличия его выхода.
+`generator_*_is_running` — физическое подтверждение работы/наличия выхода generator.
 
-Оба `*_is_running` могут одновременно быть `ON`. Это штатный режим и не означает одновременного подключения обоих генераторов к общей генераторной шине.
+`generator_*_remote_start` — управляющий уровневый REMOTE signal. `ON` не доказывает успешный start, `OFF` не доказывает подтверждённую остановку.
 
-### Emergency Stop
+Оба `*_is_running` могут одновременно быть `ON`. Это штатно и не означает, что оба generator одновременно подключены к общей bus.
+
+### Choke commands
+
+```text
+button.generator_a_choke_to_cold_start
+button.generator_a_choke_to_run
+button.generator_b_choke_to_cold_start
+button.generator_b_choke_to_run
+```
+
+Названия уже нормализуют физический смысл: `to_cold_start` — положение холодного запуска, `to_run` — рабочее положение.
+
+## 4. Safety / environment
 
 ```text
 switch.generators_emergency_stop
+sensor.garage_temperature
 ```
 
-E-stop имеет приоритет над обычным управлением. Неизвестное состояние этого entity также не считается безопасным разрешением на запуск.
+E-stop имеет приоритет над обычным управлением. Неизвестное состояние E-stop не считается безопасным разрешением на start.
 
-### Метаданные и PRIMARY
+`garage_temperature` используется GC для choke/warmup. Временная недоступность температуры обрабатывается консервативно и сама по себе не блокирует core ATS.
+
+## 5. Generator metadata и PRIMARY
 
 Core ATS использует:
 
@@ -78,9 +102,9 @@ sensor.generator_b_model
 select.primary_generator
 ```
 
-Имена должны быть непустыми и различаться. `select.primary_generator` содержит одно из фактических имён и преобразуется во внутренний слот A/B.
+Имена должны быть непустыми и различаться. `select.primary_generator` должен совпадать с одним из фактических generator names и преобразуется во внутренний A/B slot.
 
-Load Manager дополнительно читает числовые read-only metadata:
+Load Manager дополнительно использует:
 
 ```text
 sensor.generator_a_nominal_power
@@ -89,28 +113,47 @@ sensor.generator_b_nominal_power
 sensor.generator_b_maximum_power
 ```
 
-Они измеряются в W и являются **soft dependency**: отсутствие/ошибка этих sensors не блокирует core ATS. При включённом Load Manager power-based admission/shedding в таком случае приостанавливаются локальным `DEGRADED`.
+Единицы — W. Эти sensors являются soft dependencies относительно core ATS.
 
-### Температура
+## 6. UPS Run — battery soft dependencies
+
+UPS Run использует:
 
 ```text
-sensor.garage_temperature
+sensor.ups_battery_charge_level_soc
+sensor.ups_battery_time_remaining_minutes_ttg
+binary_sensor.ups_running_on_battery
+binary_sensor.ups_ready
 ```
 
-Используется GC для choke/warmup. Недоступная температура обрабатывается консервативным профилем, но не подменяет обязательные RUNNING/REMOTE/E-stop данные.
+Смысл:
 
-## 3. Load Manager: soft-dependency entities
+- `ups_battery_charge_level_soc` — числовой SoC 0–100 %;
+- `ups_battery_time_remaining_minutes_ttg` — числовой TTG в **минутах**;
+- `ups_running_on_battery` — `ON`, когда батарея реально разряжается; при charge/float должен быть `OFF`;
+- `ups_ready` — способность UPS/АКБ продолжать работу, включая отсутствие critical battery state.
 
-Load Manager управляет только двумя группами:
+Все четыре — soft dependencies core ATS. Если UPS Run выключен, они не влияют на обычную ATS logic.
+
+При включённом Delayed Start stale/invalid telemetry отменяет ожидание и приводит к fail-safe generator start. TTG учитывается только при реальном discharge.
+
+## 7. Load Manager — soft dependencies
+
+Управляемые группы:
 
 ```text
 G1 = switch.non_critical_loads_first_floor
 G2 = switch.non_critical_loads_basement_floor
 ```
 
-G1 имеет более высокий приоритет. Восстановление выполняется `G1 -> G2`, overload `LOAD_SHEDDING` — `G2 -> G1`.
+Приоритет:
 
-Счётчик общей генераторной шины:
+```text
+restore: G1 -> G2
+shed:    G2 -> G1
+```
+
+Generator-bus meter:
 
 ```text
 binary_sensor.generator_meter_status
@@ -123,30 +166,29 @@ sensor.generator_power_factor
 sensor.generator_frequency
 ```
 
-Для автоматических power-based решений используется `sensor.generator_power`. Остальные meter entities публикуются как диагностическая телеметрия.
+Для automatic power decisions используется `sensor.generator_power`. U/I/S/Q/PF/Frequency — диагностическая telemetry, если отдельным requirement не задано иное.
 
-Все entities этого раздела являются soft dependencies относительно core ATS. Их отсутствие, `unknown/unavailable`, отказ Modbus или ошибка команды G1/G2 не должны сами по себе переводить Supervisor/TPC/GC в `RECOVERY_REQUIRED` либо блокировать возврат Grid.
+Meter/G1/G2/power metadata являются soft dependencies core ATS. Их отсутствие, `unknown/unavailable`, Modbus failure или consumer switch error не должны сами по себе создавать system `RECOVERY_REQUIRED` либо блокировать возврат Grid.
 
-### Батарейные soft dependencies
+Stale stream новых `sensor.generator_power` samples также считается недостоверным measurement: Load Manager переходит в локальный `DEGRADED` и после восстановления требует нового stabilization window.
 
-Delayed Start / Charge Cycling используют `sensor.ups_battery_charge_level_soc`, `sensor.ups_battery_time_remaining_minutes_ttg`, `binary_sensor.ups_running_on_battery` и `binary_sensor.ups_ready`. Их смысл и проверка достоверности приведены в [руководстве](DELAYED_START_RU.md#батарейные-сигналы).
+## 8. Presence для Scheduled Exercise
 
-Отсутствие этих entities не блокирует startup core ATS. При выключенных функциях они не влияют на управление.
-
-## 4. Управляющие buttons генераторов
-
-Для каждого генератора используются две физические команды заслонки:
+Entity задаётся configuration option:
 
 ```text
-button.generator_a_choke_to_cold_start
-button.generator_a_choke_to_run
-button.generator_b_choke_to_cold_start
-button.generator_b_choke_to_run
+family_presence_entity
 ```
 
-Их физический смысл уже нормализован именами: `to_cold_start` переводит заслонку в положение холодного запуска, `to_run` — в рабочее положение.
+Default:
 
-## 5. Команды App через STDIN
+```text
+group.family
+```
+
+Presence — soft Scheduler input. `unknown/unavailable` не блокирует core ATS, но ordinary Exercise до forced date требует достоверного подтверждения отсутствия семьи непосредственно перед REMOTE ON.
+
+## 9. Команды App через STDIN
 
 EnergyATS принимает:
 
@@ -156,13 +198,13 @@ stop_generator
 reset
 ```
 
-- `start_generator` — начать managed-сессию на выбранном PRIMARY;
-- `stop_generator` — безопасно завершить текущую managed-сессию;
-- `reset` — начать контролируемое восстановление после `RECOVERY_REQUIRED`.
+- `start_generator` — manual managed session / explicit manual handoff;
+- `stop_generator` — безопасное завершение managed session;
+- `reset` — контролируемое Recovery.
 
-Команды не обходят safety checks и в режиме DISARMED не исполняют аппаратные действия.
+Команды не обходят safety checks. В DISARMED аппаратные действия не разрешены.
 
-## 6. Status sensor
+## 10. Status sensor
 
 App публикует:
 
@@ -170,27 +212,31 @@ App публикует:
 sensor.energy_ats_status
 ```
 
-Это диагностическая проекция, а не вход управляющей логики.
+Это read-only diagnostic projection, а не управляющий input.
 
 ### State
 
-Человекочитаемое состояние, например:
+Примеры человекочитаемого state:
 
 ```text
-Питание от основной сети
+Ожидание данных
+Ожидание запуска генератора
 Запуск генератора
+Переключение на генератор
 Питание от генератора
 Питание от внешнего генератора
 Возврат на основную сеть
+Переход на питание только от UPS
 В доме работает только UPS линия
 Требуется восстановление
 DISARMED — только наблюдение
 ```
 
-### Базовые attributes
+### Core attributes
 
 ```text
 source
+phase
 generator
 generator_model
 generator_slot
@@ -199,16 +245,15 @@ bus_owner
 generator_a_run_context
 generator_b_run_context
 primary_generator
-phase
 remaining_seconds
 session_reason
 fallback_used
+cycle_session_owned_by_energy_ats
+session_manual_override
 armed
 ```
 
-A/B не кодируются в `source`. Конкретный генератор определяется `generator` / `generator_slot` и `bus_owner`.
-
-`source` принимает:
+`source`:
 
 ```text
 grid
@@ -218,7 +263,7 @@ no_power
 unknown
 ```
 
-Фаза Supervisor:
+Supervisor `phase`:
 
 ```text
 waiting_for_data
@@ -227,11 +272,12 @@ grid_failure_delay
 starting_generator
 on_generator
 returning_to_grid
+returning_to_ups
 external_running
 recovery_required
 ```
 
-Run context A/B:
+Run-context A/B:
 
 ```text
 none
@@ -241,7 +287,48 @@ other
 unknown
 ```
 
-### Load Manager attributes
+A/B не кодируются в `source`. Конкретный generator определяется через `generator`, `generator_slot` и `bus_owner`.
+
+## 11. UPS Run status attributes
+
+`UPSRun.status_attributes()` публикует:
+
+```text
+delayed_start_enabled
+charge_cycle_enabled
+charge_cycle_state
+delayed_start_reason
+battery_soc
+battery_ttg_minutes
+battery_discharging
+battery_ready
+generator_start_soc
+generator_target_charge_soc
+delayed_start_elapsed_seconds
+delayed_start_remaining_seconds
+```
+
+Дополнительно top-level status содержит:
+
+```text
+cycle_session_owned_by_energy_ats
+session_manual_override
+```
+
+`charge_cycle_state`:
+
+```text
+idle
+waiting_on_ups
+generator_required
+charging
+target_reached
+degraded
+```
+
+`returning_to_ups` — не UPS Run state, а Supervisor phase во время физического снятия дома с generator bus и завершения cycle.
+
+## 12. Load Manager status attributes
 
 ```text
 load_management_enabled
@@ -261,7 +348,7 @@ load_next_restore_retry
 load_last_reason
 ```
 
-`load_manager_phase` может принимать:
+`load_manager_phase`:
 
 ```text
 disabled
@@ -272,50 +359,60 @@ stable
 degraded
 ```
 
-`degraded` относится только к Load Manager и сам по себе не означает системный `recovery_required`.
+`degraded` принадлежит только Load Manager и не означает system `recovery_required`.
 
-Exercise Scheduler также публикует свои due/history/active attributes в этом же status sensor; их точный набор формируется Scheduler-ом.
+## 13. Scheduled Exercise status
 
-### Delayed Start / Charge Cycling attributes
+Exercise Scheduler добавляет per-slot attributes для:
 
-| Attribute | Значение |
-|---|---|
-| `delayed_start_enabled`, `charge_cycle_enabled` | Разрешение функций |
-| `charge_cycle_state`, `delayed_start_reason` | Состояние policy и причина текущего решения |
-| `battery_soc`, `battery_ttg_minutes` | Заряд и оставшиеся минуты; некорректное значение — `null` |
-| `battery_discharging`, `battery_ready` | Разряд и готовность UPS |
-| `generator_start_soc`, `generator_target_charge_soc` | Пороги заряда |
-| `delayed_start_elapsed_seconds`, `delayed_start_remaining_seconds` | Время текущего ожидания и остаток, секунды |
-| `cycle_session_owned_by_energy_ats` | Право cycling завершить эту сессию |
-| `session_manual_override` | Пользователь запретил автоматическое завершение по Target SoC |
+- enabled state;
+- last qualifying / initial reference;
+- next due / overdue / forced date;
+- warning state;
+- active attempt / duration;
+- last result / failure reason.
 
-Состояния policy: `idle`, `waiting_on_ups`, `generator_required`, `charging`, `target_reached`, `degraded`. `returning_to_ups` — фаза Supervisor при снятии питания дома с генератора и его остановке. Source продолжает отражать фактически наблюдаемое питание, а не цель переключения.
+Точный набор формируется `ExerciseScheduler.status_attributes()`; это диагностическая projection, а не отдельный HA control contract.
 
-## 7. Logbook и уведомления
+## 14. Logbook и notifications
 
-Аппаратные действия и события Supervisor/Exercise/Load Manager публикуются через HA Logbook. События уровня `critical` дополнительно вызывают:
+EnergyATS публикует runtime events в Logbook. Critical events дополнительно вызывают:
 
 ```text
 script.notify_critical
 ```
 
-Человеко-читаемые предупреждения Load Manager о локальной деградации и sustained overload могут также отправляться через тот же пользовательский notification script.
+Load Manager warnings и другие обычные user notifications могут использовать тот же script.
 
-Ошибка Logbook/status/notification считается диагностической и не должна сама прерывать управляющую последовательность.
+В 1.0.3 обычные status/Logbook/user publications выполняются best-effort background tasks и не должны задерживать control tick на сетевой timeout. При reconnect незавершённые background publications отменяются.
 
-## 8. Что намеренно отсутствует
+Исключение — предупреждение перед forced Scheduled Exercise. Оно отправляется синхронно, потому что Scheduler не имеет права считать warning доставленным до успешного ответа Home Assistant.
 
-В HA-контракте EnergyATS нет:
+Ошибки diagnostic publication не должны сами по себе менять физический source/session.
 
-- отдельного Battery contactor/path;
-- selector A/B генераторной шины — owner выбирает физическая взаимно заблокированная схема;
-- A/B position feedback контакторов генераторов;
-- helper-а, который объявляет внешний генератор managed;
-- автоматического запрета второго RUNNING;
-- права Load Manager управлять REMOTE/choke/stop генератора.
+## 15. Required vs soft dependencies
 
-## 9. Fail-safe по неизвестным данным
+Перед active hardware control обязательные core entities должны иметь определённые значения. `unknown`, `unavailable` и отсутствие required entity не интерпретируются как удобное default state.
 
-Перед аппаратным управлением core ATS обязательные entities должны иметь определённые значения. `unknown`, `unavailable` или отсутствие обязательного entity не интерпретируются как удобное значение по умолчанию.
+Отдельно как soft dependencies определены:
 
-Load Manager inputs из раздела 3 отделены от этого правила как soft dependencies. При их потере Load Manager прекращает те действия, для которых данных недостаточно, но core ATS продолжает работу согласно собственным требованиям.
+- battery telemetry UPS Run;
+- generator meter и G1/G2 Load Manager;
+- Nominal/Maximum metadata;
+- presence Scheduled Exercise;
+- ambient temperature с консервативным fallback.
+
+Отказ soft dependency ограничивает соответствующую локальную функцию, но не должен сам по себе превращаться в core Recovery.
+
+## 16. Что намеренно отсутствует в HA contract
+
+EnergyATS не моделирует как physical actuator:
+
+- Battery contactor / `connect_battery`;
+- software A/B selector общей generator bus;
+- автоматический запрет второго RUNNING;
+- отдельный Exercise power path;
+- helper, который произвольно объявляет внешний generator managed;
+- право Load Manager управлять REMOTE/choke/stop generator.
+
+Эти ограничения следуют из реальной физической схемы и требований проекта.
