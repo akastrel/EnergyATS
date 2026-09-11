@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.0.2
+
+Исправления пяти воспроизведённых дефектов F1–F5, найденных независимым ревью EnergyATS 1.0.1, без нового архитектурного слоя.
+
+- **F1:** manual stop во время продолжающегося outage сохраняет EnergyATS-owned обязанность вернуть Grid path после устойчивого восстановления сети; ownership переживает завершение generator session и restart App, но не распространяется на произвольный пользовательский `grid_power=OFF`.
+- **F2:** stop fault/timeout managed generator после уже подтверждённого возврата дома на Grid переводит Supervisor в `RECOVERY_REQUIRED`; fallback SECONDARY для ошибки остановки после возврата Grid не запускается.
+- **F3:** TPC при исчезновении generator voltage/feedback и всё ещё подтверждённом `generator_selected=ON` разрешает безопасный break `DESELECT_GENERATOR` с физическим подтверждением. Отсутствие напряжения не считается доказательством размыкания и не съедает допустимый start interval SECONDARY старым transfer timeout.
+- **F4:** ordinary Scheduled Exercise повторно проверяет presence непосредственно до физического REMOTE ON; `home` и `unknown/unavailable` отменяют ещё не начатую попытку как `DEFERRED`. Forced Exercise сохраняет отдельные правила grace/warning.
+- **F5:** Load Manager контролирует freshness потока generator-power samples и в `STABLE`; stale gap переводит только Load Manager в `DEGRADED`, разрывает overload/admission continuity и требует нового stabilization после восстановления samples.
+- Добавлены отдельные regression tests F1–F5 с человеко-читаемым описанием проверяемого поведения. До production fixes они воспроизводили все находки: `6 failed, 276 passed`; после исправлений полный suite проходит.
+- `REQUIREMENTS_RU.md` дополнен точной семантикой ownership Grid isolation, stop fault, generator-selector feedback, presence recheck и sample freshness; добавлены `TC-CORE-24`, `TC-CORE-25`, `TC-LOAD-25`.
+- `USER_TESTS_RU.md` расширен: C4 теперь проверяет окончательный возврат Grid, включая restart между stop и restore; C7 оставляет реальной схеме подтверждение feedback/contactors для F3.
+- App и add-on version подняты до `1.0.2`; persistent `schema_version` остаётся `3`, так как новое поле Supervisor обратно совместимо внутри существующего payload.
+
+---
+
 ## 1.0.1
 
 Терминологический cleanup UPS Run без изменения поведения EnergyATS.

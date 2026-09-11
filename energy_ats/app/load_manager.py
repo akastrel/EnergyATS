@@ -148,6 +148,9 @@ class LoadManager:
         self._measurement_started_at: float | None = None
         self._measurement_count = 0
         self._measurement_max: float | None = None
+        # Stream continuity and measurement-window state are deliberately
+        # separate. The stream markers must survive completion of MEASURING so
+        # STABLE can still detect a later sample gap.
         self._last_sample_id: Hashable | None = None
         self._last_new_sample_at: float | None = None
         self._nominal_overload_since: float | None = None
@@ -290,6 +293,7 @@ class LoadManager:
         retry = data.get("next_restore_retry")
         manager.next_restore_retry = float(retry) if retry is not None else None
         manager._reset_measurement()
+        manager._reset_sample_stream()
         manager._last_owner = None
         manager._blocked_groups.clear()
         manager._reset_overload_timers()
@@ -362,14 +366,19 @@ class LoadManager:
             self._start_measurement(o.now, "base")
             self._reset_overload_timers()
 
-        new_sample = self._accept_sample(o)
+        # F5 / REQ-LOAD-14/16/18/19: сначала оцениваем gap относительно
+        # предыдущего наблюдения, и только потом принимаем текущий sample. Иначе
+        # первый sample после долгой паузы сам стирает доказательство stale gap.
         if self._samples_stale(o.now):
+            self._reset_overload_timers()
             self._degrade(
                 "Нет нескольких свежих generator-power samples; power-based действия приостановлены.",
                 events,
                 notifications,
             )
             return self._decision(actions, events, notifications)
+
+        new_sample = self._accept_sample(o)
 
         if self.phase == LoadManagerPhase.MEASURING:
             if not self._measurement_ready(o.now):
@@ -578,8 +587,9 @@ class LoadManager:
         self._measurement_started_at = now
         self._measurement_count = 0
         self._measurement_max = None
-        self._last_sample_id = None
-        self._last_new_sample_at = None
+        # Новое stabilization window начинает новую доказанную непрерывность
+        # samples. Завершение этого окна, напротив, stream markers не стирает.
+        self._reset_sample_stream()
 
     def _accept_sample(self, o: LoadManagerObservation, *, force: bool = False) -> bool:
         power = self._number(o.generator_power)
@@ -601,16 +611,25 @@ class LoadManager:
         )
 
     def _samples_stale(self, now: float) -> bool:
-        if self._measurement_started_at is None:
+        reference = (
+            self._last_new_sample_at
+            if self._last_new_sample_at is not None
+            else self._measurement_started_at
+        )
+        if reference is None:
             return False
-        reference = self._last_new_sample_at if self._last_new_sample_at is not None else self._measurement_started_at
-        return now - reference >= max(5.0, self.config.measurement_stabilization_time * 2 + 1)
+        return now - reference >= max(
+            5.0,
+            self.config.measurement_stabilization_time * 2 + 1,
+        )
 
     def _reset_measurement(self) -> None:
         self._measurement_reason = None
         self._measurement_started_at = None
         self._measurement_count = 0
         self._measurement_max = None
+
+    def _reset_sample_stream(self) -> None:
         self._last_sample_id = None
         self._last_new_sample_at = None
 
@@ -643,6 +662,7 @@ class LoadManager:
 
     def _reset_runtime(self) -> None:
         self._reset_measurement()
+        self._reset_sample_stream()
         self._reset_overload_timers()
         self._blocked_groups.clear()
 
