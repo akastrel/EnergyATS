@@ -18,7 +18,7 @@ from generator_controller import (
 )
 from ha_client import HomeAssistantClient
 from load_manager import LoadAction, LoadActionKind, LoadGroup
-from outage_power_policy import BatteryObservation
+from ups_run import BatteryObservation
 from power_transfer import (
     PowerTransferObservation,
     TransferAction,
@@ -63,8 +63,8 @@ ENTITIES = {
     "generator_frequency": "sensor.generator_frequency",
     "load_g1": "switch.non_critical_loads_first_floor",
     "load_g2": "switch.non_critical_loads_basement_floor",
-    # Battery inputs Delayed Start / Charge Cycling. Это soft dependencies:
-    # отсутствие любого из них не должно блокировать core ATS.
+    # Battery inputs UPS Run. Это soft dependencies: отсутствие любого из них
+    # не должно блокировать core ATS.
     "ups_battery_soc": "sensor.ups_battery_charge_level_soc",
     "ups_battery_ttg_minutes": "sensor.ups_battery_time_remaining_minutes_ttg",
     "ups_running_on_battery": "binary_sensor.ups_running_on_battery",
@@ -287,7 +287,7 @@ class HomeAssistantAdapter:
         *,
         include_control_entities: bool = True,
     ) -> list[str]:
-        # Load Manager, battery-policy entities and Nominal/Maximum metadata
+        # Load Manager, UPS Run battery entities и Nominal/Maximum metadata
         # намеренно не входят сюда: это soft dependencies и они не могут
         # блокировать старт core ATS.
         state_required = [
