@@ -1,4 +1,4 @@
-"""Policy EnergyATS поверх GC, TPC и наблюдаемой генераторной шины."""
+"""Верхнеуровневая логика поведения EnergyATS поверх GC/TPC и локальных подсистем."""
 
 from __future__ import annotations
 
@@ -22,6 +22,16 @@ class SupervisorPhase(str, Enum):
     RETURNING_TO_UPS = "returning_to_ups"
     EXTERNAL_RUNNING = "external_running"
     RECOVERY_REQUIRED = "recovery_required"
+
+
+class ExerciseDirective(str, Enum):
+    """Механическая команда Scheduler-у после решения Supervisor."""
+
+    NONE = "none"
+    CANCEL_UNSTARTED = "cancel_unstarted"
+    HANDOFF_TO_OUTAGE = "handoff_to_outage"
+    HANDOFF_TO_MANUAL = "handoff_to_manual"
+    FAIL_ACTIVE = "fail_active"
 
 
 _TRANSIENT_PHASES = {
@@ -123,10 +133,20 @@ class SupervisorDecision:
     stable_managed_generator: GeneratorSlot | None
     stop_outage_generators: frozenset[GeneratorSlot]
     events: tuple[SupervisorEvent, ...]
+    exercise_directive: ExerciseDirective = ExerciseDirective.NONE
+    exercise_slot: GeneratorSlot | None = None
+    exercise_reason: str | None = None
+    begin_post_cycle_wait: bool = False
 
 
 class EnergySupervisor:
-    """Хранит только policy-state; физические переходы выполняют GC/TPC."""
+    """Единственный центр верхнеуровневых решений EnergyATS.
+
+    Supervisor реализует системные REQ-BEH-* и хранит managed-session state.
+    GC/TPC исполняют уже разрешённые физические операции; Exercise/UPS Run/
+    LoadManager предоставляют локальные факты и условия, но не конкурируют с
+    Supervisor за право принять общесистемное решение.
+    """
 
     def __init__(self, config: SupervisorConfig | None = None) -> None:
         self.config = config or SupervisorConfig()
@@ -147,6 +167,10 @@ class EnergySupervisor:
         self._recovery_reset_active = False
         self._events: list[SupervisorEvent] = []
         self._stop_outage_generators: set[GeneratorSlot] = set()
+        self._exercise_directive = ExerciseDirective.NONE
+        self._exercise_slot: GeneratorSlot | None = None
+        self._exercise_reason: str | None = None
+        self._begin_post_cycle_wait = False
 
     # Requests / recovery --------------------------------------------
 
@@ -157,11 +181,11 @@ class EnergySupervisor:
         self._manual_stop_requested = True
 
     def request_cycle_stop(self) -> None:
-        """Завершить только принадлежащую Charge Cycling outage-session."""
+        """Compatibility entry point; normal tick passes the UPS Run intent directly."""
         self._cycle_stop_requested = True
 
     def mark_session_cycle_owned(self) -> bool:
-        """Пометить новую automatic outage-session как принадлежащую cycling policy."""
+        """Compatibility helper for old callers/tests; ownership normally set in step()."""
         if (
             self.session is None
             or self.session.reason != SessionReason.GRID_OUTAGE
@@ -176,7 +200,7 @@ class EnergySupervisor:
 
     @property
     def has_pending_session_request(self) -> bool:
-        """Maintenance не должна обгонять пользовательскую команду."""
+        """Scheduled Exercise не должен обгонять пользовательскую команду."""
         return self._manual_start_requested or self._manual_stop_requested
 
     @property
@@ -243,7 +267,7 @@ class EnergySupervisor:
         self._events.clear()
         return events
 
-    # Main policy -----------------------------------------------------
+    # Main behavior ---------------------------------------------------
 
     def step(
         self,
@@ -254,9 +278,32 @@ class EnergySupervisor:
         exercise_desired_running: bool = False,
         defer_automatic_start: bool = False,
         outage_delay_already_satisfied: bool = False,
+        claim_new_outage_session: bool = False,
+        request_cycle_stop: bool = False,
         restore_grid_after_cycle: bool = False,
     ) -> SupervisorDecision:
+        """Выполнить один верхнеуровневый decision pass.
+
+        Параметры Exercise/UPS Run — только локальные факты/intents. Их
+        пересечение с manual/outage/recovery разрешается здесь, а main.py после
+        этого лишь механически dispatch-ит возвращённые директивы.
+        """
         self._stop_outage_generators.clear()
+        self._clear_step_directives()
+
+        cycle_completion_candidate = bool(
+            self.session is not None
+            and self.session.cycle_owned
+            and (
+                self.phase == SupervisorPhase.RETURNING_TO_UPS
+                or request_cycle_stop
+                or self._cycle_stop_requested
+            )
+        )
+        session_before = self.session
+        if request_cycle_stop:
+            self._cycle_stop_requested = True
+
         if not self.initialized:
             self._initialize(o)
             self.initialized = True
@@ -265,29 +312,41 @@ class EnergySupervisor:
         if not o.required_states_known:
             self._discard_requests()
             return self._decision(o, exercise_owned_slot, exercise_desired_running)
+
+        # REQ-BEH-17 — Recovery имеет абсолютный приоритет. При этом
+        # автоматически запущенный Exercise не теряет ответственного за stop.
         if self.phase == SupervisorPhase.RECOVERY_REQUIRED:
             self._discard_requests()
+            self._fail_exercise_for_recovery(exercise_owned_slot)
             return self._decision(o, exercise_owned_slot, False)
         if o.emergency_stop is True:
             self._discard_requests()
             self._require_recovery("Активен Generators Emergency Stop.")
+            self._fail_exercise_for_recovery(exercise_owned_slot)
             return self._decision(o, exercise_owned_slot, False)
         if o.power.recovery_required:
             self._discard_requests()
             self._require_recovery(
                 o.power.fault or "Power Transfer требует восстановления."
             )
+            self._fail_exercise_for_recovery(exercise_owned_slot)
             return self._decision(o, exercise_owned_slot, False)
 
+        # REQ-BEH-02/06/07/13 — явная команда пользователя обрабатывается
+        # раньше автоматических outage/UPS Run intents.
         if self._manual_start_requested:
             self._manual_start_requested = False
-            self._manual_start(o)
+            self._manual_start(o, exercise_owned_slot)
         if self._manual_stop_requested:
             self._manual_stop_requested = False
             self._manual_stop(o)
         if self._cycle_stop_requested:
             self._cycle_stop_requested = False
             self._cycle_stop(o)
+
+        if self.phase == SupervisorPhase.RECOVERY_REQUIRED:
+            self._fail_exercise_for_recovery(exercise_owned_slot)
+            return self._decision(o, exercise_owned_slot, False)
 
         if self.session is None:
             self._without_session(
@@ -300,6 +359,26 @@ class EnergySupervisor:
             )
         else:
             self._with_session(now, o)
+
+        # REQ-CYCLE-04 — UPS Run может владеть только новой обычной automatic
+        # outage-session. Adopted Exercise и manual session cycling не захватывает.
+        ordinary_new_outage = bool(
+            session_before is None
+            and self.session is not None
+            and self.session.reason == SessionReason.GRID_OUTAGE
+            and self._exercise_directive != ExerciseDirective.HANDOFF_TO_OUTAGE
+        )
+        if ordinary_new_outage and claim_new_outage_session:
+            self.session.cycle_owned = True
+
+        # REQ-CYCLE-07 — после штатного cycle stop следующий UPS interval
+        # начинается сразу; повторный core grid_failure_delay не требуется.
+        if cycle_completion_candidate and self.session is None and o.grid_ready is False:
+            self._begin_post_cycle_wait = True
+
+        if self.phase == SupervisorPhase.RECOVERY_REQUIRED:
+            self._fail_exercise_for_recovery(exercise_owned_slot)
+
         return self._decision(o, exercise_owned_slot, exercise_desired_running)
 
     def _initialize(self, o: SupervisorObservation) -> None:
@@ -389,10 +468,11 @@ class EnergySupervisor:
             self.phase = SupervisorPhase.GRID_FAILURE_DELAY
             return
 
-        # Уже запущенный Scheduler-ом generator можно явно принять в outage
-        # независимо от delayed-start policy: дополнительного пуска здесь нет.
         if exercise_owned_slot is not None:
             exercise_status = o.generators[exercise_owned_slot]
+
+            # REQ-BEH-04 — уже RUNNING исправный Exercise-generator не
+            # останавливаем ради нового cold start: принимаем тот же slot в outage.
             if (
                 exercise_status.running is True
                 and exercise_status.remote_on is True
@@ -405,8 +485,37 @@ class EnergySupervisor:
                     exercise_owned_slot,
                     allow_active=True,
                 )
-            else:
-                self.phase = SupervisorPhase.GRID_FAILURE_DELAY
+                if self.session is not None:
+                    self._set_exercise_directive(
+                        ExerciseDirective.HANDOFF_TO_OUTAGE,
+                        exercise_owned_slot,
+                        "реальный Grid outage принял уже работающий Exercise-generator",
+                    )
+                return
+
+            # REQ-BEH-03 — Exercise существует логически, но физически ещё не
+            # стартовал. Outage сильнее maintenance: Scheduler должен defer/cancel.
+            if exercise_status.running is False and exercise_status.remote_on is False:
+                self._set_exercise_directive(
+                    ExerciseDirective.CANCEL_UNSTARTED,
+                    exercise_owned_slot,
+                    "реальная потеря Grid получила приоритет над ещё не начавшимся Exercise",
+                )
+                if defer_automatic_start:
+                    self.phase = SupervisorPhase.GRID_FAILURE_DELAY
+                    return
+                self._begin_session(o, SessionReason.GRID_OUTAGE)
+                return
+
+            # REQ-BEH-05 — start/stop handoff нельзя угадывать.
+            self._require_recovery(
+                "Grid пропала во время неоднозначной start/stop-фазы Scheduled Exercise."
+            )
+            self._set_exercise_directive(
+                ExerciseDirective.FAIL_ACTIVE,
+                exercise_owned_slot,
+                "неоднозначный Exercise -> Outage handoff потребовал Recovery",
+            )
             return
 
         if defer_automatic_start:
@@ -423,6 +532,7 @@ class EnergySupervisor:
             return
 
         if self.phase == SupervisorPhase.RETURNING_TO_UPS:
+            # REQ-BEH-12 — stable Grid важнее завершения Generator -> UPS_ONLY.
             if self._grid_stable(now):
                 self.session.stop_requested = False
                 self.phase = SupervisorPhase.RETURNING_TO_GRID
@@ -540,6 +650,7 @@ class EnergySupervisor:
         other_status = o.generators[other]
         self.desired_generators[failed] = False
 
+        # REQ-BEH-15/16 — единственный fallback; внешний SECONDARY не захватываем.
         if self.session.fallback_used:
             self._require_recovery(f"Отказ SECONDARY после fallback: {reason}")
             return
@@ -576,6 +687,8 @@ class EnergySupervisor:
         assert self.session is not None
         self.desired_source = PowerSource.GRID
 
+        # REQ-BEH-10 — повторная потеря Grid отменяет логическое завершение
+        # return, но неподтверждённый физический шаг TPC не разворачивается здесь.
         if (
             self.session.grid_was_unavailable
             and not self.session.stop_requested
@@ -603,7 +716,7 @@ class EnergySupervisor:
             self._finish_session()
 
     def _returning_to_ups(self, o: SupervisorObservation) -> None:
-        """Cycle stop: сначала снять дом с generator bus, потом остановить engine."""
+        """REQ-BEH-11: сначала снять дом с generator bus, затем остановить engine."""
         assert self.session is not None
         slot = self.session.generator
         self.desired_source = PowerSource.UPS_ONLY
@@ -655,15 +768,18 @@ class EnergySupervisor:
 
     # Session commands ------------------------------------------------
 
-    def _manual_start(self, o: SupervisorObservation) -> None:
+    def _manual_start(
+        self,
+        o: SupervisorObservation,
+        exercise_owned_slot: GeneratorSlot | None,
+    ) -> None:
         if self.session is not None:
             if self.session.reason == SessionReason.GRID_OUTAGE:
+                # REQ-BEH-13 — user takes over an automatic outage/cycle.
                 self.session.manual_override = True
                 self.session.cycle_owned = False
                 self.session.stop_requested = False
                 if self.phase == SupervisorPhase.RETURNING_TO_UPS:
-                    # Двигатель мог уже штатно остановиться. Возобновление
-                    # проходит через обычный startup, а не через failure/fallback.
                     self.phase = SupervisorPhase.STARTING_GENERATOR
                     self.desired_source = PowerSource.UPS_ONLY
                     self.desired_generators[self.session.generator] = True
@@ -675,6 +791,55 @@ class EnergySupervisor:
             else:
                 self._event("info", "Ручная команда запуска: сессия уже активна.")
             return
+
+        if exercise_owned_slot is not None:
+            status = o.generators[exercise_owned_slot]
+
+            # REQ-BEH-07 — already RUNNING Exercise используется тем же manual
+            # session без бессмысленного REMOTE OFF -> cold start.
+            if (
+                status.running is True
+                and status.remote_on is True
+                and not _generator_failed(status)
+                and self.config.generator_enabled(exercise_owned_slot)
+            ):
+                self._begin_session_for_slot(
+                    o,
+                    SessionReason.MANUAL_GENERATOR_START,
+                    exercise_owned_slot,
+                    allow_active=True,
+                )
+                if self.session is not None:
+                    self._set_exercise_directive(
+                        ExerciseDirective.HANDOFF_TO_MANUAL,
+                        exercise_owned_slot,
+                        "пользователь запросил резервное питание от уже работающего Exercise-generator",
+                    )
+                    self.automatic_start_suppressed_until_grid = False
+                return
+
+            # REQ-BEH-06 — ещё не стартовавший Exercise уступает manual request.
+            if status.running is False and status.remote_on is False:
+                self._set_exercise_directive(
+                    ExerciseDirective.CANCEL_UNSTARTED,
+                    exercise_owned_slot,
+                    "пользовательская managed-сессия получила приоритет над ещё не начавшимся Exercise",
+                )
+                self._begin_session(o, SessionReason.MANUAL_GENERATOR_START)
+                if self.session is not None:
+                    self.automatic_start_suppressed_until_grid = False
+                return
+
+            self._require_recovery(
+                "Ручной запрос получен во время неоднозначной start/stop-фазы Scheduled Exercise."
+            )
+            self._set_exercise_directive(
+                ExerciseDirective.FAIL_ACTIVE,
+                exercise_owned_slot,
+                "неоднозначный Exercise -> Manual handoff потребовал Recovery",
+            )
+            return
+
         active = self._active_slots(o)
         if active:
             names = ", ".join(o.generators[slot].display_name for slot in active)
@@ -694,6 +859,7 @@ class EnergySupervisor:
         self.session.stop_requested = True
         self.session.cycle_owned = False
         if o.grid_ready is False:
+            # REQ-BEH-14 — explicit stop suppresses automatic restart until Grid.
             self.automatic_start_suppressed_until_grid = True
         self.desired_source = PowerSource.GRID
         self.phase = SupervisorPhase.RETURNING_TO_GRID
@@ -771,6 +937,36 @@ class EnergySupervisor:
         self._cycle_stop_requested = False
         self._stop_outage_generators.clear()
 
+    # Step directives -------------------------------------------------
+
+    def _clear_step_directives(self) -> None:
+        self._exercise_directive = ExerciseDirective.NONE
+        self._exercise_slot = None
+        self._exercise_reason = None
+        self._begin_post_cycle_wait = False
+
+    def _set_exercise_directive(
+        self,
+        directive: ExerciseDirective,
+        slot: GeneratorSlot,
+        reason: str,
+    ) -> None:
+        # Safety failure must never be overwritten by a weaker handoff/cancel.
+        if self._exercise_directive == ExerciseDirective.FAIL_ACTIVE:
+            return
+        self._exercise_directive = directive
+        self._exercise_slot = slot
+        self._exercise_reason = reason
+
+    def _fail_exercise_for_recovery(self, slot: GeneratorSlot | None) -> None:
+        if slot is None:
+            return
+        self._set_exercise_directive(
+            ExerciseDirective.FAIL_ACTIVE,
+            slot,
+            "EnergyATS перешёл в RECOVERY_REQUIRED во время Scheduled Exercise",
+        )
+
     # Derived state / persistence ------------------------------------
 
     def _decision(
@@ -793,6 +989,7 @@ class EnergySupervisor:
         if (
             self.session is None
             and self.phase != SupervisorPhase.RECOVERY_REQUIRED
+            and self._exercise_directive == ExerciseDirective.NONE
             and exercise_owned_slot is not None
             and exercise_desired_running
         ):
@@ -808,6 +1005,10 @@ class EnergySupervisor:
             stable_managed_generator=stable_managed,
             stop_outage_generators=frozenset(self._stop_outage_generators),
             events=self.take_events(),
+            exercise_directive=self._exercise_directive,
+            exercise_slot=self._exercise_slot,
+            exercise_reason=self._exercise_reason,
+            begin_post_cycle_wait=self._begin_post_cycle_wait,
         )
 
     def status_text(self, o: SupervisorObservation) -> str:
