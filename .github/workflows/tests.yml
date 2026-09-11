@@ -21,3 +21,24 @@ jobs:
 
       - name: Run tests
         run: pytest -q
+
+  addon-container-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build add-on container
+        run: >-
+          docker build
+          --build-arg BUILD_VERSION=ci
+          --build-arg BUILD_ARCH=amd64
+          -t energy-ats:ci
+          energy_ats
+
+      - name: Import production runtime inside container
+        run: >-
+          docker run --rm
+          --entrypoint python3
+          energy-ats:ci
+          -c "import sys; sys.path.insert(0, '/app'); import main; print(main.APP_VERSION)"
