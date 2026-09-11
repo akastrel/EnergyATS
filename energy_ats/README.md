@@ -1,34 +1,97 @@
-# Energy ATS 0.5.0
+# Energy ATS 1.0.3
 
-Home Assistant App для управления резервным электроснабжением дома.
+Home Assistant App для управления резервным электроснабжением дома с двумя генераторами, общей generator bus и отдельной UPS-линией через МАП.
 
-Базовая модель 0.4 сохраняется без изменения физической топологии:
+## Основные возможности
 
-- `UPS_ONLY` вместо виртуального Battery path;
-- аппаратный FIFO owner общей генераторной шины;
-- штатные два RUNNING;
-- один managed fallback `PRIMARY -> SECONDARY`;
-- внешний SECONDARY без автоматического захвата ownership;
-- outage-related shutdown после возврата Grid;
-- persistent owner/run-context между restart.
+- автоматический и ручной переход Grid -> Generator и обратно;
+- безопасный break-before-make transfer с подтверждением каждого шага;
+- выбор PRIMARY generator в Home Assistant и один fallback на SECONDARY;
+- корректная работа с двумя одновременно RUNNING генераторами и аппаратным FIFO-owner общей шины;
+- `UPS_ONLY` без отдельного Battery contactor;
+- **UPS Run**: Delayed Start и charge cycling для длительных отключений;
+- **Scheduled Exercise** для периодических пробных запусков A/B;
+- **Load Manager** для двух некритичных групп G1/G2;
+- Recovery при неоднозначном физическом состоянии;
+- persistent state и диагностический `sensor.energy_ats_status`.
 
-Версия 0.5 добавляет **Scheduled Generator Exercise** — независимый автоматический пробный запуск A и B после длительного простоя. Exercise использует существующий Generator Controller, оставляет дом на Grid, сохраняет ownership/timer между restart, не имеет maintenance fallback и может явно передать уже работающий test-generator обычной outage-сессии при реальной потере Grid.
+## Важно перед включением ARMED
 
-Автоматические exercise по умолчанию выключены. Defaults после включения:
+EnergyATS управляет реальными генераторами и контакторами. Для первого запуска рекомендуется:
 
-```text
-A: 30 дней / 15:00 / 10 мин / grace 7 дней
-B: 45 дней / 15:00 / 10 мин / grace 14 дней
+```yaml
+armed: false
 ```
 
-Presence задаётся через `family_presence_entity` (default `group.family`). Presence является входом только Scheduler-а и не блокирует основную ATS-логику.
+В этом режиме App читает Home Assistant, восстанавливает внутреннюю модель и публикует status, но не должна выдавать аппаратные команды.
 
-Основные документы:
+Перед `armed: true` проверьте:
 
-- `../docs/PHYSICAL_POWER_TOPOLOGY_RU.md` — физическая схема;
-- `../docs/REQUIREMENTS_RU.md` — требования;
-- `../docs/ARCHITECTURE_RU.md` — архитектура;
-- `../docs/ENTITIES_RU.md` — Home Assistant contract;
-- `../docs/INSTALL_RU.md` — установка, обновление и физические испытания.
+- `binary_sensor.grid_input_ready`;
+- `binary_sensor.house_powered_by_grid` / `_by_generator`;
+- RUNNING/REMOTE обоих генераторов;
+- `switch.grid_power` и `switch.use_generator_as_power_source`;
+- Emergency Stop;
+- имена/модели генераторов и `select.primary_generator`.
 
-Для первого запуска использовать `armed: false`. Старый journal 0.3 автоматически в модель 0.4+ не мигрируется.
+После этого выполните физические commissioning-тесты из `USER_TESTS_RU.md`.
+
+## UPS Run
+
+UPS Run определяет стратегию длительного outage. Две функции включаются независимо и по умолчанию выключены:
+
+- **Delayed Start** — после обычного `grid_failure_delay` можно продолжать работу только от UPS до порога SoC/TTG/max-delay;
+- **Charge Cycling** — cycle-owned automatic outage session можно завершить при Target SoC, перейти в `UPS_ONLY`, остановить generator и позже запустить следующий цикл.
+
+Manual request имеет приоритет над ожиданием/cycle stop. Stable Grid имеет приоритет над Target SoC. При плохой battery telemetry EnergyATS отказывается от задержки и использует обычный безопасный generator start.
+
+## Scheduled Exercise
+
+Плановые пробные запуски настраиваются отдельно для A и B и по умолчанию выключены. Ordinary Exercise выполняется только при подтверждённом отсутствии семьи; forced run после grace требует заранее успешно доставленного warning. Exercise не переводит дом с Grid на generator bus и не имеет maintenance fallback.
+
+## Load Manager
+
+При `load_management_enabled: true` EnergyATS управляет только:
+
+```text
+G1 = switch.non_critical_loads_first_floor
+G2 = switch.non_critical_loads_basement_floor
+```
+
+Load Manager снимает некритичные нагрузки перед generator transfer, возвращает их по одной при достаточном запасе мощности и выполняет shedding при устойчивой перегрузке. Meter/G1/G2/power metadata являются soft dependencies: их отказ не должен ломать core ATS.
+
+## Управление
+
+Поддерживаются команды App:
+
+```text
+start_generator
+stop_generator
+reset
+```
+
+`reset` запускает контролируемое Recovery. Это не безусловный сброс ошибки: внешний generator, E-stop или неоднозначное физическое состояние могут блокировать восстановление.
+
+## Status
+
+App публикует:
+
+```text
+sensor.energy_ats_status
+```
+
+Он показывает фактический source, phase, generator/bus owner, PRIMARY, managed session, Exercise, UPS Run и Load Manager state. Status является диагностикой и не используется как управляющий input.
+
+## Документация
+
+Вкладка **Documentation** этого App содержит практическое руководство (`DOCS.md`). Полные документы проекта:
+
+- [Физическая схема](https://github.com/akastrel/EnergyATS/blob/main/docs/PHYSICAL_POWER_TOPOLOGY_RU.md)
+- [Требования](https://github.com/akastrel/EnergyATS/blob/main/docs/REQUIREMENTS_RU.md)
+- [Архитектура](https://github.com/akastrel/EnergyATS/blob/main/docs/ARCHITECTURE_RU.md)
+- [Home Assistant entities](https://github.com/akastrel/EnergyATS/blob/main/docs/ENTITIES_RU.md)
+- [Установка и обновление](https://github.com/akastrel/EnergyATS/blob/main/docs/INSTALL_RU.md)
+- [Физические тесты](https://github.com/akastrel/EnergyATS/blob/main/docs/USER_TESTS_RU.md)
+- [Changelog](https://github.com/akastrel/EnergyATS/blob/main/energy_ats/CHANGELOG.md)
+
+Текущая версия 1.0.3 проходит полный Python suite (**288 tests**) и production-container smoke. Это не заменяет проверку на реальной электроустановке.
