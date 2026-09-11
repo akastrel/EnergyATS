@@ -56,7 +56,7 @@ EnergyATS — один Home Assistant App и один Python-процесс. В�
 
 `main.py` собирает наблюдения, вызывает компоненты в определённом порядке и механически исполняет полученное решение. Он не содержит отдельного слоя бизнес-арбитража.
 
-Допустимы `if` для технического dispatch, например «если Supervisor выдал handoff directive — вызвать соответствующий метод Scheduler». Недопустимо решать в `main.py`, **когда** outage важнее Exercise, должен ли Target SoC проиграть manual request или можно ли захватить уже работающий generator.
+Допустимы `if` для технического dispatch, например «если Supervisor выдал handoff directive — вызвать соответствующий метод Scheduler». Недопустимо решать в `main.py`, **когда** outage важнее Exercise, должен ли Target SoC проиграть manual request, можно ли захватить уже работающий generator либо какие generators Recovery имеет право остановить.
 
 ---
 
@@ -72,8 +72,8 @@ EnergyATS — один Home Assistant App и один Python-процесс. В�
 | `exercise_scheduler.py` | Локальная логика Scheduled Exercise: schedule/history/warning/duration/result и ответственность за собственный auto-run до явного handoff |
 | `ups_run.py` | UPS Run subsystem: оценка battery/TTG/time, ожидание в `UPS_ONLY`, условия начала/окончания charge cycle. Не является вторым Supervisor |
 | `load_manager.py` | G1/G2: pre-transfer shedding, admission, continuous overload control, own-OFF ownership и локальный DEGRADED |
-| `ha_adapter.py` | HA states -> observations, разрешённые service calls, safety checks и публикация runtime outputs |
-| `main.py` | Composition root: snapshot, вызов компонентов, dispatch `SupervisorDecision`, journal/status/log |
+| `ha_adapter.py` | HA states -> observations, hardware service calls, safety checks; routine status/Logbook/user publications выполняются best-effort background tasks |
+| `main.py` | Composition root: snapshot, вызов компонентов, механический dispatch `SupervisorDecision` / `RecoveryDecision`, hardware execution и persistence |
 | `state_store.py` | Атомарное сохранение persistent state |
 | `ha_client.py` | WebSocket/REST transport Home Assistant и revisions входящих HA states |
 
@@ -235,7 +235,8 @@ Supervisor отвечает на вопросы:
 - когда automatic charge cycle можно завершить;
 - что делать при manual command во время outage/cycle/Exercise;
 - можно ли принять already-running Exercise generator;
-- когда обычное управление должно уступить Recovery.
+- когда обычное управление должно уступить Recovery;
+- можно ли начать Recovery reset, какой порядок восстановления использовать и какие owned generators разрешено остановить.
 
 ### 8.1. Фазы Supervisor
 
@@ -267,7 +268,7 @@ Scheduler и UPS Run не передают Supervisor готовое общес�
 
 ### 8.3. `SupervisorDecision`
 
-Результат одного `step()` — единое решение для текущего tick. Оно должно содержать достаточно информации, чтобы `main.py` мог **механически**:
+Результат обычного `step()` — единое решение для текущего tick. Оно должно содержать достаточно информации, чтобы `main.py` мог **механически**:
 
 - передать TPC желаемый source;
 - передать GC желаемый RUNNING/authorized shutdown;
@@ -338,6 +339,44 @@ UPS Run subsystem не выдаёт engine/TPC commands. Он вычисляет
 Manual request во время cycle снимает automatic Target SoC stop через manual override. Устойчивый возврат Grid имеет приоритет над переходом Generator -> UPS_ONLY.
 
 После подтверждённой cycle stop UPS Run начинает новый post-cycle wait. Следующий automatic start снова проходит обычный Supervisor/GC/LoadManager/TPC path.
+
+### 8.10. Recovery в 1.0.3
+
+Recovery больше не является скрытой policy внутри `main.py`. `EnergySupervisor.recovery_step()` получает общие observations плюс локальный TPC blocker и Exercise-owned slot и возвращает `RecoveryDecision`.
+
+Внутренние directives:
+
+```text
+NONE
+FINISH_TICK
+BEGIN_GRID_RECOVERY
+DRIVE_GRID_RECOVERY
+STOP_GENERATORS
+COMPLETE
+```
+
+Supervisor определяет:
+
+- требуется ли reset вообще;
+- блокирует ли E-stop;
+- есть ли локальный TPC blocker;
+- известны ли обязательные состояния генераторов;
+- присутствует ли внешний RUNNING generator, на который Recovery не имеет ownership;
+- когда Grid path уже подтверждён;
+- какие managed/Exercise-owned slots разрешено останавливать;
+- когда Recovery можно завершить.
+
+Порядок системного решения:
+
+```text
+prove no blocker
+  -> establish/confirm Grid path
+  -> stop only explicitly owned generators
+  -> reset local GC/TPC fault state when physically safe
+  -> complete Recovery
+```
+
+Если Grid path уже физически подтверждён в момент reset request, Supervisor может сразу перейти к owned shutdown/complete без искусственного дополнительного tick. `main.py` не выбирает recovery ownership и не формирует этот порядок самостоятельно.
 
 ---
 
@@ -525,6 +564,26 @@ Load Manager и UPS Run battery inputs намеренно не входят в �
 
 Одновременный RUNNING A и B допустим.
 
+### 12.1. Runtime publications
+
+В 1.0.3 публикации разделены по семантике.
+
+**Routine diagnostics**:
+
+- status sensor;
+- Logbook;
+- обычные user notifications, включая Load Manager warnings.
+
+Они выполняются best-effort background tasks. HA/network timeout не должен удерживать критический control tick. Перед reconnect/закрытием transport незавершённые publication tasks отменяются.
+
+**Safety-significant confirmed publication**:
+
+- warning перед forced Scheduled Exercise.
+
+Он остаётся синхронным: Scheduler не может persist-ить факт delivery и разрешить future forced start, пока Home Assistant не подтвердил успешную отправку.
+
+Hardware service calls Generator/TPC/G1/G2 не относятся к background diagnostics: они исполняются в соответствующем control path и подтверждаются обычной физической моделью.
+
 ---
 
 ## 13. `main.py` и один tick
@@ -537,17 +596,19 @@ Load Manager и UPS Run battery inputs намеренно не входят в �
 HA snapshot
   -> GeneratorBusTracker
   -> refresh observations GC/TPC
-  -> ExerciseScheduler.step()      # локальные schedule/lifecycle facts
-  -> UPS Run step()                # локальные battery/wait/cycle facts
-  -> EnergySupervisor.step(...)    # ЕДИНСТВЕННОЕ системное решение
+  -> EnergySupervisor.recovery_step(...) if Recovery/reset active
+       -> main mechanically executes RecoveryDirective via TPC/GC
+  -> otherwise ExerciseScheduler.step()    # локальные schedule/lifecycle facts
+  -> UPS Run step()                        # локальные battery/wait/cycle facts
+  -> EnergySupervisor.step(...)            # ЕДИНСТВЕННОЕ обычное системное решение
   -> dispatch Supervisor directives to Exercise / UPS Run
-  -> LoadManager.step(...)         # downstream G1/G2 execution constraints
+  -> LoadManager.step(...)                 # downstream G1/G2 execution constraints
   -> G1/G2 soft actions
   -> GC actions / authorized shutdown
   -> Load Manager execution gate for Grid -> Generator
   -> TPC actions
-  -> HA Adapter service calls
-  -> status / log / notifications
+  -> awaited hardware service calls
+  -> schedule routine status/log/notifications in background
   -> persistence
 ```
 
@@ -562,9 +623,9 @@ Grid return + Target SoC
 Recovery + Exercise
 ```
 
-должны быть разрешены в `EnergySupervisor` и трассированы к `REQ-BEH-*`.
+должны быть разрешены в `EnergySupervisor` и трассированы к `REQ-BEH-*` либо к узкому recovery requirement.
 
-`main.py` может только исполнять результат: вызвать handoff/defer method, начать post-cycle wait, передать desired source/desired running и записать события.
+`main.py` может только исполнять результат: вызвать handoff/defer method, начать post-cycle wait, передать desired source/desired running, механически исполнить `RecoveryDirective` и записать события.
 
 Status/log/persistence не имеют права повторно выполнять управляющие FSM либо менять принятое решение.
 
@@ -626,6 +687,8 @@ Load Manager публикует:
 
 UI/log обязаны использовать реальные generator names, а не A/B там, где речь идёт о пользователе.
 
+Diagnostic publication failure не изменяет desired source/session. Исключение касается не обычной диагностики, а подтверждаемого forced-Exercise warning, который является prerequisite будущего действия.
+
 ---
 
 ## 16. Safety-инварианты реализации
@@ -650,9 +713,11 @@ UI/log обязаны использовать реальные generator names,
 18. После изменения managed load следующее power-based решение требует нового stabilization window.
 19. Generator power limits всегда относятся к фактическому bus owner.
 20. Generator не останавливается автоматически только по overload Load Manager.
-21. `main.py` не принимает бизнес-решения о пересечении режимов.
+21. `main.py` не принимает бизнес-решения о пересечении режимов или Recovery ownership/order.
 22. Каждая нетривиальная системная decision branch Supervisor трассируется к конкретному requirement.
 23. UI/log/persistence не продвигают управляющие FSM.
+24. Routine diagnostic network I/O не удерживает control tick на HA timeout.
+25. Forced Exercise warning считается доставленным только после подтверждённого успешного HA call.
 
 ---
 
@@ -671,6 +736,8 @@ production code
         ↓
 unit / integration / end-to-end tests
         ↓
+production container smoke
+        ↓
 commissioning на реальном оборудовании
 ```
 
@@ -682,4 +749,6 @@ REQ-BEH-* -> EnergySupervisor branch -> TC-BEH-* / integration scenario
 
 Для локальных feature requirements аналогично используются соответствующие `REQ-*` и `TC-*` families.
 
-Зелёный CI проверяет программную модель, но не заменяет физические испытания контакторов, generator bus, G1/G2, meter, генераторов, DKG116 и MAP.
+Начиная с 1.0.3 CI проверяет не только pytest environment: `addon-container-smoke` собирает настоящий add-on image и внутри него проверяет production `HomeAssistantClient` через test WebSocket/REST endpoint и App command handling.
+
+Зелёный CI проверяет программную модель и packaging/runtime, но не заменяет физические испытания контакторов, generator bus, G1/G2, meter, генераторов, DKG116 и MAP.
