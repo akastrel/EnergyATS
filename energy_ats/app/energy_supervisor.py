@@ -19,6 +19,7 @@ class SupervisorPhase(str, Enum):
     STARTING_GENERATOR = "starting_generator"
     ON_GENERATOR = "on_generator"
     RETURNING_TO_GRID = "returning_to_grid"
+    RETURNING_TO_UPS = "returning_to_ups"
     EXTERNAL_RUNNING = "external_running"
     RECOVERY_REQUIRED = "recovery_required"
 
@@ -26,6 +27,7 @@ class SupervisorPhase(str, Enum):
 _TRANSIENT_PHASES = {
     SupervisorPhase.STARTING_GENERATOR,
     SupervisorPhase.RETURNING_TO_GRID,
+    SupervisorPhase.RETURNING_TO_UPS,
 }
 
 
@@ -49,6 +51,8 @@ class GeneratorSession:
     stop_requested: bool = False
     fallback_used: bool = False
     external_takeover_observed: bool = False
+    cycle_owned: bool = False
+    manual_override: bool = False
 
     @classmethod
     def begin(
@@ -67,6 +71,8 @@ class GeneratorSession:
             "stop_requested": self.stop_requested,
             "fallback_used": self.fallback_used,
             "external_takeover_observed": self.external_takeover_observed,
+            "cycle_owned": self.cycle_owned,
+            "manual_override": self.manual_override,
         }
 
     @classmethod
@@ -81,6 +87,8 @@ class GeneratorSession:
                 data.get("external_takeover_observed", False),
                 "session.external_takeover_observed",
             ),
+            _strict_bool(data.get("cycle_owned", False), "session.cycle_owned"),
+            _strict_bool(data.get("manual_override", False), "session.manual_override"),
         )
 
 
@@ -134,6 +142,7 @@ class EnergySupervisor:
 
         self._manual_start_requested = False
         self._manual_stop_requested = False
+        self._cycle_stop_requested = False
         self._recovery_reset_requested = False
         self._recovery_reset_active = False
         self._events: list[SupervisorEvent] = []
@@ -147,6 +156,21 @@ class EnergySupervisor:
     def request_manual_stop(self) -> None:
         self._manual_stop_requested = True
 
+    def request_cycle_stop(self) -> None:
+        """Завершить только принадлежащую Charge Cycling outage-session."""
+        self._cycle_stop_requested = True
+
+    def mark_session_cycle_owned(self) -> bool:
+        """Пометить новую automatic outage-session как принадлежащую cycling policy."""
+        if (
+            self.session is None
+            or self.session.reason != SessionReason.GRID_OUTAGE
+            or self.session.manual_override
+        ):
+            return False
+        self.session.cycle_owned = True
+        return True
+
     def request_recovery_reset(self) -> None:
         self._recovery_reset_requested = True
 
@@ -154,6 +178,10 @@ class EnergySupervisor:
     def has_pending_session_request(self) -> bool:
         """Maintenance не должна обгонять пользовательскую команду."""
         return self._manual_start_requested or self._manual_stop_requested
+
+    @property
+    def manual_start_pending(self) -> bool:
+        return self._manual_start_requested
 
     def consume_recovery_reset_request(self) -> bool:
         requested = self._recovery_reset_requested
@@ -190,6 +218,7 @@ class EnergySupervisor:
         self.desired_generators = _stopped_generators()
         self.grid_failed_since = None
         self.grid_ready_since = None
+        self._cycle_stop_requested = False
         self._stop_outage_generators.clear()
         self._event("info", "Восстановление завершено; управление снова разрешено.")
 
@@ -223,6 +252,8 @@ class EnergySupervisor:
         *,
         exercise_owned_slot: GeneratorSlot | None = None,
         exercise_desired_running: bool = False,
+        defer_automatic_start: bool = False,
+        outage_delay_already_satisfied: bool = False,
     ) -> SupervisorDecision:
         self._stop_outage_generators.clear()
         if not self.initialized:
@@ -253,9 +284,18 @@ class EnergySupervisor:
         if self._manual_stop_requested:
             self._manual_stop_requested = False
             self._manual_stop(o)
+        if self._cycle_stop_requested:
+            self._cycle_stop_requested = False
+            self._cycle_stop(o)
 
         if self.session is None:
-            self._without_session(now, o, exercise_owned_slot)
+            self._without_session(
+                now,
+                o,
+                exercise_owned_slot,
+                defer_automatic_start=defer_automatic_start,
+                outage_delay_already_satisfied=outage_delay_already_satisfied,
+            )
         else:
             self._with_session(now, o)
         return self._decision(o, exercise_owned_slot, exercise_desired_running)
@@ -293,6 +333,9 @@ class EnergySupervisor:
         now: float,
         o: SupervisorObservation,
         exercise_owned_slot: GeneratorSlot | None,
+        *,
+        defer_automatic_start: bool,
+        outage_delay_already_satisfied: bool,
     ) -> None:
         self.desired_generators = _stopped_generators()
 
@@ -326,15 +369,20 @@ class EnergySupervisor:
             self.phase = SupervisorPhase.EXTERNAL_RUNNING
             return
 
-        if self.grid_failed_since is None:
-            self.grid_failed_since = now
+        delay_elapsed = outage_delay_already_satisfied
+        if not delay_elapsed:
+            if self.grid_failed_since is None:
+                self.grid_failed_since = now
+                self.phase = SupervisorPhase.GRID_FAILURE_DELAY
+                return
+            delay_elapsed = now - self.grid_failed_since >= self.config.grid_failure_delay
+
+        if not delay_elapsed:
             self.phase = SupervisorPhase.GRID_FAILURE_DELAY
             return
 
-        if now - self.grid_failed_since < self.config.grid_failure_delay:
-            self.phase = SupervisorPhase.GRID_FAILURE_DELAY
-            return
-
+        # Уже запущенный Scheduler-ом generator можно явно принять в outage
+        # независимо от delayed-start policy: дополнительного пуска здесь нет.
         if exercise_owned_slot is not None:
             exercise_status = o.generators[exercise_owned_slot]
             if (
@@ -350,9 +398,11 @@ class EnergySupervisor:
                     allow_active=True,
                 )
             else:
-                # Scheduler владеет незавершённым запуском. Не создаём второй
-                # параллельный REMOTE START configured PRIMARY.
                 self.phase = SupervisorPhase.GRID_FAILURE_DELAY
+            return
+
+        if defer_automatic_start:
+            self.phase = SupervisorPhase.GRID_FAILURE_DELAY
             return
 
         self._begin_session(o, SessionReason.GRID_OUTAGE)
@@ -362,6 +412,14 @@ class EnergySupervisor:
 
         if self.phase == SupervisorPhase.RETURNING_TO_GRID:
             self._returning(o)
+            return
+
+        if self.phase == SupervisorPhase.RETURNING_TO_UPS:
+            if self._grid_stable(now):
+                self.phase = SupervisorPhase.RETURNING_TO_GRID
+                self.desired_source = PowerSource.GRID
+                return
+            self._returning_to_ups(o)
             return
 
         if (
@@ -535,6 +593,25 @@ class EnergySupervisor:
         ):
             self._finish_session()
 
+    def _returning_to_ups(self, o: SupervisorObservation) -> None:
+        """Cycle stop: сначала снять дом с generator bus, потом остановить engine."""
+        assert self.session is not None
+        slot = self.session.generator
+        self.desired_source = PowerSource.UPS_ONLY
+
+        if o.power.transition_in_progress or o.power.actual_path != PowerPath.ISOLATED:
+            self.desired_generators[slot] = True
+            return
+
+        self.desired_generators[slot] = False
+        managed = o.generators[slot]
+        if managed.running is False and managed.remote_on is False:
+            self._event(
+                "info",
+                "Цикл подзаряда завершён; дом остаётся на UPS до следующей необходимости запуска.",
+            )
+            self._finish_session(preserve_grid_failure_timer=True)
+
     def _cancel_return(self, o: SupervisorObservation) -> None:
         assert self.session is not None
         owner = self._owner(o)
@@ -566,7 +643,21 @@ class EnergySupervisor:
 
     def _manual_start(self, o: SupervisorObservation) -> None:
         if self.session is not None:
-            self._event("info", "Ручная команда запуска: сессия уже активна.")
+            if self.session.reason == SessionReason.GRID_OUTAGE:
+                self.session.manual_override = True
+                self.session.cycle_owned = False
+                self.session.stop_requested = False
+                if self.phase == SupervisorPhase.RETURNING_TO_UPS:
+                    self.phase = SupervisorPhase.ON_GENERATOR
+                    self.desired_source = PowerSource.GENERATOR
+                    self.desired_generators[self.session.generator] = True
+                self._event(
+                    "info",
+                    "Ручная команда приняла активную outage-сессию под управление пользователя; "
+                    "автоматическая остановка по Target SoC отменена.",
+                )
+            else:
+                self._event("info", "Ручная команда запуска: сессия уже активна.")
             return
         active = self._active_slots(o)
         if active:
@@ -585,10 +676,25 @@ class EnergySupervisor:
             self._event("info", "Управляемая генераторная сессия не активна.")
             return
         self.session.stop_requested = True
+        self.session.cycle_owned = False
         if o.grid_ready is False:
             self.automatic_start_suppressed_until_grid = True
         self.desired_source = PowerSource.GRID
         self.phase = SupervisorPhase.RETURNING_TO_GRID
+
+    def _cycle_stop(self, o: SupervisorObservation) -> None:
+        if (
+            self.session is None
+            or self.session.reason != SessionReason.GRID_OUTAGE
+            or not self.session.cycle_owned
+            or self.session.manual_override
+            or self.phase != SupervisorPhase.ON_GENERATOR
+        ):
+            return
+        self.session.stop_requested = True
+        self.desired_source = PowerSource.UPS_ONLY
+        self.phase = SupervisorPhase.RETURNING_TO_UPS
+        self._event("info", "Target SoC достигнут; начинаем возврат на питание только от UPS.")
 
     def _begin_session(self, o: SupervisorObservation, reason: SessionReason) -> None:
         if self._active_slots(o):
@@ -637,12 +743,16 @@ class EnergySupervisor:
             f"Начата сессия {reason.value}; используется {status.display_name}.",
         )
 
-    def _finish_session(self) -> None:
+    def _finish_session(self, *, preserve_grid_failure_timer: bool = False) -> None:
+        grid_failed_since = self.grid_failed_since
         self.session = None
         self.desired_source = None
         self.desired_generators = _stopped_generators()
         self.phase = SupervisorPhase.NORMAL
-        self.grid_failed_since = None
+        self.grid_failed_since = (
+            grid_failed_since if preserve_grid_failure_timer else None
+        )
+        self._cycle_stop_requested = False
         self._stop_outage_generators.clear()
 
     # Derived state / persistence ------------------------------------
@@ -697,6 +807,8 @@ class EnergySupervisor:
             )
         if self.phase == SupervisorPhase.RETURNING_TO_GRID:
             return "Возврат на основную сеть"
+        if self.phase == SupervisorPhase.RETURNING_TO_UPS:
+            return "Переход на питание только от UPS"
         if self.phase == SupervisorPhase.EXTERNAL_RUNNING:
             return "Обнаружен внешний запуск"
         if self.phase == SupervisorPhase.RECOVERY_REQUIRED:
@@ -824,6 +936,7 @@ class EnergySupervisor:
     def _discard_requests(self) -> None:
         self._manual_start_requested = False
         self._manual_stop_requested = False
+        self._cycle_stop_requested = False
 
     def _event(self, level: str, message: str) -> None:
         self._events.append(SupervisorEvent(level, message))
