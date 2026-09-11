@@ -20,7 +20,6 @@ from domain import (
     GeneratorSlot,
     PowerPath,
     PowerSource,
-    SessionReason,
     SupervisorEvent,
 )
 from energy_supervisor import (
@@ -32,7 +31,6 @@ from energy_supervisor import (
 )
 from exercise_scheduler import (
     ExerciseConfig,
-    ExerciseDecision,
     ExerciseGeneratorObservation,
     ExerciseObservation,
     ExerciseScheduler,
@@ -58,6 +56,7 @@ from outage_power_policy import (
     OutagePowerPolicy,
     OutagePowerState,
 )
+from policy_coordinator import PolicyCoordinator
 from power_transfer import PowerTransferController, TransferAction, TransferPhase
 from state_store import StateStore
 
@@ -157,6 +156,11 @@ class EnergySupervisorApp:
             exercise_configs,
             load_manager_config,
             outage_power_config,
+        )
+        self.policy_coordinator = PolicyCoordinator(
+            self.supervisor,
+            self.exercise_scheduler,
+            self.outage_power_policy,
         )
 
         self._pending_action_records: list[dict[str, str]] = []
@@ -283,12 +287,12 @@ class EnergySupervisorApp:
         observation = self._supervisor_observation(hardware)
         exercise_observation = self._exercise_observation(now, hardware, observation)
         exercise_decision = self.exercise_scheduler.step(exercise_observation)
-        exercise_events = list(exercise_decision.events)
+        exercise_side_events: list[SupervisorEvent] = []
 
         for warning in exercise_decision.warnings:
             if await self.adapter.publish_user_notification(warning.message):
                 sent_at = datetime.fromtimestamp(now, self.local_time_zone)
-                exercise_events.append(
+                exercise_side_events.append(
                     self.exercise_scheduler.confirm_warning(
                         warning.slot,
                         warning.window_date,
@@ -300,99 +304,19 @@ class EnergySupervisorApp:
                 # Persist it immediately instead of waiting for the end of tick.
                 self._save_state(force=True)
 
-        session_before = self.supervisor.session
-        cycle_return_before = self.supervisor.phase == SupervisorPhase.RETURNING_TO_UPS
         outage_decision = self.outage_power_policy.step(
             self._outage_power_observation(now, hardware, observation)
         )
-        outage_events = list(outage_decision.events)
-        if outage_decision.request_cycle_stop:
-            self.supervisor.request_cycle_stop()
-
-        decision = self.supervisor.step(
+        coordination = self.policy_coordinator.step(
             now,
             observation,
-            exercise_owned_slot=exercise_decision.owned_slot,
-            exercise_desired_running=exercise_decision.desired_running,
-            defer_automatic_start=outage_decision.defer_automatic_start,
-            outage_delay_already_satisfied=(
-                outage_decision.outage_delay_already_satisfied
-            ),
-            restore_grid_after_cycle=outage_decision.restore_grid_after_cycle,
+            exercise_observation,
+            exercise_decision,
+            outage_decision,
+            grid_ready=hardware.grid_ready,
+            exercise_side_events=tuple(exercise_side_events),
         )
-
-        # Cycling ownership создаётся только у новой обычной automatic outage
-        # session. Уже работающий exercise-generator, manual session и внешний
-        # generator не захватываются этой policy.
-        if (
-            session_before is None
-            and self.supervisor.session is not None
-            and self.supervisor.session.reason == SessionReason.GRID_OUTAGE
-            and outage_decision.claim_new_outage_session
-            and exercise_decision.owned_slot is None
-        ):
-            self.supervisor.mark_session_cycle_owned()
-
-        # После штатного cycle stop новый battery interval начинается без
-        # повторного grid_failure_delay. Порог Start SoC/TTG применяется заново.
-        if (
-            cycle_return_before
-            and self.supervisor.session is None
-            and hardware.grid_ready is False
-        ):
-            self.outage_power_policy.begin_post_cycle_wait(now)
-
-        # An outage session may explicitly adopt the already running exercise
-        # generator. Only after the Supervisor session exists do we release the
-        # Scheduler's stop ownership.
-        if (
-            self.exercise_scheduler.owned_slot is not None
-            and self.supervisor.session is not None
-            and self.supervisor.session.reason == SessionReason.GRID_OUTAGE
-            and self.supervisor.session.generator == self.exercise_scheduler.owned_slot
-            and hardware.grid_ready is False
-        ):
-            exercise_events.extend(
-                self.exercise_scheduler.handoff_to_outage(
-                    self.supervisor.session.generator,
-                    exercise_observation,
-                )
-            )
-            exercise_decision = ExerciseDecision(
-                owned_slot=None,
-                desired_running=False,
-                authorized_shutdown_slot=None,
-                warnings=(),
-                events=(),
-            )
-
-        # A manual session has priority. An exercise that has not physically
-        # started yet can be deferred without touching the engine.
-        if (
-            self.exercise_scheduler.owned_slot is not None
-            and self.supervisor.session is not None
-            and self.supervisor.session.reason != SessionReason.GRID_OUTAGE
-        ):
-            exercise_events.extend(
-                self.exercise_scheduler.cancel_unstarted(
-                    exercise_observation,
-                    "начата пользовательская managed-сессия",
-                )
-            )
-
-        # Если общая policy уже требует Recovery, Scheduler не имеет права
-        # потерять автоматически запущенный двигатель. Он переводит собственный
-        # attempt в FAILED/STOPPING и сохраняет обязанность безопасной остановки.
-        if (
-            self.supervisor.phase == SupervisorPhase.RECOVERY_REQUIRED
-            and self.exercise_scheduler.owned_slot is not None
-        ):
-            exercise_events.extend(
-                self.exercise_scheduler.fail_active(
-                    exercise_observation,
-                    "EnergyATS перешёл в RECOVERY_REQUIRED во время пробного запуска.",
-                )
-            )
+        decision = coordination.supervisor_decision
 
         actions_allowed = self.armed and decision.actions_allowed
         load_decision = self.load_manager.step(
@@ -422,23 +346,18 @@ class EnergySupervisorApp:
             if failures:
                 self._save_state(force=True)
 
+        authorized_shutdown_slots: set[GeneratorSlot] = set()
+        if actions_allowed:
+            authorized_shutdown_slots.update(decision.stop_outage_generators)
+        if self.armed and coordination.exercise_shutdown_slot is not None:
+            authorized_shutdown_slots.add(coordination.exercise_shutdown_slot)
+
         generator_actions: list[GeneratorAction] = []
         shutdown_errors: list[str] = []
-        exercise_shutdown_slot = self.exercise_scheduler.authorized_shutdown_slot
         for slot, controller in self.generator_controllers.items():
-            if slot in decision.stop_outage_generators and actions_allowed:
+            if slot in authorized_shutdown_slots:
                 actions, error = controller.step_authorized_shutdown(
                     now, hardware.generators[slot]
-                )
-                generator_actions.extend(actions)
-                if error is not None:
-                    shutdown_errors.append(error)
-                continue
-
-            if slot == exercise_shutdown_slot and self.armed:
-                actions, error = controller.step_authorized_shutdown(
-                    now,
-                    hardware.generators[slot],
                 )
                 generator_actions.extend(actions)
                 if error is not None:
@@ -483,14 +402,7 @@ class EnergySupervisorApp:
         await self._finish_tick(
             now,
             hardware,
-            tuple(
-                (
-                    *decision.events,
-                    *exercise_events,
-                    *outage_events,
-                    *load_events,
-                )
-            ),
+            tuple((*coordination.events, *load_events)),
         )
 
     def _apply_bus_model(self, hardware: HardwareSnapshot) -> HardwareSnapshot:
