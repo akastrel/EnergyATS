@@ -163,6 +163,24 @@ class PowerTransferController:
 
         topology = self._infer_topology(observation)
         if topology is None:
+            # F3 / REQ-FAULT-02: исчезновение напряжения generator bus не доказывает
+            # положение силовых контактов, но подтверждённый selector=ON даёт право
+            # выполнить только безопасный break — DESELECT. Это не угадывание
+            # topology и не разрешение make-команды по отсутствующему feedback.
+            if (
+                actions_allowed
+                and desired_source in {
+                    PowerSource.GRID,
+                    PowerSource.UPS_ONLY,
+                    PowerSource.NO_POWER,
+                }
+                and observation.generator_selected is True
+                and observation.grid_connected is False
+                and observation.house_on_grid is False
+            ):
+                self.feedback_lost_since = None
+                return self._begin(now, TransferActionKind.DESELECT_GENERATOR)
+
             if self.feedback_lost_since is None:
                 self.feedback_lost_since = now
             elif now - self.feedback_lost_since >= self.confirmation_timeout:
