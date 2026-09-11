@@ -5,17 +5,25 @@ from pathlib import Path
 
 import pytest
 
-from domain import GeneratorSlot, PowerPath, PowerSource, SupervisorEvent
+from domain import GeneratorSlot, PowerPath, PowerSource, SessionReason, SupervisorEvent
+from energy_supervisor import (
+    EnergySupervisor,
+    GeneratorSession,
+    RecoveryDirective,
+    SupervisorObservation,
+    SupervisorPhase,
+)
+from generator_bus import GeneratorBusOwner, GeneratorBusStatus, GeneratorRunContext
 from generator_controller import GeneratorPhase, GeneratorStatus
 from ha_adapter import HomeAssistantAdapter
 from main import DEFAULT_OPTIONS, EnergySupervisorApp
 from power_transfer import (
     PowerTransferController,
     PowerTransferObservation,
+    PowerTransferStatus,
     TransferActionKind,
     TransferPhase,
 )
-from energy_supervisor import SupervisorPhase
 
 
 class ReconnectClient:
@@ -210,3 +218,133 @@ def test_control_and_feedback_can_change_independently_during_fallback() -> None
     )
     assert secondary.remote_on is True
     assert secondary.running is False
+
+
+def _generator(
+    slot: GeneratorSlot,
+    *,
+    running: bool = False,
+    remote_on: bool = False,
+    phase: GeneratorPhase = GeneratorPhase.IDLE,
+    fault: str | None = None,
+) -> GeneratorStatus:
+    return GeneratorStatus(
+        slot=slot,
+        display_name="Elemax" if slot == GeneratorSlot.A else "Вепрь",
+        phase=phase,
+        running=running,
+        remote_on=remote_on,
+        ready_for_load=False,
+        fault=fault,
+    )
+
+
+def _recovery_observation(
+    *,
+    a: GeneratorStatus | None = None,
+    b: GeneratorStatus | None = None,
+) -> SupervisorObservation:
+    return SupervisorObservation(
+        grid_ready=True,
+        automatic_transfer_enabled=True,
+        emergency_stop=False,
+        power=PowerTransferStatus(
+            phase=TransferPhase.RECOVERY_REQUIRED,
+            actual_source=PowerSource.UNKNOWN,
+            actual_path=PowerPath.UNKNOWN,
+            target_source=PowerSource.GRID,
+            transition_in_progress=False,
+            recovery_required=True,
+            fault="test recovery",
+        ),
+        generators={
+            GeneratorSlot.A: a or _generator(GeneratorSlot.A),
+            GeneratorSlot.B: b or _generator(GeneratorSlot.B),
+        },
+        power_inputs_known=True,
+        bus=GeneratorBusStatus(
+            owner=GeneratorBusOwner.NONE,
+            run_contexts={
+                GeneratorSlot.A: GeneratorRunContext.NONE,
+                GeneratorSlot.B: GeneratorRunContext.NONE,
+            },
+        ),
+    )
+
+
+def test_supervisor_owns_recovery_order_and_stop_scope() -> None:
+    """REC-01: Recovery policy принадлежит Supervisor: сначала Grid path, затем только owned managed/Exercise generators, затем COMPLETE."""
+    supervisor = EnergySupervisor()
+    supervisor.phase = SupervisorPhase.RECOVERY_REQUIRED
+    supervisor.session = GeneratorSession.begin(
+        SessionReason.GRID_OUTAGE,
+        GeneratorSlot.A,
+        grid_was_unavailable=True,
+    )
+    supervisor.request_recovery_reset()
+
+    running_a = _generator(
+        GeneratorSlot.A,
+        running=True,
+        remote_on=True,
+        phase=GeneratorPhase.READY_FOR_LOAD,
+    )
+    observation = _recovery_observation(a=running_a)
+
+    decision = supervisor.recovery_step(
+        observation,
+        transfer_blocker=None,
+        exercise_owned_slot=None,
+        grid_path_confirmed=False,
+    )
+    assert decision.directive == RecoveryDirective.BEGIN_GRID_RECOVERY
+
+    decision = supervisor.recovery_step(
+        observation,
+        transfer_blocker=None,
+        exercise_owned_slot=None,
+        grid_path_confirmed=False,
+    )
+    assert decision.directive == RecoveryDirective.DRIVE_GRID_RECOVERY
+
+    decision = supervisor.recovery_step(
+        observation,
+        transfer_blocker=None,
+        exercise_owned_slot=None,
+        grid_path_confirmed=True,
+    )
+    assert decision.directive == RecoveryDirective.STOP_GENERATORS
+    assert decision.stop_generators == frozenset({GeneratorSlot.A})
+
+    stopped = _recovery_observation(a=_generator(GeneratorSlot.A))
+    decision = supervisor.recovery_step(
+        stopped,
+        transfer_blocker=None,
+        exercise_owned_slot=None,
+        grid_path_confirmed=True,
+    )
+    assert decision.directive == RecoveryDirective.COMPLETE
+
+
+def test_supervisor_recovery_does_not_capture_external_generator() -> None:
+    """REC-02: внешний RUNNING generator блокирует Recovery reset; Supervisor не расширяет stop ownership на него."""
+    supervisor = EnergySupervisor()
+    supervisor.phase = SupervisorPhase.RECOVERY_REQUIRED
+    supervisor.request_recovery_reset()
+
+    external_b = _generator(
+        GeneratorSlot.B,
+        running=True,
+        remote_on=False,
+        phase=GeneratorPhase.EXTERNAL_RUNNING,
+    )
+    decision = supervisor.recovery_step(
+        _recovery_observation(b=external_b),
+        transfer_blocker=None,
+        exercise_owned_slot=None,
+        grid_path_confirmed=False,
+    )
+
+    assert decision.directive == RecoveryDirective.FINISH_TICK
+    assert supervisor.recovery_reset_in_progress is False
+    assert any("внешний запуск" in event.message for event in supervisor.take_events())
