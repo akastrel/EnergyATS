@@ -5,13 +5,15 @@ from pathlib import Path
 
 import pytest
 
-from domain import GeneratorSlot, PowerPath, PowerSource
+from domain import GeneratorSlot, PowerPath, PowerSource, SupervisorEvent
 from generator_controller import GeneratorPhase, GeneratorStatus
+from ha_adapter import HomeAssistantAdapter
 from main import DEFAULT_OPTIONS, EnergySupervisorApp
 from power_transfer import (
     PowerTransferController,
     PowerTransferObservation,
     TransferActionKind,
+    TransferPhase,
 )
 from energy_supervisor import SupervisorPhase
 
@@ -34,6 +36,22 @@ class ReconnectClient:
 
     async def get_time_zone(self) -> str:
         return "UTC"
+
+
+class SlowPublicationClient:
+    """HA fake, который намеренно зависает на сетевой публикации."""
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def call_service(self, domain, service, *, service_data=None) -> None:
+        self.started.set()
+        await self.release.wait()
+
+    async def set_state(self, entity_id, state, *, attributes=None) -> None:
+        self.started.set()
+        await self.release.wait()
 
 
 def make_app(tmp_path: Path) -> EnergySupervisorApp:
@@ -95,6 +113,37 @@ async def test_run_reconnect_preserves_obligation_and_latches_transient_loss(
     assert app.supervisor.grid_restore_pending is True
 
 
+@pytest.mark.asyncio
+async def test_routine_publication_does_not_wait_for_slow_home_assistant() -> None:
+    """RUN-03: обычный Logbook/status I/O не удерживает control tick, даже если HA service завис; background task можно безопасно отменить при disconnect."""
+    client = SlowPublicationClient()
+    adapter = HomeAssistantAdapter(client, armed=True)
+
+    await asyncio.wait_for(
+        adapter.publish_events((SupervisorEvent("info", "routine event"),)),
+        timeout=0.1,
+    )
+    await asyncio.wait_for(client.started.wait(), timeout=0.1)
+
+    assert adapter._publication_tasks
+    await adapter.cancel_background_publications()
+    assert not adapter._publication_tasks
+
+
+@pytest.mark.asyncio
+async def test_forced_warning_delivery_remains_synchronous() -> None:
+    """RUN-04: подтверждаемое Exercise warning остаётся синхронным safety prerequisite и не считается доставленным до ответа HA."""
+    client = SlowPublicationClient()
+    adapter = HomeAssistantAdapter(client, armed=True)
+
+    delivery = asyncio.create_task(adapter.publish_user_notification("forced warning"))
+    await asyncio.wait_for(client.started.wait(), timeout=0.1)
+    assert delivery.done() is False
+
+    client.release.set()
+    assert await asyncio.wait_for(delivery, timeout=0.1) is True
+
+
 def _transfer_observation(
     *,
     house_on_generator: bool,
@@ -132,6 +181,22 @@ def test_control_and_feedback_can_change_independently_during_fallback() -> None
         desired_generator_ready=False,
     )
     assert [action.kind for action in actions] == [TransferActionKind.DESELECT_GENERATOR]
+    assert transfer.status().phase == TransferPhase.DISCONNECTING_GENERATOR
+    # До подтверждения размыкания actual_path остаётся последним достоверным,
+    # а не угадывается по исчезнувшему voltage feedback.
+    assert transfer.status().actual_path == PowerPath.GENERATOR
+
+    isolated = _transfer_observation(
+        house_on_generator=False,
+        generator_selected=False,
+    )
+    transfer.step(
+        2.0,
+        isolated,
+        PowerSource.UPS_ONLY,
+        desired_generator_ready=False,
+    )
+    assert transfer.status().actual_path == PowerPath.ISOLATED
 
     # RUNNING/REMOTE резервного двигателя не обязаны совпадать с selector/house feedback.
     secondary = GeneratorStatus(
@@ -145,4 +210,3 @@ def test_control_and_feedback_can_change_independently_during_fallback() -> None
     )
     assert secondary.remote_on is True
     assert secondary.running is False
-    assert transfer.status().actual_path != PowerPath.GENERATOR
