@@ -69,15 +69,17 @@ def test_restored_managed_outage_run_has_known_context():
     assert status.run_contexts[GeneratorSlot.A] == GeneratorRunContext.OUTAGE_RELATED
 
 
-def test_state_round_trip_preserves_fifo_owner_and_contexts():
+def test_state_round_trip_does_not_trust_fifo_order_across_restart():
+    """Persisted owner/context не доказывают, что RUNNING не прерывался во время restart."""
     tracker = GeneratorBusTracker()
     tracker.update(running(False, False), grid_ready=False, test_mode=False)
     tracker.update(running(True, False), grid_ready=False, test_mode=False)
     tracker.update(running(True, True), grid_ready=False, test_mode=False)
+    assert tracker.status().owner == GeneratorBusOwner.A
 
     restored = GeneratorBusTracker.from_dict(tracker.to_dict())
     status = restored.update(running(True, True), grid_ready=False, test_mode=False)
 
-    assert status.owner == GeneratorBusOwner.A
-    assert status.run_contexts[GeneratorSlot.A] == GeneratorRunContext.OUTAGE_RELATED
-    assert status.run_contexts[GeneratorSlot.B] == GeneratorRunContext.OUTAGE_RELATED
+    assert status.owner == GeneratorBusOwner.UNKNOWN
+    assert status.run_contexts[GeneratorSlot.A] == GeneratorRunContext.UNKNOWN
+    assert status.run_contexts[GeneratorSlot.B] == GeneratorRunContext.UNKNOWN
