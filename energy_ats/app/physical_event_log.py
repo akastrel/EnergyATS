@@ -250,7 +250,10 @@ class PhysicalEventTracker:
     @staticmethod
     def _power_source_event(source: PowerSource, path: PowerPath) -> SupervisorEvent:
         if source == PowerSource.GRID:
-            return user_event("power_source_grid", visibility=EventVisibility.DETAIL)
+            # Это не промежуточное подтверждение контактора, а итог возврата:
+            # дом уже фактически питается от основной сети. Событие должно быть
+            # видно в кратком пользовательском журнале, а не только в App log.
+            return user_event("power_source_grid", visibility=EventVisibility.MAIN)
         if source == PowerSource.GENERATOR:
             return user_event(
                 "power_source_generator",
