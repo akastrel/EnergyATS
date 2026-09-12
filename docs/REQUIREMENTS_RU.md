@@ -295,11 +295,15 @@ Automatic outage начинается только по `binary_sensor.grid_inpu
 
 При исчезновении входного AC МАП автоматически переводит UPS-линию на АКБ. EnergyATS не формирует `connect_battery` и не моделирует отдельный Battery contactor.
 
+#### REQ-GRID-05. Observation gap разрывает непрерывность Grid
+
+Любой таймер, смысл которого требует **непрерывно наблюдаемого** состояния Grid (`grid_failure_delay`, `grid_restore_stable_time` и аналогичные safety delays), считается доказанным только при непрерывной последовательности валидных observations. Потеря связи с Home Assistant, `unknown/unavailable` обязательного Grid input либо другой observation gap сбрасывает уже накопленную непрерывность; после восстановления валидных данных отсчёт начинается заново. Истёкшее wall-clock время внутри gap само по себе не доказывает стабильность Grid.
+
 ### 5.2. Автоматический outage start
 
 #### REQ-AUTO-01. Grid failure delay
 
-При `grid_input_ready = OFF` и разрешённом АВР EnergyATS выдерживает конфигурируемый `grid_failure_delay` (текущий default 60 s).
+При `grid_input_ready = OFF` и разрешённом АВР EnergyATS выдерживает конфигурируемый `grid_failure_delay` (текущий default 60 s). Непрерывность этого интервала определяется REQ-GRID-05.
 
 #### REQ-AUTO-02. Состояние во время задержки
 
@@ -343,7 +347,7 @@ Manual session переводит дом на generator только после 
 
 #### REQ-RETURN-01. Stable time
 
-После `grid_input_ready = ON` outage-session ждёт непрерывную `grid_restore_stable_time` (default 60 s).
+После `grid_input_ready = ON` outage-session ждёт непрерывную `grid_restore_stable_time` (default 60 s). Непрерывность этого интервала определяется REQ-GRID-05; reconnect Home Assistant не позволяет засчитать время, в течение которого состояние Grid не наблюдалось.
 
 #### REQ-RETURN-02. До окончания stable time сохраняется доступный источник
 
@@ -390,6 +394,7 @@ REMOTE OFF управляемого generator разрешается тольк�
 - `TC-CORE-07` (legacy #7) — после устойчивого Grid restore дом сначала возвращается на Grid, затем generator штатно останавливается.
 - `TC-CORE-21` (legacy #21) — повторная потеря Grid во время возврата не приводит к слепому развороту незавершённой силовой операции.
 - `TC-CORE-24` — после подтверждённого возврата manual session на Grid stop fault managed generator переводит систему в Recovery без fallback на второй generator.
+- `TC-CORE-27` — observation gap/reconnect разрывает накопленную непрерывность Grid; `grid_failure_delay`/`grid_restore_stable_time` после восстановления валидных observations доказываются заново.
 
 ---
 
@@ -419,7 +424,7 @@ REMOTE OFF управляемого generator разрешается тольк�
 
 #### REQ-BUS-06. Логический owner
 
-EnergyATS различает `A | B | NONE | UNKNOWN`; достоверно известный owner должен переживать обычный restart.
+EnergyATS различает `A | B | NONE | UNKNOWN`. Persisted owner/context может сохраняться для диагностики journal, но **restart или observation gap не являются доказательством непрерывности FIFO-истории**. Runtime owner после такого разрыва восстанавливается только из новых однозначных observations.
 
 #### REQ-BUS-07. Не угадывать owner после потери истории
 
@@ -471,9 +476,9 @@ External SECONDARY, аппаратно получивший bus после ос�
 
 ### 6.4. Run context
 
-#### REQ-OUTRUN-01. Классификация run переживает restart
+#### REQ-OUTRUN-01. Классификация run после restart консервативна
 
-Для каждого продолжающегося run должно быть возможно различить как минимум `OUTAGE_RELATED`, `TEST_RUN`, `OTHER`, `UNKNOWN`.
+Для каждого продолжающегося run должно быть возможно различить как минимум `OUTAGE_RELATED`, `TEST_RUN`, `OTHER`, `UNKNOWN`. Restart/observation gap, после которого происхождение непрерывного RUNNING нельзя доказать новыми observations, переводит его context в `UNKNOWN`; persisted context сам по себе не восстанавливает право управления или cleanup.
 
 #### REQ-OUTRUN-02. Stable Grid завершает outage-related runs
 
@@ -499,7 +504,7 @@ HA helper `input_boolean.generator_test_mode` маркирует новый вн
 - `TC-CORE-11` (legacy #11) — PRIMARY не стартует, SECONDARY свободен: выполняется один managed fallback.
 - `TC-CORE-12` (legacy #12) — PRIMARY отказывает во время session, SECONDARY свободен: выполняется один fallback.
 - `TC-CORE-13` (legacy #13) — SECONDARY после fallback также отказывает: Recovery без A->B->A ping-pong.
-- `TC-CORE-14` (legacy #14) — restart при двух RUNNING и сохранённом owner восстанавливает тот же owner.
+- `TC-CORE-14` (legacy #14) — restart при двух уже RUNNING генераторах, даже если прежний owner сохранён в journal, разрывает доказанную FIFO-историю и даёт `UNKNOWN` до новой однозначной наблюдаемой истории.
 - `TC-CORE-15` (legacy #15) — restart при двух RUNNING без достоверного owner даёт `UNKNOWN`, а не угадывание.
 - `TC-CORE-16` (legacy #16) — внешний outage-related generator после stable Grid корректно завершается разрешённым cleanup.
 - `TC-CORE-17` (legacy #17) — два outage-related generator после stable Grid оба корректно завершаются, если подпадают под cleanup.
@@ -918,7 +923,7 @@ Shed groups остаются OFF; вслепую добавлять их на ge
 
 #### REQ-LOAD-19. Meter recovered
 
-После recovery meter сначала проходит новый stabilization window; первый sample не используется как shortcut и не продолжает старый overload/admission timer.
+Recovery начинается только после появления **новой revision/sample**, отличимой от последнего принятого измерения; неизменившийся frozen sample не считается восстановлением потока. После этого meter проходит новый stabilization window; первый новый sample не используется как shortcut и не продолжает старый overload/admission timer. Пользовательское событие «Load Manager восстановлен» допустимо только после успешного завершения нового stabilization window.
 
 ### 9.5. Admission
 
@@ -1055,7 +1060,7 @@ load_restore_retry_interval = 300 s
 - `TC-LOAD-22` (legacy #75) — unavailable load switch/meter не переводит core ATS в Recovery и не блокирует Grid return.
 - `TC-LOAD-23` (legacy #76) — disabled Load Manager не выдаёт G1/G2 commands и не меняет обычный ATS flow.
 - `TC-LOAD-24` (legacy #77) — invalid/missing owner power metadata даёт Load Manager DEGRADED без остановки core ATS.
-- `TC-LOAD-25` — stale gap потока power samples уже в `STABLE` переводит Load Manager в `DEGRADED`, сбрасывает overload continuity, а первый новый sample после восстановления не вызывает immediate shedding/admission без нового stabilization.
+- `TC-LOAD-25` — stale/frozen поток power samples в `STABLE` переводит Load Manager в `DEGRADED`, сбрасывает overload continuity; неизменившийся sample id не считается recovery, а после появления новой revision требуется полный новый stabilization без immediate shedding/admission.
 
 ---
 
@@ -1125,6 +1130,14 @@ Emergency Stop имеет приоритет над обычными сцена�
 
 Recovery не расширяет право на external generator, кроме уже явно разрешённых cleanup rules. Recovery Load Manager не существует: его DEGRADED локален.
 
+#### REQ-RECOVERY-01. Recovery использует те же безопасные break-before-make правила
+
+Recovery не получает отдельного права на небезопасную силовую команду. Если generator selector/control достоверно остаётся ON, а generator voltage/house feedback уже исчезли, Recovery может выполнить безопасный `DESELECT_GENERATOR` по REQ-FAULT-02 и только после подтверждения переходить к следующему шагу. Отсутствие напряжения само по себе не считается доказательством размыкания.
+
+#### REQ-RECOVERY-02. Принятый Recovery Reset обязан завершиться или явно истечь по timeout
+
+После принятия reset ни одна физическая операция Recovery не может ждать подтверждение бесконечно. Каждая TPC/GC operation имеет конечный deadline; отсутствие требуемого feedback оставляет систему в `RECOVERY_REQUIRED` с явной причиной/ошибкой и не разрешает слепо выполнять следующий make/stop шаг.
+
 ### 10.4. Тест-кейсы restart/recovery
 
 - `TC-CORE-19` (legacy #19) — contradictory house feedback распознаётся как unsafe inconsistency.
@@ -1133,12 +1146,21 @@ Recovery не расширяет право на external generator, кроме 
 - `TC-CORE-23` (legacy #23) — restart после незавершённой physical transaction не продолжает её вслепую.
 - `TC-CORE-24` — stop fault managed generator после уже подтверждённого manual return на Grid даёт Recovery без запуска fallback generator.
 - `TC-CORE-25` — потеря generator voltage при `generator_selected=ON` разрешает безопасный DESELECT и не должна обрывать допустимый SECONDARY start более коротким stale-topology timeout.
+- `TC-CORE-26` — Recovery Reset при `generator_selected=ON` и потерянном generator feedback сначала выполняет безопасный break/DESELECT; неподтверждённая операция завершается timeout/Recovery, а не бесконечным ожиданием или make-командой.
 
 Feature-specific restart cases дополнительно описаны `TC-EX-19..21`, `TC-LOAD-17`, `TC-UPS-15..17`.
 
 ---
 
 ## 11. Наблюдаемость, журнал и уведомления
+
+### REQ-OBS-01. Recovery нельзя маскировать функциональным статусом
+
+Если верхнеуровневый Supervisor находится в `RECOVERY_REQUIRED`, основной пользовательский status и `sensor.energy_ats_status` должны сообщать именно о необходимости Recovery независимо от локального состояния UPS Run, Exercise или Load Manager. Технические атрибуты этих подсистем могут сохраняться, но штатная надпись вроде «Питание от UPS» не должна скрывать Recovery.
+
+### REQ-OBS-02. Текущий status публикуется последовательно и по latest-wins
+
+`sensor.energy_ats_status` представляет одно текущее состояние, поэтому его REST publications не должны выполняться параллельно так, чтобы старый медленный write завершился после нового и затёр более свежий status. Временная ошибка доставки не отменяет последнее desired состояние: retry/coalescing должны в итоге публиковать актуальный payload, а устаревшие промежуточные значения могут быть пропущены.
 
 Пользователь должен иметь возможность ответить минимум на четыре вопроса:
 
@@ -1200,6 +1222,11 @@ next restore retry
 Journal должен позволять установить причину каждого существенного решения, передачу ответственности между сценариями и физический результат start/transfer/stop.
 
 Failure/critical notifications должны быть человеко-читаемыми и использовать generator display name.
+
+### 11.1. Тест-кейсы наблюдаемости
+
+- `TC-OBS-01` — `RECOVERY_REQUIRED` имеет приоритет над UPS Run/другими штатными labels в основном тексте status.
+- `TC-OBS-02` — медленный/ошибочный старый status write не может затереть более новый desired status; publisher последовательно доставляет latest state и повторяет временную ошибку.
 
 ---
 
@@ -1310,12 +1337,13 @@ PHYSICAL_POWER_TOPOLOGY_RU.md
 | Область требований | Test cases | Основная автоматическая проверка | Физическая проверка |
 |---|---|---|---|
 | `REQ-BEH-01..18` — пересечения режимов | `TC-BEH-01..10` | Supervisor/integration scenarios | для transfer/start/stop конфликтов — да |
-| `REQ-GRID-*`, `REQ-AUTO-*`, `REQ-MANUAL-*`, `REQ-RETURN-*`, `REQ-STOP-*` | `TC-CORE-01..07`, `TC-CORE-21/24` | core ATS integration | да |
+| `REQ-GRID-*`, `REQ-AUTO-*`, `REQ-MANUAL-*`, `REQ-RETURN-*`, `REQ-STOP-*` | `TC-CORE-01..07`, `TC-CORE-21/24/27` | core ATS integration | да |
 | `REQ-BUS-*`, `REQ-EXT-*`, `REQ-FALLBACK-*`, `REQ-OUTRUN-*` | `TC-CORE-08..18`, `TC-CORE-25` | bus/supervisor/TPC integration | да для owner/takeover/fallback |
 | `REQ-DELAY-*`, `REQ-CYCLE-*` | `TC-UPS-01..17`, `TC-BEH-01/07/08/09` | UPS Run + app integration | да для реального Generator->UPS/Grid cycle |
 | `REQ-EXERCISE-*` | `TC-EX-01..31`, `TC-BEH-02..06` | scheduler + app integration | минимальный physical Exercise set обязателен |
 | `REQ-LOAD-*` | `TC-LOAD-01..25`, `TC-BEH-10` | LoadManager + app integration | да для pre-shed/admission/overload |
-| `REQ-START-*`, `REQ-FAULT-*` | `TC-CORE-14/15/19/20/22..25` + feature restart cases | persistence/recovery integration | часть recovery cases физически |
+| `REQ-START-*`, `REQ-FAULT-*`, `REQ-RECOVERY-*` | `TC-CORE-14/15/19/20/22..26` + feature restart cases | persistence/recovery integration | часть recovery cases физически |
+| `REQ-OBS-*` | `TC-OBS-01..02` | status/runtime publication tests | не применяется |
 | `REQ-TRACE-*` | review/CI convention | наличие descriptions/coverage | не применяется |
 
 ### 14.1. Правило полноты
