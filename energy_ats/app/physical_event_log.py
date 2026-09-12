@@ -24,6 +24,7 @@ class _GeneratorPhysicalState:
 @dataclass(frozen=True)
 class _PhysicalState:
     grid_ready: bool | None
+    automatic_transfer_enabled: bool
     power_path: PowerPath
     power_source: PowerSource
     emergency_stop: bool | None
@@ -45,6 +46,7 @@ class PhysicalEventTracker:
         self,
         *,
         grid_ready: bool | None,
+        automatic_transfer_enabled: bool,
         power_path: PowerPath,
         power_source: PowerSource,
         emergency_stop: bool | None,
@@ -55,6 +57,7 @@ class PhysicalEventTracker:
     ) -> tuple[SupervisorEvent, ...]:
         current = _PhysicalState(
             grid_ready=grid_ready,
+            automatic_transfer_enabled=automatic_transfer_enabled,
             power_path=power_path,
             power_source=power_source,
             emergency_stop=emergency_stop,
@@ -79,6 +82,15 @@ class PhysicalEventTracker:
             unknown_message="Состояние входной сети стало неизвестно.",
             false_level="warning",
         )
+
+        if previous.automatic_transfer_enabled != current.automatic_transfer_enabled:
+            events.append(
+                SupervisorEvent(
+                    "info",
+                    "Автоматический переход на резерв "
+                    + ("разрешён." if current.automatic_transfer_enabled else "отключён."),
+                )
+            )
 
         if previous.power_path != current.power_path:
             events.append(
