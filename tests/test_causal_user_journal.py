@@ -69,6 +69,11 @@ def test_ups_wait_explains_why_generator_is_not_started():
 
     assert decision.defer_automatic_start
     assert _messages(decision.events) == [user_message("ups_wait_started")]
+    assert decision.events[0].message == (
+        "Входная сеть отсутствует, но заряда батарей UPS пока достаточно. АВР "
+        "откладывает запуск генератора, пока не вернётся входная сеть или заряд "
+        "батарей не снизится до настроенного порога."
+    )
 
 
 def test_ups_soc_threshold_explains_why_generator_is_required():

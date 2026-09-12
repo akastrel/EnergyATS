@@ -267,8 +267,8 @@ class UPSRun:
 
         if o.battery.soc <= self.config.start_soc:
             reason = (
-                f"SoC {o.battery.soc:.1f}% достиг порога запуска "
-                f"{self.config.start_soc:.1f}%."
+                f"SoC {o.battery.soc:.0f}% достиг порога запуска "
+                f"{self.config.start_soc:.0f}%."
             )
             event_key = "start_soc"
             event_message = user_message(
@@ -391,8 +391,8 @@ class UPSRun:
 
         if soc >= self.config.target_soc:
             reason = (
-                f"Батарея заряжена до {soc:.1f}% "
-                f"(целевой уровень {self.config.target_soc:.1f}%)."
+                f"Батарея заряжена до {soc:.0f}% "
+                f"(целевой уровень {self.config.target_soc:.0f}%)."
             )
             self.state = UPSRunState.TARGET_REACHED
             self.last_reason = reason
@@ -415,8 +415,8 @@ class UPSRun:
 
         self.state = UPSRunState.CHARGING
         self.last_reason = (
-            f"Заряд батареи {soc:.1f}%; ожидаем целевой уровень "
-            f"{self.config.target_soc:.1f}%."
+            f"Заряд батареи {soc:.0f}%; ожидаем целевой уровень "
+            f"{self.config.target_soc:.0f}%."
         )
         return UPSRunDecision(reason=self.last_reason, events=tuple(events))
 

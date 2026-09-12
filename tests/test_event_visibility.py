@@ -32,7 +32,7 @@ from load_manager import (
 )
 from physical_event_log import PhysicalEventTracker
 from ups_run import BatteryObservation, UPSRun, UPSRunConfig, UPSRunObservation
-from user_messages import user_event
+from user_messages import user_event, user_message
 
 
 class FakeClient:
@@ -171,6 +171,31 @@ def test_physical_confirmations_are_detail_while_major_facts_are_main():
         if "Подтверждено" in message or "REMOTE" in message or "шины" in message
     )
     assert any(event.visibility == EventVisibility.MAIN for event in events)
+
+
+def test_confirmed_house_supply_from_grid_is_main():
+    tracker = PhysicalEventTracker()
+    _observe(
+        tracker,
+        grid_ready=False,
+        path=PowerPath.GENERATOR,
+        source=PowerSource.GENERATOR,
+    )
+
+    events = _observe(
+        tracker,
+        grid_ready=True,
+        path=PowerPath.GRID,
+        source=PowerSource.GRID,
+    )
+
+    target = [
+        event
+        for event in events
+        if event.message == user_message("power_source_grid")
+    ]
+    assert len(target) == 1
+    assert target[0].visibility == EventVisibility.MAIN
 
 
 def test_exercise_scheduler_progress_notifications_are_detail():

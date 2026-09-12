@@ -42,7 +42,7 @@ def setup(tmp_path, **options):
             "grid_restore_stable_time": 3,
             "delayed_generator_start_enabled": True,
             "generator_charge_cycle_enabled": True,
-            "generator_max_start_delay": 100,
+            "generator_max_start_delay_hours": 100 / 3600,
             **options,
         },
     )
@@ -103,6 +103,7 @@ async def test_78_wait_on_ups_has_no_hardware_commands(tmp_path):
     app, fake = setup(tmp_path)
     await wait_on_ups(app, fake)
     assert not switch_calls(fake)
+    assert fake.state_writes[-1][1] == "Питание от UPS"
     attrs = fake.state_writes[-1][2]
     assert attrs["source"] == "ups_only"
     assert attrs["delayed_start_elapsed_seconds"] == 0
@@ -128,6 +129,35 @@ async def test_79_81_each_start_threshold_runs_normal_transfer(tmp_path, trigger
     assert fake.states[ENTITIES["house_generator"]] == "on"
     assert app.supervisor.session.cycle_owned
     assert app.supervisor.session.reason == SessionReason.GRID_OUTAGE
+
+
+@pytest.mark.asyncio
+async def test_soc_delayed_start_primary_failure_falls_back_to_secondary(tmp_path):
+    """После запуска по порогу SoC отказ PRIMARY не обрывает UPS Run: единственный исправный SECONDARY принимает дом и продолжает ту же автоматическую charge-cycle session."""
+    app, fake = setup(tmp_path)
+    await wait_on_ups(app, fake)
+    battery(fake, soc=40)
+
+    now = 3.0
+    for _ in range(30):
+        await app._tick(now)
+        if fake.states[ENTITIES["generator_b_remote"]] == "on":
+            fake.states[ENTITIES["generator_b_running"]] = "on"
+        if (
+            app.supervisor.phase == SupervisorPhase.ON_GENERATOR
+            and app.supervisor.session is not None
+            and app.supervisor.session.generator == GeneratorSlot.B
+        ):
+            break
+        now += 1.0
+    else:
+        raise AssertionError("SECONDARY не принял дом после отказа PRIMARY")
+
+    assert app.supervisor.session.fallback_used
+    assert app.supervisor.session.cycle_owned
+    assert fake.states[ENTITIES["generator_a_remote"]] == "off"
+    assert fake.states[ENTITIES["generator_b_remote"]] == "on"
+    assert fake.states[ENTITIES["house_generator"]] == "on"
 
 
 @pytest.mark.parametrize(

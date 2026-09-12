@@ -127,7 +127,7 @@ Generator требуется, если выполняется хотя бы од
 ```text
 SoC <= generator_start_soc
 OR TTG <= generator_min_ttg_before_start
-OR UPS wait >= generator_max_start_delay
+OR UPS wait >= generator_max_start_delay_hours
 ```
 
 Defaults:
@@ -135,7 +135,7 @@ Defaults:
 ```text
 generator_start_soc = 40 %
 generator_min_ttg_before_start = 60 min
-generator_max_start_delay = 21600 s  # 6 h
+generator_max_start_delay_hours = 6 h
 ```
 
 ### Charge Cycling

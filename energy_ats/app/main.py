@@ -61,7 +61,7 @@ from ups_run import (
 from power_transfer import PowerTransferController, TransferAction, TransferPhase
 from state_store import StateStore
 
-APP_VERSION = "1.0.6"
+APP_VERSION = "1.0.7"
 STATE_SCHEMA_VERSION = 3
 
 DEFAULT_OPTIONS: dict[str, Any] = {
@@ -84,7 +84,7 @@ DEFAULT_OPTIONS: dict[str, Any] = {
     "generator_start_soc": 40,
     "generator_target_charge_soc": 80,
     "generator_min_ttg_before_start": 60,
-    "generator_max_start_delay": 21600,
+    "generator_max_start_delay_hours": 6,
     "family_presence_entity": "group.family",
     "generator_a_exercise_enabled": False,
     "generator_a_exercise_interval_days": 30,
@@ -119,7 +119,7 @@ class EnergySupervisorApp:
     """Связывает доменные компоненты с Home Assistant; собственной policy не содержит."""
 
     def __init__(self, options: dict[str, Any], token: str) -> None:
-        self.options = {**DEFAULT_OPTIONS, **options}
+        self.options = _merge_options(options)
         self.armed = _boolean_option(self.options, "armed")
         self.tick_seconds = max(0.2, float(self.options["tick_seconds"]))
         self.local_time_zone = timezone.utc
@@ -164,6 +164,13 @@ class EnergySupervisorApp:
         self._last_runtime_signature: tuple[str, ...] | None = None
         self._last_generator_config_signature: tuple[Any, ...] | None = None
         self._last_status_payload: dict[str, Any] | None = None
+        # Один интервал недоступности HA должен давать одно safety-событие,
+        # независимо от числа последующих reconnect attempts.
+        self._ha_outage_started_at: float | None = None
+        self._ha_reconnect_failures = 0
+        self._ha_outage_saw_http_502 = False
+        self._ha_outage_preexisting_recovery = False
+        self._ha_deferred_events: list[SupervisorEvent] = []
         self.stop_event = asyncio.Event()
         self.commands_ready = False
 
@@ -236,6 +243,7 @@ class EnergySupervisorApp:
                 if self.stop_event.is_set():
                     break
                 self._sync_generator_configuration(self.adapter.snapshot())
+                await self._record_connection_restored()
                 self.commands_ready = True
                 while not self.stop_event.is_set():
                     if not self.client.connected.is_set():
@@ -246,11 +254,9 @@ class EnergySupervisorApp:
                 raise
             except Exception as exc:
                 if not self.stop_event.is_set():
-                    self._record_interrupted_connection(exc)
-                    self.log.error(
-                        "Рабочий цикл прерван: %s. Переподключение через %.0f с.",
+                    self._record_interrupted_connection(
                         exc,
-                        reconnect_delay,
+                        connection_was_ready=self.commands_ready,
                     )
             finally:
                 self.commands_ready = False
@@ -532,7 +538,7 @@ class EnergySupervisorApp:
         if not config.generator_enabled(hardware.primary_generator):
             raise ValueError(
                 f"Основной генератор {self._profile(hardware.primary_generator).display_name} "
-                "запрещён политикой EnergyATS."
+                "запрещён политикой АВР."
             )
         self.supervisor.config = config
         self._last_generator_config_signature = signature
@@ -851,7 +857,7 @@ class EnergySupervisorApp:
                 return None, None
             if saved.get("schema_version") != STATE_SCHEMA_VERSION:
                 raise ValueError(
-                    "Неподдерживаемый формат persistent state EnergyATS; "
+                    "Неподдерживаемый формат сохранённого состояния АВР; "
                     "миграция не выполняется."
                 )
             return saved, None
@@ -989,17 +995,118 @@ class EnergySupervisorApp:
         self.state_store.save(payload)
         self._saved_state_signature = signature
 
-    def _record_interrupted_connection(self, exc: Exception) -> None:
-        self.supervisor.mark_connection_lost()
-        self.power_transfer.mark_interrupted(
-            time.time(), "Потеряна связь с Home Assistant."
-        )
-        self._save_state(force=True)
-        if self.supervisor.phase == SupervisorPhase.RECOVERY_REQUIRED:
-            self.log.critical(
-                "Связь потеряна во время физической операции; управление заблокировано: %s",
+    def _record_interrupted_connection(
+        self,
+        exc: Exception,
+        *,
+        connection_was_ready: bool,
+        now: float | None = None,
+    ) -> None:
+        """Зафиксировать границу одного интервала недоступности Home Assistant."""
+        timestamp = time.time() if now is None else now
+
+        if self._ha_outage_started_at is not None:
+            self._ha_reconnect_failures += 1
+            self._ha_outage_saw_http_502 |= "502" in str(exc)
+            self.log.debug(
+                "Попытка переподключения к Home Assistant не удалась (%d): %s",
+                self._ha_reconnect_failures,
                 exc,
             )
+            return
+
+        # Ошибка до готовности первого рабочего соединения — это не «потеря»
+        # ранее установленной связи и не повод менять доменное состояние АВР.
+        if not connection_was_ready:
+            self.log.error(
+                "Не удалось установить рабочее соединение с Home Assistant: %s",
+                exc,
+            )
+            return
+
+        phase_before = self.supervisor.phase
+        transfer_was_in_progress = self.power_transfer.transition_in_progress
+        interrupted_physical_operation = (
+            phase_before
+            in {
+                SupervisorPhase.STARTING_GENERATOR,
+                SupervisorPhase.RETURNING_TO_GRID,
+                SupervisorPhase.RETURNING_TO_UPS,
+            }
+            or transfer_was_in_progress
+        )
+
+        self._ha_outage_started_at = timestamp
+        self._ha_reconnect_failures = 0
+        self._ha_outage_saw_http_502 = "502" in str(exc)
+        self._ha_outage_preexisting_recovery = (
+            phase_before == SupervisorPhase.RECOVERY_REQUIRED
+        )
+
+        # Если исключение возникло после формирования событий текущего tick,
+        # не теряем их. Connection-loss event самого Supervisor публиковать после
+        # reconnect поздно: непосредственное сообщение пишется ниже в App log.
+        self._ha_deferred_events = list(self.supervisor.take_events())
+        self.supervisor.mark_connection_lost()
+        self.power_transfer.mark_interrupted(
+            timestamp, "Потеряна связь с Home Assistant."
+        )
+        generated = list(self.supervisor.take_events())
+        if generated:
+            generated = generated[1:]
+        self._ha_deferred_events.extend(generated)
+        self._save_state(force=True)
+
+        if interrupted_physical_operation:
+            self.log.critical(
+                "Связь с Home Assistant потеряна во время незавершённой физической "
+                "операции; управление АВР заблокировано до восстановления связи: %s",
+                exc,
+            )
+        else:
+            self.log.warning(
+                "Home Assistant недоступен: %s. Управляющие команды АВР временно "
+                "заблокированы.",
+                exc,
+            )
+
+    async def _record_connection_restored(self, *, now: float | None = None) -> None:
+        """Завершить интервал недоступности одним сводным пользовательским событием."""
+        if self._ha_outage_started_at is None:
+            return
+
+        timestamp = time.time() if now is None else now
+        duration = max(0, int(round(timestamp - self._ha_outage_started_at)))
+        reconnect_attempts = self._ha_reconnect_failures + 1
+        state_count = len(getattr(self.client, "states", {}))
+
+        parts = [
+            f"Связь с Home Assistant восстановлена после {duration} с.",
+            (
+                f"Попыток переподключения: {reconnect_attempts}; "
+                f"загружено состояний HA: {state_count}."
+            ),
+            "Физические состояния оборудования перечитаны.",
+        ]
+        if self._ha_outage_saw_http_502:
+            parts.append(
+                "Во время недоступности Home Assistant Core возвращал HTTP 502."
+            )
+        if self._ha_outage_preexisting_recovery:
+            parts.append(
+                "Состояние «Требуется восстановление» существовало до потери связи "
+                "и не было вызвано этим отключением."
+            )
+
+        events = tuple(
+            (*self._ha_deferred_events, SupervisorEvent("info", " ".join(parts)))
+        )
+        self._ha_outage_started_at = None
+        self._ha_reconnect_failures = 0
+        self._ha_outage_saw_http_502 = False
+        self._ha_outage_preexisting_recovery = False
+        self._ha_deferred_events = []
+        await self.adapter.publish_events(events)
 
     def _supervisor_config(self, primary: GeneratorSlot) -> SupervisorConfig:
         return SupervisorConfig(
@@ -1037,7 +1144,10 @@ class EnergySupervisorApp:
             min_ttg_before_start=float(
                 self.options["generator_min_ttg_before_start"]
             ),
-            max_start_delay=float(self.options["generator_max_start_delay"]),
+            max_start_delay=round(
+                float(self.options["generator_max_start_delay_hours"]) * 60 * 60,
+                6,
+            ),
         )
 
     def _exercise_configs(self) -> dict[GeneratorSlot, ExerciseConfig]:
@@ -1143,7 +1253,7 @@ class EnergySupervisorApp:
         )
         return {
             "state": (
-                self.supervisor.status_text(observation)
+                self._status_text(observation)
                 if self.armed
                 else "DISARMED — только наблюдение"
             ),
@@ -1241,7 +1351,7 @@ class EnergySupervisorApp:
 
     def _log_runtime_if_changed(self, observation: SupervisorObservation) -> None:
         status = (
-            self.supervisor.status_text(observation)
+            self._status_text(observation)
             if self.armed
             else "DISARMED — только наблюдение"
         )
@@ -1285,6 +1395,12 @@ class EnergySupervisorApp:
         if signature != self._last_runtime_signature:
             self._last_runtime_signature = signature
             self.log.info("%s.", "; ".join(parts))
+
+    def _status_text(self, observation: SupervisorObservation) -> str:
+        """Совместить core phase с более точным состоянием UPS Run."""
+        if self.ups_run.state == UPSRunState.WAITING_ON_UPS:
+            return "Питание от UPS"
+        return self.supervisor.status_text(observation)
 
     # Process helpers -------------------------------------------------
 
@@ -1335,7 +1451,21 @@ def load_options(path: str | Path = "/data/options.json") -> dict[str, Any]:
         loaded = json.load(stream)
     if not isinstance(loaded, dict):
         raise ValueError("options.json должен содержать JSON object")
-    return {**DEFAULT_OPTIONS, **loaded}
+    return _merge_options(loaded)
+
+
+def _merge_options(options: dict[str, Any]) -> dict[str, Any]:
+    """Объединить options с defaults и перенести старое значение секунд в часы."""
+    normalized = dict(options)
+    if "generator_max_start_delay_hours" not in normalized:
+        legacy_seconds = normalized.pop("generator_max_start_delay", None)
+        if legacy_seconds is not None:
+            normalized["generator_max_start_delay_hours"] = (
+                float(legacy_seconds) / 3600
+            )
+    else:
+        normalized.pop("generator_max_start_delay", None)
+    return {**DEFAULT_OPTIONS, **normalized}
 
 
 def configure_logging(level_name: str) -> None:

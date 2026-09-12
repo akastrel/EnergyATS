@@ -1,5 +1,5 @@
 name: "Energy ATS"
-version: "1.0.6"
+version: "1.0.7"
 slug: "energy_ats"
 description: >-
   Energy Supervisor: политика источников, безопасная силовая коммутация и
@@ -48,7 +48,7 @@ options:
   generator_start_soc: 40
   generator_target_charge_soc: 80
   generator_min_ttg_before_start: 60
-  generator_max_start_delay: 21600
+  generator_max_start_delay_hours: 6
 
   # Плановые пробные пуски по умолчанию выключены. После включения Scheduler
   # использует один общий HA entity присутствия семьи.
@@ -90,7 +90,7 @@ schema:
   generator_start_soc: "float(1,99)"
   generator_target_charge_soc: "float(1,100)"
   generator_min_ttg_before_start: "float(0,1440)"
-  generator_max_start_delay: "float(0,604800)"
+  generator_max_start_delay_hours: "float(0,168)"
 
   family_presence_entity: str
 

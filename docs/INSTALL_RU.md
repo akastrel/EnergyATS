@@ -149,7 +149,7 @@ generator_charge_cycle_enabled = false
 generator_start_soc = 40
 generator_target_charge_soc = 80
 generator_min_ttg_before_start = 60 min
-generator_max_start_delay = 21600 s
+generator_max_start_delay_hours = 6 h
 ```
 
 Для включения необходимы soft-dependency inputs:

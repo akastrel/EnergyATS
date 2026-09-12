@@ -826,7 +826,7 @@ class ExerciseScheduler:
         scheduled: datetime,
     ) -> str | None:
         if not o.actions_enabled:
-            return "EnergyATS находится в DISARMED режиме"
+            return "АВР находится в DISARMED режиме"
         if not o.required_states_known:
             return "неизвестны обязательные физические состояния"
         if o.emergency_stop is not False:
@@ -834,7 +834,7 @@ class ExerciseScheduler:
         if o.grid_ready is not True or not o.grid_path_stable:
             return "нет подтверждённой штатной Grid"
         if o.power_transition_in_progress or o.policy_busy:
-            return "EnergyATS выполняет другую операцию"
+            return "АВР выполняет другую операцию"
         if self.active_attempt is not None and self.active_attempt.slot != slot:
             return "в это же окно уже запущен exercise другого генератора"
 

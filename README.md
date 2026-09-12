@@ -2,7 +2,7 @@
 
 Home Assistant App для управления резервным электроснабжением дома с двумя генераторами, общей генераторной шиной, UPS-линией и подтверждаемой коммутацией Grid / Generator.
 
-Текущая версия: **1.0.4**. Статус add-on: `experimental` — программная модель и автоматические проверки стабильны, но окончательный ввод конкретной установки требует физических commissioning-тестов.
+Текущая версия: **1.0.7**. Статус add-on: `experimental` — программная модель и автоматические проверки стабильны, но окончательный ввод конкретной установки требует физических commissioning-тестов.
 
 ## Что умеет EnergyATS
 
@@ -18,7 +18,8 @@ Home Assistant App для управления резервным электро
 - Recovery при неоднозначном физическом состоянии или незавершённой hardware transaction;
 - persisted session/bus/exercise/load/UPS Run state;
 - причинно-следственный Logbook: trigger -> решение -> аппаратная команда -> подтверждённое физическое состояние;
-- диагностический `sensor.energy_ats_status`, Logbook и notifications.
+- диагностический `sensor.energy_ats_status`, Logbook и notifications;
+- корректное восстановление после временной недоступности или перезапуска Home Assistant без дублирования аварийных событий.
 
 Все дополнительные функции — UPS Run, Scheduled Exercise и Load Manager — не создают отдельного центра принятия решений. Системный конфликт Manual / Outage / Exercise / Recovery разрешает только `EnergySupervisor`.
 
@@ -69,16 +70,18 @@ main.py                   composition/runtime dispatch, без второго po
 
 ```text
 что изменилось физически
-  -> почему EnergyATS принял решение
+  -> почему АВР принял решение
   -> какое действие было начато
   -> какой feedback подтвердил результат
 ```
 
 Отдельно журналируются потеря/возврат Grid, ручные команды, переходы UPS Run, Scheduled Exercise, Recovery, изменения RUNNING/REMOTE, PowerPath/PowerSource, generator bus owner и Emergency Stop. Первый snapshot после start/reconnect считается baseline и не создаёт ложных событий.
 
-Внешний запуск генератора явно отличается от запуска, которым управляет EnergyATS. Пользовательские причинные сообщения формируются через стабильные message keys и русский каталог `energy_ats/app/user_messages_ru.py`; control logic не зависит от конкретной русской формулировки.
+App log является полным последовательным журналом и содержит основные и диагностические события, аппаратные команды и отправляемые пользовательские сообщения. Основной поток Home Assistant Logbook намеренно короче: в него публикуются только существенные MAIN events. После фактического возврата дома на Grid итоговое подтверждение питания от основной сети также относится к MAIN.
 
-App log является полным последовательным журналом и содержит основные и диагностические события, аппаратные команды и отправляемые пользовательские сообщения. Основной поток Home Assistant Logbook намеренно короче: в него публикуются только существенные MAIN events.
+При временной недоступности Home Assistant один реальный разрыв связи считается одним интервалом outage: повторные reconnect/HTTP 502 не создают новые аварийные события. После восстановления публикуется одна сводка с длительностью разрыва и количеством попыток подключения. Уже существующий `RECOVERY_REQUIRED` не выдаётся за следствие потери HA; `CRITICAL` создаётся только если связь действительно была потеряна во время незавершённой физической операции Supervisor/TPC.
+
+Внешний запуск генератора явно отличается от запуска, которым управляет АВР. Пользовательские причинные сообщения формируются через стабильные message keys и русский каталог `energy_ats/app/user_messages_ru.py`; control logic не зависит от конкретной русской формулировки.
 
 ## UPS Run
 
@@ -92,12 +95,14 @@ UPS Run — стратегия работы при длительном отсу
 ```text
 SoC <= generator_start_soc
 OR TTG <= generator_min_ttg_before_start
-OR UPS wait >= generator_max_start_delay
+OR UPS wait >= generator_max_start_delay_hours
 ```
+
+`generator_max_start_delay_hours` задаётся в часах; default — `6`. Старое сохранённое значение `generator_max_start_delay` в секундах автоматически преобразуется при обновлении.
 
 Недостоверная или stale battery telemetry отменяет экономию топлива и приводит к обычному безопасному generator start. Manual request имеет приоритет. Stable Grid имеет приоритет над Target SoC.
 
-Нормативное поведение и все параметры находятся в [`docs/REQUIREMENTS_RU.md`](docs/REQUIREMENTS_RU.md), HA entities — в [`docs/ENTITIES_RU.md`](docs/ENTITIES_RU.md), физические проверки — в [`docs/USER_TESTS_RU.md`](docs/USER_TESTS_RU.md), их результаты — в [`docs/USER_TEST_RESULTS_RU.md`](docs/USER_TEST_RESULTS_RU.md). Отдельного feature-документа для Delayed Start больше нет, чтобы не поддерживать вторую копию тех же правил.
+Нормативное поведение и все параметры находятся в [`docs/REQUIREMENTS_RU.md`](docs/REQUIREMENTS_RU.md), HA entities — в [`docs/ENTITIES_RU.md`](docs/ENTITIES_RU.md), физические проверки — в [`docs/USER_TESTS_RU.md`](docs/USER_TESTS_RU.md). Отдельного feature-документа для Delayed Start больше нет, чтобы не поддерживать вторую копию тех же правил.
 
 ## Scheduled Exercise
 
@@ -145,7 +150,7 @@ App публикует read-only:
 sensor.energy_ats_status
 ```
 
-Status показывает фактический source, Supervisor phase, generator/bus owner, managed session, PRIMARY, fallback, Exercise, UPS Run и Load Manager state. Он не является входом управляющей логики.
+Status показывает фактический source, Supervisor phase, generator/bus owner, managed session, PRIMARY, fallback, Exercise, UPS Run и Load Manager state. Во время базовой задержки после исчезновения сети пользовательский статус — «Проверка отсутствия сети», а после перехода Delayed Start в ожидание на батареях — «Питание от UPS». Status sensor не является входом управляющей логики.
 
 ## Установка
 
@@ -186,7 +191,7 @@ reset
 | [`energy_ats/DOCS.md`](energy_ats/DOCS.md) | пользовательская справка, показываемая вместе с HA App |
 | [`energy_ats/CHANGELOG.md`](energy_ats/CHANGELOG.md) | история изменений |
 
-Правило документации: один факт должен иметь один нормативный источник. README и HA docs объясняют использование, но не создают отдельные требования.
+Правило документации: один факт должен иметь один нормативный источник. README и HA docs объясняют использование, но не создают отдельные требования. Фактические результаты конкретных commissioning-прогонов в repository не хранятся.
 
 ## Проверка разработки
 
@@ -197,6 +202,6 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-Для 1.0.4 полный Python suite: **314 passed**. CI также собирает реальный add-on Docker image и внутри него выполняет production smoke через локальный test Home Assistant WebSocket/REST endpoint.
+Для 1.0.7 полный Python suite: **338 passed**. CI также собирает реальный add-on Docker image и внутри него выполняет production smoke через локальный test Home Assistant WebSocket/REST endpoint.
 
 Зелёный CI подтверждает программную модель и production packaging, но не заменяет commissioning на реальных генераторах, контакторах, DKG116, MAP, meter и G1/G2.

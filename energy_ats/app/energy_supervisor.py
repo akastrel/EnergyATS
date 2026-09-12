@@ -1213,7 +1213,7 @@ class EnergySupervisor:
         self._set_exercise_directive(
             ExerciseDirective.FAIL_ACTIVE,
             slot,
-            "EnergyATS перешёл в RECOVERY_REQUIRED во время Scheduled Exercise",
+            "АВР перешёл в RECOVERY_REQUIRED во время Scheduled Exercise",
         )
 
     # Derived state / persistence ------------------------------------
@@ -1264,7 +1264,7 @@ class EnergySupervisor:
         if self.phase == SupervisorPhase.WAITING_FOR_DATA:
             return "Ожидание данных"
         if self.phase == SupervisorPhase.GRID_FAILURE_DELAY:
-            return "Ожидание запуска генератора"
+            return "Проверка отсутствия сети"
         if self.phase == SupervisorPhase.STARTING_GENERATOR:
             return (
                 "Переключение на генератор"
