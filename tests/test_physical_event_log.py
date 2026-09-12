@@ -5,6 +5,7 @@ from __future__ import annotations
 from domain import GeneratorSlot, PowerPath, PowerSource
 from generator_bus import GeneratorBusOwner
 from physical_event_log import PhysicalEventTracker
+from user_messages import user_message
 
 
 NAMES = {
@@ -53,8 +54,8 @@ def test_first_snapshot_is_baseline_without_false_events():
     assert observe(tracker) == ()
 
 
-def test_grid_loss_and_isolation_are_separate_observed_events():
-    """Отдельно видим причину outage и подтверждённое снятие Grid path."""
+def test_grid_loss_and_later_isolation_are_distinct_physical_facts():
+    """Видим сначала outage/UPS, затем отдельное подтверждение снятия Grid path."""
     tracker = PhysicalEventTracker()
     observe(tracker)
 
@@ -64,8 +65,9 @@ def test_grid_loss_and_isolation_are_separate_observed_events():
         path=PowerPath.GRID,
         source=PowerSource.UPS_ONLY,
     )
-    assert "Входная сеть пропала (Grid Input Ready = OFF)." in messages(lost)
-    assert "Подтверждено: силовые вводы сняты; дом в режиме UPS_ONLY." not in messages(lost)
+    assert user_message("grid_input_off") in messages(lost)
+    assert user_message("power_source_ups_grid_path") in messages(lost)
+    assert user_message("power_path_isolated_from_grid") not in messages(lost)
 
     isolated = observe(
         tracker,
@@ -73,13 +75,11 @@ def test_grid_loss_and_isolation_are_separate_observed_events():
         path=PowerPath.ISOLATED,
         source=PowerSource.UPS_ONLY,
     )
-    assert (
-        "Подача входной сети в дом отключена; силовой ввод изолирован."
-        in messages(isolated)
-    )
+    assert user_message("power_path_isolated_from_grid") in messages(isolated)
+    assert user_message("power_source_ups_isolated") not in messages(isolated)
 
 
-def test_managed_running_transition_is_marked_managed():
+def test_managed_running_transition_is_marked_as_energyats_start():
     tracker = PhysicalEventTracker()
     observe(tracker, a_remote=True, managed=frozenset({GeneratorSlot.A}))
 
@@ -90,10 +90,7 @@ def test_managed_running_transition_is_marked_managed():
         owner=GeneratorBusOwner.A,
         managed=frozenset({GeneratorSlot.A}),
     )
-    assert (
-        "Elemax: RUNNING = ON — двигатель запущен (managed EnergyATS)."
-        in messages(events)
-    )
+    assert user_message("generator_running_managed", generator="Elemax") in messages(events)
 
 
 def test_unowned_running_transition_is_marked_external():
@@ -106,10 +103,7 @@ def test_unowned_running_transition_is_marked_external():
         b_remote=False,
         owner=GeneratorBusOwner.B,
     )
-    assert (
-        "Вепрь: RUNNING = ON — двигатель запущен (внешний/неуправляемый запуск)."
-        in messages(events)
-    )
+    assert user_message("generator_running_external", generator="Вепрь") in messages(events)
 
 
 def test_external_stop_is_visible_too():
@@ -117,10 +111,7 @@ def test_external_stop_is_visible_too():
     observe(tracker, b_running=True, owner=GeneratorBusOwner.B)
 
     events = observe(tracker, b_running=False, owner=GeneratorBusOwner.NONE)
-    assert (
-        "Вепрь: RUNNING = OFF — двигатель остановлен (внешняя/неуправляемая остановка)."
-        in messages(events)
-    )
+    assert user_message("generator_stopped_external", generator="Вепрь") in messages(events)
 
 
 def test_generator_supply_and_grid_restore_create_physical_timeline():
@@ -146,8 +137,8 @@ def test_generator_supply_and_grid_restore_create_physical_timeline():
         owner=GeneratorBusOwner.A,
         managed=frozenset({GeneratorSlot.A}),
     )
-    assert "Генераторная ветвь дома подключена (Generator path подтверждён)." in messages(generator)
-    assert "Подтверждено: дом питается от генераторной шины." in messages(generator)
+    assert user_message("power_path_generator") in messages(generator)
+    assert user_message("power_source_generator") in messages(generator)
 
     restored = observe(
         tracker,
@@ -159,9 +150,9 @@ def test_generator_supply_and_grid_restore_create_physical_timeline():
         owner=GeneratorBusOwner.A,
         managed=frozenset({GeneratorSlot.A}),
     )
-    assert "Входная сеть восстановлена (Grid Input Ready = ON)." in messages(restored)
-    assert "Сетевая ветвь дома подключена (Grid path подтверждён)." in messages(restored)
-    assert "Подтверждено: дом питается от входной сети Grid." in messages(restored)
+    assert user_message("grid_input_on") in messages(restored)
+    assert user_message("power_path_grid") in messages(restored)
+    assert user_message("power_source_grid") in messages(restored)
 
 
 def test_emergency_stop_and_automatic_transfer_toggle_are_visible():
@@ -169,8 +160,38 @@ def test_emergency_stop_and_automatic_transfer_toggle_are_visible():
     observe(tracker)
 
     events = observe(tracker, emergency=True, automatic=False)
-    assert "Generators Emergency Stop активирован." in messages(events)
-    assert "Автоматический переход на резерв отключён." in messages(events)
+    assert user_message("emergency_stop_on") in messages(events)
+    assert user_message("automatic_transfer_off") in messages(events)
+
+
+def test_remote_state_confirmation_is_visible_separately_from_running():
+    tracker = PhysicalEventTracker()
+    observe(tracker)
+
+    events = observe(
+        tracker,
+        a_remote=True,
+        managed=frozenset({GeneratorSlot.A}),
+    )
+    assert user_message("generator_remote_on", generator="Elemax") in messages(events)
+    assert user_message("generator_running_managed", generator="Elemax") not in messages(events)
+
+
+def test_bus_owner_change_names_real_generators():
+    tracker = PhysicalEventTracker()
+    observe(tracker, a_running=True, owner=GeneratorBusOwner.A)
+
+    events = observe(
+        tracker,
+        a_running=False,
+        b_running=True,
+        owner=GeneratorBusOwner.B,
+    )
+    assert user_message(
+        "bus_owner_changed",
+        old="Elemax",
+        new="Вепрь",
+    ) in messages(events)
 
 
 def test_reset_makes_next_snapshot_new_baseline():
