@@ -1,4 +1,4 @@
-# Energy ATS 1.0.4
+# Energy ATS
 
 Home Assistant App для управления резервным электроснабжением дома с двумя генераторами, общей generator bus и отдельной UPS-линией через МАП.
 
@@ -63,7 +63,7 @@ Load Manager снимает некритичные нагрузки перед g
 
 ## Причинный Logbook
 
-В 1.0.4 журнал разделяет причину, команду и реально наблюдённый результат. Для ключевых сценариев можно восстановить последовательность:
+Журнал разделяет причину, команду и реально наблюдённый результат. Для ключевых сценариев можно восстановить последовательность:
 
 ```text
 изменение входного/physical signal
@@ -112,4 +112,4 @@ sensor.energy_ats_status
 - [Физические тесты](https://github.com/akastrel/EnergyATS/blob/main/docs/USER_TESTS_RU.md)
 - [Changelog](https://github.com/akastrel/EnergyATS/blob/main/energy_ats/CHANGELOG.md)
 
-Текущая версия 1.0.4 проходит полный Python suite (**314 tests**) и production-container smoke. Это не заменяет проверку на реальной электроустановке.
+CI выполняет полный Python suite и production-container smoke. Это не заменяет проверку на реальной электроустановке.
