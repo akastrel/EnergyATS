@@ -2,7 +2,7 @@
 
 Home Assistant App для управления резервным электроснабжением дома с двумя генераторами, общей генераторной шиной, UPS-линией и подтверждаемой коммутацией Grid / Generator.
 
-Текущая версия: **1.0.7**. Статус add-on: `experimental` — программная модель и автоматические проверки стабильны, но окончательный ввод конкретной установки требует физических commissioning-тестов.
+Статус add-on: `experimental` — программная модель и автоматические проверки стабильны, но окончательный ввод конкретной установки требует физических commissioning-тестов.
 
 ## Что умеет EnergyATS
 
@@ -56,7 +56,7 @@ HomeAssistantAdapter      HA observations, hardware actions, background diagnost
 main.py                   composition/runtime dispatch, без второго policy layer
 ```
 
-В 1.0.3 Recovery arbitration окончательно перенесён в `EnergySupervisor`: Supervisor решает, можно ли выполнять reset, какие owned generators допустимо остановить и задаёт порядок `Grid path -> owned shutdown -> complete`. `main.py` только исполняет директивы TPC/GC.
+Recovery arbitration находится в `EnergySupervisor`: Supervisor решает, можно ли выполнять reset, какие owned generators допустимо остановить и задаёт порядок `Grid path -> owned shutdown -> complete`. `main.py` только исполняет директивы TPC/GC.
 
 Обычные status/Logbook/user publications выполняются best-effort вне критического control path и не должны задерживать аппаратную FSM на сетевой timeout. Исключение — предупреждение перед forced Scheduled Exercise: его доставка является safety prerequisite и подтверждается синхронно.
 
@@ -64,7 +64,7 @@ main.py                   composition/runtime dispatch, без второго po
 
 ## Причинный журнал событий
 
-Начиная с 1.0.4 Logbook предназначен не только для фиксации команд, но и для восстановления причинно-следственной цепочки события через месяцы после его возникновения.
+Logbook предназначен не только для фиксации команд, но и для восстановления причинно-следственной цепочки события через месяцы после его возникновения.
 
 Для ключевых сценариев журнал различает:
 
@@ -202,6 +202,6 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-Для 1.0.7 полный Python suite: **338 passed**. CI также собирает реальный add-on Docker image и внутри него выполняет production smoke через локальный test Home Assistant WebSocket/REST endpoint.
+CI запускает полный Python suite, собирает реальный add-on Docker image и внутри него выполняет production smoke через локальный test Home Assistant WebSocket/REST endpoint.
 
 Зелёный CI подтверждает программную модель и production packaging, но не заменяет commissioning на реальных генераторах, контакторах, DKG116, MAP, meter и G1/G2.
