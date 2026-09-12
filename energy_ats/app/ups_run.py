@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Hashable, Mapping
 
-from domain import SessionReason, SupervisorEvent
+from domain import EventVisibility, SessionReason, SupervisorEvent
 from user_messages import user_message
 
 
@@ -405,6 +405,7 @@ class UPSRun:
                     soc=soc,
                     target=self.config.target_soc,
                 ),
+                visibility=EventVisibility.DETAIL,
             )
             return UPSRunDecision(
                 request_cycle_stop=True,
@@ -472,11 +473,13 @@ class UPSRun:
         key: str,
         level: str,
         message: str,
+        *,
+        visibility: EventVisibility = EventVisibility.MAIN,
     ) -> None:
         if self._last_event_key == key:
             return
         self._last_event_key = key
-        events.append(SupervisorEvent(level, message))
+        events.append(SupervisorEvent(level, message, visibility))
 
     def status_attributes(
         self, now: float, battery: BatteryObservation

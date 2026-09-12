@@ -7,7 +7,7 @@ from datetime import date, datetime, time, timedelta
 from enum import Enum
 from typing import Any, Mapping
 
-from domain import GeneratorSlot, SupervisorEvent
+from domain import EventVisibility, GeneratorSlot, SupervisorEvent
 from user_messages import user_message
 
 SLOTS = (GeneratorSlot.A, GeneratorSlot.B)
@@ -268,6 +268,7 @@ class ExerciseScheduler:
                             "exercise_grace_expired",
                             generator=o.generator_names[warning.slot],
                         ),
+                        EventVisibility.DETAIL,
                     )
                 )
             events.extend(self._maybe_start(o))
@@ -300,6 +301,7 @@ class ExerciseScheduler:
         return SupervisorEvent(
             "info",
             user_message("exercise_warning_sent", generator=generator_name),
+            EventVisibility.DETAIL,
         )
 
     def fail_active(
@@ -534,6 +536,7 @@ class ExerciseScheduler:
                         generator=o.generator_names[slot],
                         days=config.interval_days,
                     ),
+                    EventVisibility.DETAIL,
                 )
             )
         return events
@@ -603,6 +606,7 @@ class ExerciseScheduler:
                             generator=o.generator_names[attempt.slot],
                             minutes=self.configs[attempt.slot].run_minutes,
                         ),
+                        EventVisibility.DETAIL,
                     )
                 )
             return events
@@ -806,6 +810,7 @@ class ExerciseScheduler:
                         "exercise_start_time",
                         generator=o.generator_names[slot],
                     ),
+                    EventVisibility.DETAIL,
                 )
             )
             # Цикл продолжается, чтобы второй slot с тем же окном получил

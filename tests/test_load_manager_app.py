@@ -184,7 +184,9 @@ async def test_app_invalid_power_metadata_degrades_only_load_manager(tmp_path):
     assert app.supervisor.phase == SupervisorPhase.ON_GENERATOR
     assert fake.states[ENTITIES["house_generator"]] == "on"
     assert app.load_manager.phase == LoadManagerPhase.DEGRADED
-    assert "Nominal/Maximum" in (app.load_manager.degraded_reason or "")
+    assert "номинальный и максимальный пределы мощности" in (
+        app.load_manager.degraded_reason or ""
+    )
 
 
 @pytest.mark.asyncio
