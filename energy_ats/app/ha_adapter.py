@@ -74,7 +74,6 @@ ENTITIES = {
 }
 
 ENERGY_ATS_LOG_ENTITY = "update.energy_ats_update"
-ENERGY_ATS_DETAIL_LOG_ENTITY = "sensor.energy_ats_activity_detail"
 ENERGY_ATS_STATUS_ENTITY = "sensor.energy_ats_status"
 
 
@@ -352,6 +351,7 @@ class HomeAssistantAdapter:
                 continue
             self._assert_transfer_action_safe(action)
             entity_id, service = self._transfer_service(action.kind)
+            self.log.info("%s", action.message)
             await self.client.call_service(
                 "switch",
                 service,
@@ -365,6 +365,7 @@ class HomeAssistantAdapter:
                 continue
             self._assert_generator_action_safe(action)
             entity_id, domain, service = self._generator_service(action)
+            self.log.info("%s", action.message)
             await self.client.call_service(
                 domain,
                 service,
@@ -399,6 +400,7 @@ class HomeAssistantAdapter:
             service = (
                 "turn_on" if action.kind == LoadActionKind.TURN_ON else "turn_off"
             )
+            self.log.info("%s", action.message)
             try:
                 await self.client.call_service(
                     "switch",
@@ -420,12 +422,19 @@ class HomeAssistantAdapter:
         return failures
 
     async def publish_events(self, events: tuple[SupervisorEvent, ...]) -> None:
-        """Поставить обычные Logbook/critical publications в background.
+        """Записать полный App log и поставить HA publications в background.
 
-        Эти публикации информируют пользователя, но не являются подтверждением
-        физической операции. Поэтому сетевой timeout не должен растягивать tick.
+        App log является полным локальным журналом и получает MAIN и DETAIL.
+        Сетевые публикации информируют пользователя, но не являются подтверждением
+        физической операции, поэтому HA timeout не должен растягивать tick.
         """
+        methods = {
+            "info": self.log.info,
+            "warning": self.log.warning,
+            "critical": self.log.critical,
+        }
         for event in events:
+            methods.get(event.level, self.log.info)("%s", event.message)
             self._schedule_publication(
                 self._publish_event(event),
                 f"event:{event.level}",
@@ -434,18 +443,16 @@ class HomeAssistantAdapter:
         await asyncio.sleep(0)
 
     async def _publish_event(self, event: SupervisorEvent) -> None:
-        log_entity = (
-            ENERGY_ATS_DETAIL_LOG_ENTITY
-            if event.visibility == EventVisibility.DETAIL
-            else ENERGY_ATS_LOG_ENTITY
-        )
-        try:
-            await self._logbook(event.message, log_entity)
-        except Exception as exc:
-            self.log.warning(
-                "Не удалось записать событие Energy ATS в Logbook: %s",
-                exc,
-            )
+        # App log уже получил все события в publish_events().
+        # В Home Assistant Logbook публикуем только короткий основной поток.
+        if event.visibility == EventVisibility.MAIN:
+            try:
+                await self._logbook(event.message, ENERGY_ATS_LOG_ENTITY)
+            except Exception as exc:
+                self.log.warning(
+                    "Не удалось записать событие Energy ATS в Logbook: %s",
+                    exc,
+                )
         if not self.armed or event.level != "critical":
             return
         try:
@@ -470,6 +477,7 @@ class HomeAssistantAdapter:
         if not self.armed:
             self.log.info("DISARMED: подавлено уведомление: %s", message)
             return False
+        self.log.info("%s", message)
         try:
             await self.client.call_service(
                 "script",

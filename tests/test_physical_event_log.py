@@ -91,6 +91,27 @@ def test_managed_running_transition_is_marked_as_energyats_start():
         managed=frozenset({GeneratorSlot.A}),
     )
     assert user_message("generator_running_managed", generator="Elemax") in messages(events)
+    assert "Генератор Elemax запущен. Запуск управляется АВР." in messages(events)
+
+
+def test_managed_stop_uses_natural_generator_message():
+    tracker = PhysicalEventTracker()
+    observe(
+        tracker,
+        a_remote=True,
+        a_running=True,
+        owner=GeneratorBusOwner.A,
+        managed=frozenset({GeneratorSlot.A}),
+    )
+
+    events = observe(
+        tracker,
+        a_remote=False,
+        a_running=False,
+        owner=GeneratorBusOwner.NONE,
+        managed=frozenset({GeneratorSlot.A}),
+    )
+    assert "Генератор Elemax остановлен." in messages(events)
 
 
 def test_unowned_running_transition_is_marked_external():

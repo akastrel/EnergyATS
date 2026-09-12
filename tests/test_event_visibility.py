@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 
 import pytest
@@ -18,7 +19,6 @@ from energy_supervisor import EnergySupervisor
 from exercise_scheduler import ExerciseConfig, ExerciseScheduler
 from generator_bus import GeneratorBusOwner
 from ha_adapter import (
-    ENERGY_ATS_DETAIL_LOG_ENTITY,
     ENERGY_ATS_LOG_ENTITY,
     HomeAssistantAdapter,
 )
@@ -322,27 +322,26 @@ def test_repeated_pretransfer_problem_does_not_repeat_main_warning():
 
 
 @pytest.mark.asyncio
-async def test_adapter_routes_main_and_detail_to_separate_logbook_entities():
+async def test_adapter_logs_every_event_but_publishes_only_main_to_ha_logbook(caplog):
     fake = FakeClient()
-    adapter = HomeAssistantAdapter(fake, armed=True)
+    logger = logging.getLogger("test.complete-app-log")
+    adapter = HomeAssistantAdapter(fake, armed=True, logger=logger)
 
-    await adapter.publish_events(
-        (
-            SupervisorEvent("info", "Основное"),
-            SupervisorEvent(
-                "info",
-                "Подробное",
-                EventVisibility.DETAIL,
-            ),
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        await adapter.publish_events(
+            (
+                SupervisorEvent("info", "Основное"),
+                SupervisorEvent(
+                    "info",
+                    "Подробное",
+                    EventVisibility.DETAIL,
+                ),
+            )
         )
-    )
 
     logbook_calls = [call for call in fake.calls if call[:2] == ("logbook", "log")]
-    routed = {
-        call[2]["message"]: call[2]["entity_id"]
-        for call in logbook_calls
-    }
-    assert routed == {
-        "Основное": ENERGY_ATS_LOG_ENTITY,
-        "Подробное": ENERGY_ATS_DETAIL_LOG_ENTITY,
-    }
+    assert [(call[2]["message"], call[2]["entity_id"]) for call in logbook_calls] == [
+        ("Основное", ENERGY_ATS_LOG_ENTITY),
+    ]
+    assert "Основное" in caplog.messages
+    assert "Подробное" in caplog.messages

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -25,6 +26,7 @@ from ha_adapter import (  # noqa: E402
     UnsafeHardwareCommand,
 )
 from ha_client import HomeAssistantClient  # noqa: E402
+from load_manager import LoadAction, LoadActionKind, LoadGroup  # noqa: E402
 import main as app_main  # noqa: E402
 from main import DEFAULT_OPTIONS, EnergySupervisorApp, load_options  # noqa: E402
 from power_transfer import TransferAction, TransferActionKind  # noqa: E402
@@ -254,6 +256,37 @@ def test_missing_control_entity_required_only_when_armed():
 
 def generator_action(slot: GeneratorSlot, kind: GeneratorActionKind) -> GeneratorAction:
     return GeneratorAction(slot, kind, "test")
+
+
+@pytest.mark.asyncio
+async def test_hardware_action_messages_are_written_to_complete_app_log(caplog):
+    fake = FakeClient()
+    fake.states = populated_states()
+    logger = logging.getLogger("test.hardware-action-log")
+    adapter = HomeAssistantAdapter(fake, armed=True, logger=logger)
+
+    transfer = TransferAction(
+        TransferActionKind.DISCONNECT_GRID,
+        "Отключаем сетевой ввод.",
+    )
+    generator = GeneratorAction(
+        GeneratorSlot.A,
+        GeneratorActionKind.REMOTE_ON,
+        "Подаём REMOTE START на Elemax.",
+    )
+    load = LoadAction(
+        LoadGroup.G1,
+        LoadActionKind.TURN_OFF,
+        "Отключаем некритичные нагрузки 1-го этажа.",
+    )
+
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        await adapter.execute_actions([transfer], [generator])
+        await adapter.execute_load_actions([load])
+
+    assert "Отключаем сетевой ввод." in caplog.messages
+    assert "Подаём REMOTE START на Elemax." in caplog.messages
+    assert "Отключаем некритичные нагрузки 1-го этажа." in caplog.messages
 
 
 @pytest.mark.asyncio

@@ -306,6 +306,8 @@ trigger / физическое изменение
 
 Новые причинные пользовательские формулировки адресуются стабильными message keys; русский текст находится в `app/user_messages_ru.py`. Благодаря этому текст можно локализовать без изменения FSM и safety policy.
 
+Полную последовательность событий следует смотреть в App log: туда попадают MAIN/DETAIL events, команды Generator Controller, Power Transfer и Load Manager, а также отправляемые пользовательские сообщения. Основной поток Home Assistant Logbook намеренно содержит только существенные MAIN events; отдельная DETAIL-сущность не используется.
+
 Critical events используют `script.notify_critical`. Обычные status/Logbook/user publications выполняются best-effort и не должны задерживать control tick из-за сетевого timeout. При reconnect незавершённые background publications отменяются.
 
 Исключение — warning перед forced Scheduled Exercise: Scheduler считает его доставленным только после успешного ответа Home Assistant.
