@@ -146,6 +146,15 @@ class HomeAssistantAdapter:
         # synchronous publish_user_notification() method instead.
         self._publication_tasks: set[asyncio.Task[None]] = set()
 
+        # Status отличается от прочих best-effort публикаций: это одно текущее
+        # состояние, поэтому параллельные REST writes недопустимы. Храним только
+        # последний desired payload, публикуем последовательно и повторяем
+        # временную ошибку. Промежуточные устаревшие значения можно coalesce.
+        self._status_desired: tuple[str, dict[str, Any]] | None = None
+        self._status_delivered: tuple[str, dict[str, Any]] | None = None
+        self._status_publisher_task: asyncio.Task[None] | None = None
+        self._cancelling_publications = False
+
     def snapshot(self) -> HardwareSnapshot:
         grid_ready = self.bool_state(ENTITIES["grid_ready"])
         house_grid = self.bool_state(ENTITIES["house_grid"])
@@ -509,51 +518,97 @@ class HomeAssistantAdapter:
         except Exception as exc:
             self.log.warning("Не удалось отправить уведомление: %s", exc)
 
-    async def publish_status(self, state: str, attributes: dict[str, Any]) -> bool:
-        """Поставить status publication в background и сразу вернуть управление."""
-        self._schedule_publication(
-            self._publish_status(state, attributes),
-            "status",
-        )
-        await asyncio.sleep(0)
-        return True
+    async def publish_status(self, state: str, attributes: dict[str, Any]) -> None:
+        """Принять новый desired status без ожидания REST delivery.
 
-    async def _publish_status(self, state: str, attributes: dict[str, Any]) -> None:
-        try:
-            await self.client.set_state(
-                ENERGY_ATS_STATUS_ENTITY,
-                state,
-                attributes=attributes,
-            )
-        except Exception as exc:
-            self.log.warning(
-                "Не удалось опубликовать %s: %s",
-                ENERGY_ATS_STATUS_ENTITY,
-                exc,
-            )
+        Отдельный последовательный publisher хранит последнее желаемое значение,
+        повторяет временные ошибки и гарантирует, что старый медленный write не
+        завершится после уже отправленного нового статуса.
+        """
+        self._status_desired = (state, dict(attributes))
+        self._ensure_status_publisher()
+        await asyncio.sleep(0)
+
+    def _ensure_status_publisher(self) -> None:
+        task = self._status_publisher_task
+        if task is not None and not task.done():
+            return
+        self._status_publisher_task = self._schedule_publication(
+            self._status_publisher_loop(),
+            "status",
+            done_callback=self._status_publisher_done,
+        )
+
+    async def _status_publisher_loop(self) -> None:
+        while self._status_desired != self._status_delivered:
+            desired = self._status_desired
+            if desired is None:
+                return
+            state, attributes = desired
+            try:
+                await self.client.set_state(
+                    ENERGY_ATS_STATUS_ENTITY,
+                    state,
+                    attributes=attributes,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.log.warning(
+                    "Не удалось опубликовать %s: %s; повторим попытку.",
+                    ENERGY_ATS_STATUS_ENTITY,
+                    exc,
+                )
+                # Ограничиваем retry rate; если за это время desired изменится,
+                # после паузы будет отправлено уже последнее значение.
+                await asyncio.sleep(1.0)
+                continue
+            self._status_delivered = desired
+
+    def _status_publisher_done(self, task: asyncio.Task[None]) -> None:
+        if self._status_publisher_task is task:
+            self._status_publisher_task = None
+        self._publication_done(task)
+        # Закрываем редкую гонку: desired мог измениться между последней
+        # проверкой loop и completion task.
+        if (
+            not self._cancelling_publications
+            and not task.cancelled()
+            and self._status_desired != self._status_delivered
+        ):
+            self._ensure_status_publisher()
 
     async def cancel_background_publications(self) -> None:
         """Отменить незавершённый best-effort I/O перед закрытием HA transport."""
         tasks = tuple(self._publication_tasks)
         if not tasks:
+            self._status_publisher_task = None
             return
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        self._publication_tasks.clear()
+        self._cancelling_publications = True
+        try:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self._publication_tasks.clear()
+            self._status_publisher_task = None
+        finally:
+            self._cancelling_publications = False
 
     def _schedule_publication(
         self,
         coroutine: Coroutine[Any, Any, None],
         name: str,
-    ) -> None:
+        *,
+        done_callback=None,
+    ) -> asyncio.Task[None]:
         try:
             task = asyncio.create_task(coroutine, name=f"energy-ats-{name}")
         except RuntimeError:
             coroutine.close()
             raise
         self._publication_tasks.add(task)
-        task.add_done_callback(self._publication_done)
+        task.add_done_callback(done_callback or self._publication_done)
+        return task
 
     def _publication_done(self, task: asyncio.Task[None]) -> None:
         self._publication_tasks.discard(task)
