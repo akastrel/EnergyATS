@@ -465,17 +465,17 @@ class LoadManager:
 
         # Только stale-stream деградация требует доказать появление новой
         # revision и заново пройти stabilization. Прочие локальные dependency
-        # failures восстанавливаются обычным путём после исчезновения blocker-а.
+        # failures тоже проходят новое measurement window, но могут начать его
+        # сразу после исчезновения blocker-а.
         if self.phase == LoadManagerPhase.DEGRADED:
-            if self._stale_stream_degraded:
-                if not self._sample_is_new(o):
-                    return self._decision(actions, events, notifications)
-                self._last_owner = o.bus_owner
-                self._start_measurement(o.now, "recovery")
-                self._reset_overload_timers()
-                self._accept_sample(o)
+            if self._stale_stream_degraded and not self._sample_is_new(o):
                 return self._decision(actions, events, notifications)
             self._recover_from_degraded(events)
+            self._last_owner = o.bus_owner
+            self._start_measurement(o.now, "recovery")
+            self._reset_overload_timers()
+            self._accept_sample(o)
+            return self._decision(actions, events, notifications)
 
         if o.bus_owner != self._last_owner:
             self._last_owner = o.bus_owner
