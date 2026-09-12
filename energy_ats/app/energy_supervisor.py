@@ -9,6 +9,7 @@ from typing import Any, Mapping
 from domain import GeneratorSlot, PowerPath, PowerSource, SessionReason, SupervisorEvent
 from generator_bus import GeneratorBusOwner, GeneratorBusStatus
 from generator_controller import GeneratorPhase, GeneratorStatus
+from physical_event_log import PhysicalEventTracker
 from power_transfer import PowerTransferStatus
 
 
@@ -189,6 +190,7 @@ class EnergySupervisor:
         self._recovery_reset_requested = False
         self._recovery_reset_active = False
         self._events: list[SupervisorEvent] = []
+        self._physical_events = PhysicalEventTracker()
         self._stop_outage_generators: set[GeneratorSlot] = set()
         self._exercise_directive = ExerciseDirective.NONE
         self._exercise_slot: GeneratorSlot | None = None
@@ -199,9 +201,14 @@ class EnergySupervisor:
 
     def request_manual_start(self) -> None:
         self._manual_start_requested = True
+        self._event("info", "Пользователь запросил ручной переход на резервное питание.")
 
     def request_manual_stop(self) -> None:
         self._manual_stop_requested = True
+        self._event(
+            "info",
+            "Пользователь запросил завершение управляемой генераторной сессии.",
+        )
 
     def request_cycle_stop(self) -> None:
         """Compatibility entry point; normal tick passes the UPS Run intent directly."""
@@ -220,6 +227,7 @@ class EnergySupervisor:
 
     def request_recovery_reset(self) -> None:
         self._recovery_reset_requested = True
+        self._event("info", "Пользователь запросил безопасный Recovery reset.")
 
     @property
     def has_pending_session_request(self) -> bool:
@@ -253,7 +261,14 @@ class EnergySupervisor:
         TPC сообщает только локальный blocker/факт Grid path; Scheduler сообщает
         только owned slot. Право начать reset, допустимые stop owners и порядок
         `Grid path -> owned generator stop -> complete` принадлежат Supervisor.
+
+        Production runtime вызывает этот метод в начале каждого tick, поэтому
+        здесь же фиксируются изменения наблюдаемых физических сигналов. Первый
+        snapshot после start/reconnect является baseline и не публикуется как
+        ложное изменение состояния.
         """
+        self._observe_physical_events(o, exercise_owned_slot)
+
         requested = self._recovery_reset_requested
         self._recovery_reset_requested = False
         needs_reset = (
@@ -295,6 +310,39 @@ class EnergySupervisor:
         if not grid_path_confirmed:
             return RecoveryDecision(RecoveryDirective.DRIVE_GRID_RECOVERY)
         return self._recovery_after_grid(o, exercise_owned_slot)
+
+    def _observe_physical_events(
+        self,
+        o: SupervisorObservation,
+        exercise_owned_slot: GeneratorSlot | None,
+    ) -> None:
+        managed_slots = {
+            slot
+            for slot in (
+                self.session.generator if self.session is not None else None,
+                exercise_owned_slot,
+            )
+            if slot is not None
+        }
+        bus_owner = o.bus.owner if o.bus is not None else GeneratorBusOwner.UNKNOWN
+        self._events.extend(
+            self._physical_events.observe(
+                grid_ready=o.grid_ready,
+                automatic_transfer_enabled=o.automatic_transfer_enabled,
+                power_path=o.power.actual_path,
+                power_source=o.power.actual_source,
+                emergency_stop=o.emergency_stop,
+                generators={
+                    slot: (status.running, status.remote_on)
+                    for slot, status in o.generators.items()
+                },
+                bus_owner=bus_owner,
+                generator_names={
+                    slot: status.display_name for slot, status in o.generators.items()
+                },
+                managed_slots=frozenset(managed_slots),
+            )
+        )
 
     def _recovery_after_grid(
         self,
@@ -357,6 +405,7 @@ class EnergySupervisor:
         self._require_recovery(reason)
 
     def mark_connection_lost(self) -> None:
+        self._physical_events.reset()
         if self.phase in _TRANSIENT_PHASES:
             self._require_recovery(
                 "Связь потеряна во время незавершённой физической операции."
