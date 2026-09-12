@@ -18,6 +18,7 @@ from enum import Enum
 from typing import Any, Hashable, Mapping
 
 from domain import SessionReason, SupervisorEvent
+from user_messages import user_message
 
 
 class UPSRunState(str, Enum):
@@ -148,12 +149,24 @@ class UPSRun:
             restore_grid = self.post_cycle_wait and not o.session_active
             if not o.grid_stable or (restore_grid and not o.grid_supply_restored):
                 return UPSRunDecision(restore_grid_after_cycle=restore_grid)
+
+            if o.session_active and self.state in {
+                UPSRunState.CHARGING,
+                UPSRunState.TARGET_REACHED,
+            }:
+                self._emit_once(
+                    events,
+                    "grid_returned_during_charge",
+                    "info",
+                    user_message("ups_grid_returned_during_charge"),
+                )
+
             self._reset_wait()
             self.post_cycle_wait = False
             self.state = UPSRunState.IDLE
             self.last_reason = None
             self._last_event_key = None
-            return UPSRunDecision()
+            return UPSRunDecision(events=tuple(events))
 
         if o.grid_ready is not False:
             return UPSRunDecision()
@@ -190,7 +203,13 @@ class UPSRun:
         if o.manual_start_pending:
             self.state = UPSRunState.GENERATOR_REQUIRED
             self.last_reason = "Пользователь запросил питание от генератора."
-            return UPSRunDecision(reason=self.last_reason)
+            self._emit_once(
+                events,
+                "manual_interrupt",
+                "info",
+                user_message("ups_wait_cancelled_manual"),
+            )
+            return UPSRunDecision(reason=self.last_reason, events=tuple(events))
 
         delay_satisfied = self.waiting_since is not None
         if not delay_satisfied and not o.core_delay_elapsed:
@@ -231,7 +250,7 @@ class UPSRun:
                 events,
                 f"battery:{battery_reason}",
                 "warning",
-                f"Delayed Start отменён: {battery_reason} Запускаем генератор штатно.",
+                user_message("ups_wait_cancelled_bad_data"),
             )
             return UPSRunDecision(
                 outage_delay_already_satisfied=delay_satisfied,
@@ -243,11 +262,19 @@ class UPSRun:
         assert o.battery.soc is not None
         elapsed = max(0.0, o.now - self.waiting_since)
         reason: str | None = None
+        event_key: str | None = None
+        event_message: str | None = None
 
         if o.battery.soc <= self.config.start_soc:
             reason = (
                 f"SoC {o.battery.soc:.1f}% достиг порога запуска "
                 f"{self.config.start_soc:.1f}%."
+            )
+            event_key = "start_soc"
+            event_message = user_message(
+                "ups_start_soc_reached",
+                soc=o.battery.soc,
+                threshold=self.config.start_soc,
             )
         elif (
             o.battery.discharging is True
@@ -258,18 +285,25 @@ class UPSRun:
                 f"TTG {o.battery.ttg_minutes:.0f} мин достиг порога "
                 f"{self.config.min_ttg_before_start:.0f} мин."
             )
+            event_key = "start_ttg"
+            event_message = user_message(
+                "ups_start_ttg_reached",
+                ttg=o.battery.ttg_minutes,
+                threshold=self.config.min_ttg_before_start,
+            )
         elif elapsed >= self.config.max_start_delay:
             reason = "Достигнута максимальная задержка запуска генератора."
+            event_key = "start_max_wait"
+            event_message = user_message(
+                "ups_max_wait_elapsed",
+                duration=_format_duration(self.config.max_start_delay),
+            )
 
         if reason is not None:
             self.state = UPSRunState.GENERATOR_REQUIRED
             self.last_reason = reason
-            self._emit_once(
-                events,
-                f"start:{reason}",
-                "info",
-                f"Delayed Start завершён: {reason}",
-            )
+            assert event_key is not None and event_message is not None
+            self._emit_once(events, event_key, "info", event_message)
             return UPSRunDecision(
                 outage_delay_already_satisfied=True,
                 claim_new_outage_session=claim,
@@ -279,6 +313,12 @@ class UPSRun:
 
         self.state = UPSRunState.WAITING_ON_UPS
         self.last_reason = "UPS продолжает питать критическую линию."
+        self._emit_once(
+            events,
+            "waiting_on_ups",
+            "info",
+            user_message("ups_wait_started"),
+        )
         return UPSRunDecision(
             defer_automatic_start=True,
             outage_delay_already_satisfied=True,
@@ -292,12 +332,10 @@ class UPSRun:
         events: list[SupervisorEvent],
     ) -> UPSRunDecision:
         # Ручная команда, уже ожидающая обработки Supervisor, немедленно
-        # запрещает Target-SoC stop в этом tick.
+        # запрещает автоматическую остановку по уровню заряда в этом tick.
         if o.manual_start_pending:
             self.state = UPSRunState.IDLE
-            self.last_reason = (
-                "Пользователь принял generator-session под ручное управление."
-            )
+            self.last_reason = "Пользователь запросил продолжить работу от генератора."
             return UPSRunDecision(reason=self.last_reason)
 
         if o.session_reason != SessionReason.GRID_OUTAGE:
@@ -316,7 +354,7 @@ class UPSRun:
 
         if not o.session_on_generator:
             self.state = UPSRunState.CHARGING
-            self.last_reason = "Generator-session ещё не в устойчивом режиме."
+            self.last_reason = "Генератор ещё не вышел в устойчивый режим."
             return UPSRunDecision(reason=self.last_reason)
 
         soc = o.battery.soc
@@ -325,17 +363,36 @@ class UPSRun:
             or self._telemetry_stale(o.now, o.battery.soc_updated_at)
             or o.battery.ready is not True
         ):
-            reason = "SoC или готовность батареи недостоверны; cycling не завершает generator-session."
+            reason = (
+                "Данные уровня заряда или готовности UPS недостоверны; "
+                "автоматическая остановка по уровню заряда запрещена."
+            )
             self.state = UPSRunState.DEGRADED
             self.last_reason = reason
             self._emit_once(events, "cycle_soc_invalid", "warning", reason)
             return UPSRunDecision(reason=reason, events=tuple(events))
 
         assert soc is not None
+        if self._last_event_key not in {
+            "charge_started",
+            "target_reached",
+            "grid_returned_during_charge",
+        }:
+            self._emit_once(
+                events,
+                "charge_started",
+                "info",
+                user_message(
+                    "ups_charge_started",
+                    generator="работающего генератора",
+                    target=self.config.target_soc,
+                ),
+            )
+
         if soc >= self.config.target_soc:
             reason = (
                 f"Батарея заряжена до {soc:.1f}% "
-                f"(target {self.config.target_soc:.1f}%)."
+                f"(целевой уровень {self.config.target_soc:.1f}%)."
             )
             self.state = UPSRunState.TARGET_REACHED
             self.last_reason = reason
@@ -343,7 +400,11 @@ class UPSRun:
                 events,
                 "target_reached",
                 "info",
-                f"{reason} Завершаем автоматический charge cycle.",
+                user_message(
+                    "ups_target_charge_reached",
+                    soc=soc,
+                    target=self.config.target_soc,
+                ),
             )
             return UPSRunDecision(
                 request_cycle_stop=True,
@@ -353,10 +414,10 @@ class UPSRun:
 
         self.state = UPSRunState.CHARGING
         self.last_reason = (
-            f"Заряд батареи {soc:.1f}%; ожидаем target {self.config.target_soc:.1f}%."
+            f"Заряд батареи {soc:.1f}%; ожидаем целевой уровень "
+            f"{self.config.target_soc:.1f}%."
         )
-        self._last_event_key = None
-        return UPSRunDecision(reason=self.last_reason)
+        return UPSRunDecision(reason=self.last_reason, events=tuple(events))
 
     def _battery_problem(self, o: UPSRunObservation) -> str | None:
         b = o.battery
@@ -488,3 +549,14 @@ def _valid_soc(value: float | None) -> bool:
 
 def _valid_nonnegative(value: float | None) -> bool:
     return value is not None and math.isfinite(value) and value >= 0
+
+
+def _format_duration(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    if seconds % 3600 == 0 and seconds >= 3600:
+        hours = seconds // 3600
+        return f"{hours} ч"
+    if seconds % 60 == 0 and seconds >= 60:
+        minutes = seconds // 60
+        return f"{minutes} мин"
+    return f"{seconds} с"
