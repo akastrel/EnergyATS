@@ -217,7 +217,7 @@ def test_grid_outage_waits_delay_then_starts_primary():
     assert supervisor.phase == SupervisorPhase.GRID_FAILURE_DELAY
     assert supervisor.status_text(outage) == "Проверка отсутствия сети"
     assert [event.message for event in decision.events] == [
-        "EnergyATS ожидает 5 с, чтобы исключить кратковременный сбой сети."
+        "АВР ожидает 5 с, чтобы исключить кратковременный сбой сети."
     ]
     supervisor.step(4.9, outage)
     assert supervisor.session is None

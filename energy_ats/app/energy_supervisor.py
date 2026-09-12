@@ -1213,7 +1213,7 @@ class EnergySupervisor:
         self._set_exercise_directive(
             ExerciseDirective.FAIL_ACTIVE,
             slot,
-            "EnergyATS перешёл в RECOVERY_REQUIRED во время Scheduled Exercise",
+            "АВР перешёл в RECOVERY_REQUIRED во время Scheduled Exercise",
         )
 
     # Derived state / persistence ------------------------------------

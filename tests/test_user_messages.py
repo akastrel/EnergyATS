@@ -30,6 +30,18 @@ def test_charge_messages_use_human_term_instead_of_target_soc():
     assert "target_soc" not in rendered
 
 
+def test_charge_percentages_are_shown_without_decimal_noise():
+    rendered = user_message(
+        "ups_start_soc_reached",
+        soc=96.0,
+        threshold=96.0,
+    )
+    assert rendered == (
+        "Заряд UPS снизился до 96% — достигнут порог запуска генератора 96%. "
+        "Начинаем запуск генератора."
+    )
+
+
 def test_russian_catalog_contains_no_implementation_only_terms():
     catalog = message_catalog("ru")
     text = "\n".join(catalog.values()).lower()
@@ -42,6 +54,11 @@ def test_russian_catalog_contains_no_implementation_only_terms():
         "outage-сесс",
     ):
         assert forbidden not in text
+
+
+def test_russian_user_messages_call_the_controller_avr():
+    catalog = message_catalog("ru")
+    assert "EnergyATS" not in "\n".join(catalog.values())
 
 
 def test_unknown_language_falls_back_to_russian_catalog():

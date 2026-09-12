@@ -46,23 +46,23 @@ configuration:
     description: "Minimum delay before retrying a group shed by overload or rejected during admission."
 
   delayed_generator_start_enabled:
-    name: "UPS Run: delayed generator start"
-    description: "After the grid failure delay, wait on UPS until the SoC, TTG or maximum-wait threshold. Invalid or stale battery data cancels the wait and returns to the normal safe generator start."
+    name: "UPS Run: отложенный запуск генератора"
+    description: "После подтверждённого отключения входной сети дом продолжает работать от батарей UPS. Генератор запустится при достижении любого из заданных условий: низкого заряда, малого оставшегося времени работы или максимального времени ожидания."
   generator_charge_cycle_enabled:
-    name: "UPS Run: generator charge cycling"
-    description: "During a long outage, finish only owned cycle-managed automatic sessions at Target SoC. Manual and external runs are not stopped by SoC."
+    name: "UPS Run: циклическая подзарядка от генератора"
+    description: "Во время длительного отключения сети АВР останавливает автоматически запущенный генератор после достижения целевого заряда. Затем дом снова работает от UPS до следующего условия запуска. На ручной запуск генератора эта настройка не действует."
   generator_start_soc:
-    name: "UPS Run: generator start battery SoC, %"
-    description: "End the UPS wait at or below this charge level. Must be lower than the target charge level."
+    name: "UPS Run: запуск генератора при заряде UPS, %"
+    description: "Генератор запускается, когда заряд батарей UPS опускается до этого уровня. Значение должно быть ниже уровня остановки генератора."
   generator_target_charge_soc:
-    name: "UPS Run: target battery charge, %"
-    description: "Complete an owned cycle-managed automatic charge session at this level. Must exceed start SoC and be no higher than 100%."
+    name: "UPS Run: заряд UPS для остановки генератора, %"
+    description: "После достижения этого уровня АВР переводит дом с генератора на UPS, выполняет охлаждение и останавливает генератор. Значение должно быть выше уровня запуска."
   generator_min_ttg_before_start:
-    name: "UPS Run: minimum UPS time remaining, min"
-    description: "End the wait at or below this TTG while discharging. This threshold is ignored during charging or float."
-  generator_max_start_delay:
-    name: "UPS Run: maximum UPS wait, s"
-    description: "Limit for each UPS wait; 21600 s = 6 h. Elapsed time survives restart and resets after a completed charge cycle."
+    name: "UPS Run: запуск при остатке работы UPS, мин"
+    description: "Генератор запускается, когда расчётное оставшееся время работы UPS опускается до этого значения. Условие действует только при разряде батарей."
+  generator_max_start_delay_hours:
+    name: "UPS Run: максимальное время работы от UPS, ч"
+    description: "Генератор запустится по истечении этого времени, даже если заряд батарей и оставшееся время работы ещё выше заданных порогов. Отсчёт начинается после проверки отсутствия сети и сохраняется при перезапуске АВР. Значение 0 означает запуск без дополнительного ожидания."
 
   family_presence_entity:
     name: "Family presence HA entity"

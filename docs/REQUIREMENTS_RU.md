@@ -540,7 +540,7 @@ UPS Run не дублирует start/stop lifecycle generator, силовой t
 ```text
 battery_soc <= generator_start_soc
 OR battery_ttg <= generator_min_ttg_before_start
-OR current_ups_wait >= generator_max_start_delay
+OR current_ups_wait >= generator_max_start_delay_hours
 ```
 
 Для следующего charge cycle новый wait начинается после завершения предыдущего cycle и возврата в `UPS_ONLY`.
@@ -611,7 +611,7 @@ generator_charge_cycle_enabled = false
 generator_start_soc = 40 %
 generator_target_charge_soc = 80 %
 generator_min_ttg_before_start = 60 min
-generator_max_start_delay = 6 h
+generator_max_start_delay_hours = 6 h
 ```
 
 ### 7.5. Тест-кейсы UPS Run

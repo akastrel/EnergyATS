@@ -92,7 +92,7 @@ UPS Run — стратегия работы при длительном отсу
 ```text
 SoC <= generator_start_soc
 OR TTG <= generator_min_ttg_before_start
-OR UPS wait >= generator_max_start_delay
+OR UPS wait >= generator_max_start_delay_hours
 ```
 
 Недостоверная или stale battery telemetry отменяет экономию топлива и приводит к обычному безопасному generator start. Manual request имеет приоритет. Stable Grid имеет приоритет над Target SoC.

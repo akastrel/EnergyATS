@@ -147,6 +147,21 @@ def test_load_options_merges_public_configuration(tmp_path):
     assert "primary_generator" not in options
 
 
+def test_load_options_migrates_max_start_delay_from_seconds_to_hours(tmp_path):
+    path = tmp_path / "options.json"
+    path.write_text(json.dumps({"generator_max_start_delay": 21600}))
+
+    options = load_options(path)
+
+    assert options["generator_max_start_delay_hours"] == 6
+    assert "generator_max_start_delay" not in options
+
+
+def test_max_start_delay_hours_is_converted_for_internal_timer(tmp_path):
+    app = make_app(tmp_path, generator_max_start_delay_hours=2.5)
+    assert app.ups_run.config.max_start_delay == 2.5 * 60 * 60
+
+
 def test_stdin_commands_dispatch_only_when_armed_and_ready(tmp_path, monkeypatch):
     app = make_app(tmp_path, armed=True)
     received: list[str] = []

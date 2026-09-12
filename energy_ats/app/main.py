@@ -84,7 +84,7 @@ DEFAULT_OPTIONS: dict[str, Any] = {
     "generator_start_soc": 40,
     "generator_target_charge_soc": 80,
     "generator_min_ttg_before_start": 60,
-    "generator_max_start_delay": 21600,
+    "generator_max_start_delay_hours": 6,
     "family_presence_entity": "group.family",
     "generator_a_exercise_enabled": False,
     "generator_a_exercise_interval_days": 30,
@@ -119,7 +119,7 @@ class EnergySupervisorApp:
     """Связывает доменные компоненты с Home Assistant; собственной policy не содержит."""
 
     def __init__(self, options: dict[str, Any], token: str) -> None:
-        self.options = {**DEFAULT_OPTIONS, **options}
+        self.options = _merge_options(options)
         self.armed = _boolean_option(self.options, "armed")
         self.tick_seconds = max(0.2, float(self.options["tick_seconds"]))
         self.local_time_zone = timezone.utc
@@ -532,7 +532,7 @@ class EnergySupervisorApp:
         if not config.generator_enabled(hardware.primary_generator):
             raise ValueError(
                 f"Основной генератор {self._profile(hardware.primary_generator).display_name} "
-                "запрещён политикой EnergyATS."
+                "запрещён политикой АВР."
             )
         self.supervisor.config = config
         self._last_generator_config_signature = signature
@@ -851,7 +851,7 @@ class EnergySupervisorApp:
                 return None, None
             if saved.get("schema_version") != STATE_SCHEMA_VERSION:
                 raise ValueError(
-                    "Неподдерживаемый формат persistent state EnergyATS; "
+                    "Неподдерживаемый формат сохранённого состояния АВР; "
                     "миграция не выполняется."
                 )
             return saved, None
@@ -1037,7 +1037,10 @@ class EnergySupervisorApp:
             min_ttg_before_start=float(
                 self.options["generator_min_ttg_before_start"]
             ),
-            max_start_delay=float(self.options["generator_max_start_delay"]),
+            max_start_delay=round(
+                float(self.options["generator_max_start_delay_hours"]) * 60 * 60,
+                6,
+            ),
         )
 
     def _exercise_configs(self) -> dict[GeneratorSlot, ExerciseConfig]:
@@ -1341,7 +1344,21 @@ def load_options(path: str | Path = "/data/options.json") -> dict[str, Any]:
         loaded = json.load(stream)
     if not isinstance(loaded, dict):
         raise ValueError("options.json должен содержать JSON object")
-    return {**DEFAULT_OPTIONS, **loaded}
+    return _merge_options(loaded)
+
+
+def _merge_options(options: dict[str, Any]) -> dict[str, Any]:
+    """Объединить options с defaults и перенести старое значение секунд в часы."""
+    normalized = dict(options)
+    if "generator_max_start_delay_hours" not in normalized:
+        legacy_seconds = normalized.pop("generator_max_start_delay", None)
+        if legacy_seconds is not None:
+            normalized["generator_max_start_delay_hours"] = (
+                float(legacy_seconds) / 3600
+            )
+    else:
+        normalized.pop("generator_max_start_delay", None)
+    return {**DEFAULT_OPTIONS, **normalized}
 
 
 def configure_logging(level_name: str) -> None:
