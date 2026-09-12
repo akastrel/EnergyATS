@@ -561,8 +561,8 @@ async def test_22_1_13_secondary_failure_after_fallback_requires_recovery_withou
 
 
 @pytest.mark.asyncio
-async def test_22_1_14_restart_with_two_running_preserves_saved_bus_owner(tmp_path):
-    """Если до restart FIFO-владелец при двух RUNNING был достоверно известен и сохранён, новый процесс обязан восстановить его. Текущий снимок двух работающих двигателей не должен пересчитать owner заново."""
+async def test_22_1_14_restart_with_two_running_invalidates_saved_bus_owner(tmp_path):
+    """Restart разрывает доказанную FIFO-историю: сохранённый owner сам по себе не доказывает непрерывность RUNNING. Если после restart оба двигателя всё ещё RUNNING, owner обязан стать UNKNOWN до появления новой наблюдаемой истории."""
 
     app, fake = make_app(tmp_path)
     await app._tick(0.0)
@@ -577,8 +577,8 @@ async def test_22_1_14_restart_with_two_running_preserves_saved_bus_owner(tmp_pa
     restored, restored_fake = _restart_app(tmp_path, fake.states)
     await restored._tick(3.0)
 
-    assert restored.generator_bus.status().owner_slot == GeneratorSlot.A
-    assert restored.generator_bus.status().owner == GeneratorBusOwner.A
+    assert restored.generator_bus.status().owner_slot is None
+    assert restored.generator_bus.status().owner == GeneratorBusOwner.UNKNOWN
     assert restored_fake.states[ENTITIES["generator_a_running"]] == "on"
     assert restored_fake.states[ENTITIES["generator_b_running"]] == "on"
 

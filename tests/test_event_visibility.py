@@ -278,17 +278,34 @@ def test_load_manager_degrade_has_one_clean_main_and_technical_detail():
     assert second.notifications == ()
 
 
-def test_load_manager_recovery_returns_to_main_once():
+def test_load_manager_recovery_returns_to_main_once_after_stabilization():
+    """Recovery-сообщение означает завершённое новое measurement window, а не первый sample."""
     manager = LoadManager(LoadManagerConfig(enabled=True))
     manager.step(_load_observation(owner=None))
 
-    recovered = manager.step(_load_observation(now=1, sample=2))
-    assert any(
+    started = manager.step(_load_observation(now=1, sample=2))
+    assert not any(
+        event.visibility == EventVisibility.MAIN
+        and event.message
+        == "Автоматическое управление некритичными нагрузками восстановлено."
+        for event in started.events
+    )
+
+    middle = manager.step(_load_observation(now=5, sample=3))
+    assert not any(
+        event.visibility == EventVisibility.MAIN
+        and event.message
+        == "Автоматическое управление некритичными нагрузками восстановлено."
+        for event in middle.events
+    )
+
+    recovered = manager.step(_load_observation(now=11, sample=4))
+    assert sum(
         event.visibility == EventVisibility.MAIN
         and event.message
         == "Автоматическое управление некритичными нагрузками восстановлено."
         for event in recovered.events
-    )
+    ) == 1
 
 
 def test_load_manager_user_message_uses_ground_floor_name_not_basement():

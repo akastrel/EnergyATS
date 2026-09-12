@@ -165,6 +165,7 @@ class LoadManager:
         # STABLE can still detect a later sample gap.
         self._last_sample_id: Hashable | None = None
         self._last_new_sample_at: float | None = None
+        self._stale_stream_degraded = False
         self._nominal_overload_since: float | None = None
         self._maximum_overload_since: float | None = None
         self._last_owner: GeneratorSlot | None = None
@@ -462,19 +463,35 @@ class LoadManager:
             self._degrade(error, events, notifications)
             return self._decision(actions, events, notifications)
 
+        # Только stale-stream деградация требует доказать появление новой
+        # revision и заново пройти stabilization. Прочие локальные dependency
+        # failures тоже проходят новое measurement window, но могут начать его
+        # сразу после исчезновения blocker-а. Событие «восстановлено» публикуется
+        # только после успешного завершения этого окна.
         if self.phase == LoadManagerPhase.DEGRADED:
-            self._recover_from_degraded(events)
+            if self._stale_stream_degraded and not self._sample_is_new(o):
+                return self._decision(actions, events, notifications)
+            self._last_owner = o.bus_owner
+            self._start_measurement(o.now, "recovery")
+            self._reset_overload_timers()
+            self._accept_sample(o)
+            return self._decision(actions, events, notifications)
 
-        if o.bus_owner != self._last_owner or self.phase == LoadManagerPhase.DEGRADED:
+        if o.bus_owner != self._last_owner:
             self._last_owner = o.bus_owner
             self._start_measurement(o.now, "base")
             self._reset_overload_timers()
+            # Новый owner задаёт новое измерительное окно; старый timestamp
+            # предыдущего owner не должен превращать этот переход в stale fault.
+            self._accept_sample(o)
+            return self._decision(actions, events, notifications)
 
         # F5 / REQ-LOAD-14/16/18/19: сначала оцениваем gap относительно
         # предыдущего наблюдения, и только потом принимаем текущий sample. Иначе
-        # первый sample после долгой паузы сам стирает доказательство stale gap.
+        # первый sample после gap сам стирает доказательство stale gap.
         if self._samples_stale(o.now):
             self._reset_overload_timers()
+            self._stale_stream_degraded = True
             self._degrade(
                 "Данные мощности генератора перестали обновляться; "
                 "автоматическое управление нагрузками приостановлено.",
@@ -518,6 +535,8 @@ class LoadManager:
         assert power is not None
         reason = self._measurement_reason or "base"
         self._reset_measurement()
+        if reason == "recovery":
+            self._recover_from_degraded(events)
         nominal = self._nominal(o)
 
         if reason.startswith("admission:"):
@@ -820,9 +839,17 @@ class LoadManager:
         self._measurement_started_at = now
         self._measurement_count = 0
         self._measurement_max = None
-        # Новое stabilization window начинает новую доказанную непрерывность
-        # samples. Завершение этого окна, напротив, stream markers не стирает.
-        self._reset_sample_stream()
+        # Measurement window и идентичность потока — разные вещи. Не стираем
+        # _last_sample_id: иначе frozen sample после stale выглядит как новый.
+
+    def _sample_is_new(self, o: LoadManagerObservation) -> bool:
+        power = self._number(o.generator_power)
+        return bool(
+            power is not None
+            and power >= 0
+            and o.power_sample_id is not None
+            and o.power_sample_id != self._last_sample_id
+        )
 
     def _accept_sample(
         self,
@@ -875,6 +902,7 @@ class LoadManager:
     def _reset_sample_stream(self) -> None:
         self._last_sample_id = None
         self._last_new_sample_at = None
+        self._stale_stream_degraded = False
 
     def _dependency_error(self, o: LoadManagerObservation) -> str | None:
         if o.bus_owner is None:
@@ -940,7 +968,10 @@ class LoadManager:
         *,
         main_message: str | None = None,
     ) -> None:
-        was_degraded = self.phase == LoadManagerPhase.DEGRADED
+        was_degraded = (
+            self.phase == LoadManagerPhase.DEGRADED
+            or self.degraded_reason is not None
+        )
         changed = self.degraded_reason != reason
         self._set_phase(LoadManagerPhase.DEGRADED, "degraded", reason)
 
@@ -962,7 +993,7 @@ class LoadManager:
             )
 
     def _recover_from_degraded(self, events) -> None:
-        if self.phase != LoadManagerPhase.DEGRADED or self._blocked_groups:
+        if self.degraded_reason is None or self._blocked_groups:
             return
         events.append(
             SupervisorEvent(
@@ -971,6 +1002,7 @@ class LoadManager:
             )
         )
         self.degraded_reason = None
+        self._stale_stream_degraded = False
 
     def _execution_failure_message(
         self,

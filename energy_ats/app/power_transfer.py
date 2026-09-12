@@ -307,9 +307,23 @@ class PowerTransferController:
 
         topology = self._infer_topology(observation)
         if topology is not None:
+            self.feedback_lost_since = None
             self._set_stable(*topology)
             if topology[0] == PowerPath.GRID:
                 return [], None
+
+        # R1: Recovery использует тот же доказуемо безопасный break, что и
+        # обычный transfer при потерянном generator-voltage feedback. Selector=ON
+        # вместе с подтверждённо снятой Grid-ветвью достаточно для DESELECT, но
+        # не для какой-либо make-команды.
+        if (
+            topology is None
+            and observation.generator_selected is True
+            and observation.grid_connected is False
+            and observation.house_on_grid is False
+        ):
+            self.feedback_lost_since = None
+            return self._begin(now, TransferActionKind.DESELECT_GENERATOR), None
 
         actions = self._drive(
             now,
@@ -317,7 +331,25 @@ class PowerTransferController:
             PowerSource.GRID,
             generator_ready=False,
         )
-        return actions, None
+        if actions:
+            self.feedback_lost_since = None
+            return actions, None
+
+        # Принятый Reset не должен оставаться in_progress бесконечно. Если из
+        # известного snapshot нельзя доказать ни устойчивую топологию, ни один
+        # безопасный следующий шаг, ограничиваем ожидание тем же confirmation
+        # timeout и возвращаем явную причину Supervisor-у.
+        if self.feedback_lost_since is None:
+            self.feedback_lost_since = now
+            return [], None
+        if now - self.feedback_lost_since >= self.confirmation_timeout:
+            reason = (
+                "Не удалось определить безопасный следующий шаг восстановления "
+                f"за {int(self.confirmation_timeout)} с."
+            )
+            self._require_recovery(reason)
+            return [], reason
+        return [], None
 
     def request_recovery_reset(self, observation: PowerTransferObservation) -> bool:
         topology = self._infer_topology(observation)

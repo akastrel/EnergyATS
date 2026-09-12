@@ -75,6 +75,17 @@ class GeneratorBusTracker:
     def status(self) -> GeneratorBusStatus:
         return GeneratorBusStatus(self.owner, dict(self.run_contexts))
 
+    def invalidate_observation_history(self) -> None:
+        """Забыть FIFO-историю, непрерывность которой больше не доказана.
+
+        После gap/restart два RUNNING двигателя не позволяют восстановить порядок
+        их последних стартов. До новой наблюдаемой истории owner обязан оставаться
+        UNKNOWN; один RUNNING или оба OFF снова дают однозначный результат.
+        """
+        self.owner = GeneratorBusOwner.UNKNOWN
+        self.previous_running = None
+        self.run_contexts = {slot: GeneratorRunContext.NONE for slot in SLOTS}
+
     def update(
         self,
         running: Mapping[GeneratorSlot, bool | None],
@@ -86,6 +97,9 @@ class GeneratorBusTracker:
         internal_test_slots: frozenset[GeneratorSlot] = frozenset(),
     ) -> GeneratorBusStatus:
         if any(running.get(slot) is None for slot in SLOTS):
+            # UNKNOWN/UNAVAILABLE разрывает доказанную непрерывность RUNNING.
+            # Сохранять старый owner через такой разрыв небезопасно.
+            self.invalidate_observation_history()
             return self.status()
 
         current = {slot: running[slot] is True for slot in SLOTS}
@@ -131,9 +145,9 @@ class GeneratorBusTracker:
                     if managed_outage
                     else GeneratorRunContext.OTHER
                 )
-            elif self.run_contexts[slot] == GeneratorRunContext.NONE:
-                # Уже работающему внешнему двигателю нельзя приписывать причину
-                # запуска без сохранённой истории.
+            else:
+                # После первого snapshot, restart или gap причина внешнего
+                # непрерывного run без новой истории недоказуема.
                 self.run_contexts[slot] = GeneratorRunContext.UNKNOWN
 
     @staticmethod
@@ -188,26 +202,26 @@ class GeneratorBusTracker:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> "GeneratorBusTracker":
-        tracker = cls()
-        tracker.owner = GeneratorBusOwner(str(data["owner"]))
+        # Persisted owner/context остаются полезны для диагностики journal, но
+        # restart сам по себе является observation gap. Поэтому runtime не имеет
+        # права считать сохранённый FIFO-order доказательством непрерывности.
+        # Валидируем старый payload для совместимости schema, затем стартуем с
+        # недостоверной историей и восстанавливаем только из новых наблюдений.
+        GeneratorBusOwner(str(data["owner"]))
         contexts = data.get("run_contexts")
         if not isinstance(contexts, Mapping):
             raise ValueError("Некорректное состояние generator_bus.run_contexts")
-        tracker.run_contexts = {
-            slot: GeneratorRunContext(str(contexts[slot.value]))
-            for slot in SLOTS
-        }
+        for slot in SLOTS:
+            GeneratorRunContext(str(contexts[slot.value]))
 
         previous = data.get("previous_running")
-        if previous is None:
-            return tracker
-        if not isinstance(previous, Mapping):
-            raise ValueError("Некорректное состояние generator_bus.previous_running")
-        restored: dict[GeneratorSlot, bool] = {}
-        for slot in SLOTS:
-            value = previous[slot.value]
-            if type(value) is not bool:
-                raise ValueError("previous_running должен содержать boolean")
-            restored[slot] = value
-        tracker.previous_running = restored
+        if previous is not None:
+            if not isinstance(previous, Mapping):
+                raise ValueError("Некорректное состояние generator_bus.previous_running")
+            for slot in SLOTS:
+                if type(previous[slot.value]) is not bool:
+                    raise ValueError("previous_running должен содержать boolean")
+
+        tracker = cls()
+        tracker.invalidate_observation_history()
         return tracker

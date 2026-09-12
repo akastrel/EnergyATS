@@ -7,7 +7,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 from domain import GeneratorSlot, PowerPath, PowerSource
-from energy_supervisor import SupervisorObservation
+from energy_supervisor import SupervisorObservation, SupervisorPhase
 from exercise_scheduler import ExerciseConfig, ExerciseScheduler
 from generator_bus import GeneratorBusTracker
 from generator_controller import (
@@ -96,6 +96,7 @@ def app_for_log() -> EnergySupervisorApp:
     app.log = logging.getLogger("test_runtime_log")
     app.generator_bus = GeneratorBusTracker()
     app.supervisor = SimpleNamespace(
+        phase=SupervisorPhase.NORMAL,
         config=SimpleNamespace(primary_generator=GeneratorSlot.A),
         session=None,
         status_text=lambda _observation: "Питание от основной сети",
