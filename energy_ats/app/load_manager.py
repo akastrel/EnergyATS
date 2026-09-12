@@ -165,6 +165,7 @@ class LoadManager:
         # STABLE can still detect a later sample gap.
         self._last_sample_id: Hashable | None = None
         self._last_new_sample_at: float | None = None
+        self._stale_stream_degraded = False
         self._nominal_overload_since: float | None = None
         self._maximum_overload_since: float | None = None
         self._last_owner: GeneratorSlot | None = None
@@ -462,29 +463,35 @@ class LoadManager:
             self._degrade(error, events, notifications)
             return self._decision(actions, events, notifications)
 
-        # R6: DEGRADED из-за stale stream не заканчивается от одного лишь факта,
-        # что entity всё ещё существует. Нужна новая revision; затем начинается
-        # новое stabilization window. Сообщение «восстановлено» появится только
-        # после успешного завершения этого окна.
+        # Только stale-stream деградация требует доказать появление новой
+        # revision и заново пройти stabilization. Прочие локальные dependency
+        # failures восстанавливаются обычным путём после исчезновения blocker-а.
         if self.phase == LoadManagerPhase.DEGRADED:
-            if not self._sample_is_new(o):
+            if self._stale_stream_degraded:
+                if not self._sample_is_new(o):
+                    return self._decision(actions, events, notifications)
+                self._last_owner = o.bus_owner
+                self._start_measurement(o.now, "recovery")
+                self._reset_overload_timers()
+                self._accept_sample(o)
                 return self._decision(actions, events, notifications)
-            self._last_owner = o.bus_owner
-            self._start_measurement(o.now, "recovery")
-            self._reset_overload_timers()
-            self._accept_sample(o)
-            return self._decision(actions, events, notifications)
+            self._recover_from_degraded(events)
 
         if o.bus_owner != self._last_owner:
             self._last_owner = o.bus_owner
             self._start_measurement(o.now, "base")
             self._reset_overload_timers()
+            # Новый owner задаёт новое измерительное окно; старый timestamp
+            # предыдущего owner не должен превращать этот переход в stale fault.
+            self._accept_sample(o)
+            return self._decision(actions, events, notifications)
 
         # F5 / REQ-LOAD-14/16/18/19: сначала оцениваем gap относительно
         # предыдущего наблюдения, и только потом принимаем текущий sample. Иначе
         # первый sample после gap сам стирает доказательство stale gap.
         if self._samples_stale(o.now):
             self._reset_overload_timers()
+            self._stale_stream_degraded = True
             self._degrade(
                 "Данные мощности генератора перестали обновляться; "
                 "автоматическое управление нагрузками приостановлено.",
@@ -895,6 +902,7 @@ class LoadManager:
     def _reset_sample_stream(self) -> None:
         self._last_sample_id = None
         self._last_new_sample_at = None
+        self._stale_stream_degraded = False
 
     def _dependency_error(self, o: LoadManagerObservation) -> str | None:
         if o.bus_owner is None:
@@ -994,6 +1002,7 @@ class LoadManager:
             )
         )
         self.degraded_reason = None
+        self._stale_stream_degraded = False
 
     def _execution_failure_message(
         self,
