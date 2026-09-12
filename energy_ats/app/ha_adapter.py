@@ -12,7 +12,7 @@ from collections.abc import Coroutine
 from dataclasses import dataclass
 from typing import Any, Hashable
 
-from domain import GeneratorSlot, SupervisorEvent
+from domain import EventVisibility, GeneratorSlot, SupervisorEvent
 from generator_controller import (
     GeneratorAction,
     GeneratorActionKind,
@@ -74,6 +74,7 @@ ENTITIES = {
 }
 
 ENERGY_ATS_LOG_ENTITY = "update.energy_ats_update"
+ENERGY_ATS_DETAIL_LOG_ENTITY = "sensor.energy_ats_activity_detail"
 ENERGY_ATS_STATUS_ENTITY = "sensor.energy_ats_status"
 
 
@@ -433,8 +434,13 @@ class HomeAssistantAdapter:
         await asyncio.sleep(0)
 
     async def _publish_event(self, event: SupervisorEvent) -> None:
+        log_entity = (
+            ENERGY_ATS_DETAIL_LOG_ENTITY
+            if event.visibility == EventVisibility.DETAIL
+            else ENERGY_ATS_LOG_ENTITY
+        )
         try:
-            await self._logbook(event.message, ENERGY_ATS_LOG_ENTITY)
+            await self._logbook(event.message, log_entity)
         except Exception as exc:
             self.log.warning(
                 "Не удалось записать событие Energy ATS в Logbook: %s",
