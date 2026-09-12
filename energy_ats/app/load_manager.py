@@ -361,13 +361,14 @@ class LoadManager:
         events,
         notifications,
     ) -> LoadManagerDecision:
-        self._set_phase(LoadManagerPhase.LOAD_SHEDDING, "pretransfer")
         unavailable: list[LoadGroup] = []
         for group in self._SHED_ORDER:
             state = o.groups.get(group)
             if state is None:
                 unavailable.append(group)
             elif state is True and group not in self._blocked_groups:
+                self._recover_from_degraded(events)
+                self._set_phase(LoadManagerPhase.LOAD_SHEDDING, "pretransfer")
                 self._queue(
                     o,
                     actions,
@@ -397,6 +398,9 @@ class LoadManager:
                     "переходом на генератор. Переход на резервное питание продолжится."
                 ),
             )
+        else:
+            self._recover_from_degraded(events)
+            self._set_phase(LoadManagerPhase.LOAD_SHEDDING, "pretransfer")
         return self._decision(actions, events, notifications)
 
     def _restore_on_grid(
@@ -678,10 +682,14 @@ class LoadManager:
         if candidate is None:
             level = "critical" if maximum else "warning"
             key = f"{level}:{o.bus_owner}"
-            name = o.generator_name or "генератор"
+            generator = (
+                f"генератора {o.generator_name}"
+                if o.generator_name
+                else "генератора"
+            )
             message = (
                 f"{'Критическая перегрузка' if maximum else 'Перегрузка'} "
-                f"{name}: нагрузка {power:.0f} Вт. Все управляемые "
+                f"{generator}: нагрузка {power:.0f} Вт. Все управляемые "
                 "некритичные нагрузки уже отключены."
             )
             if self._last_alert_key != key:
