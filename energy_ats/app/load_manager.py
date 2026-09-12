@@ -462,17 +462,27 @@ class LoadManager:
             self._degrade(error, events, notifications)
             return self._decision(actions, events, notifications)
 
+        # R6: DEGRADED из-за stale stream не заканчивается от одного лишь факта,
+        # что entity всё ещё существует. Нужна новая revision; затем начинается
+        # новое stabilization window. Сообщение «восстановлено» появится только
+        # после успешного завершения этого окна.
         if self.phase == LoadManagerPhase.DEGRADED:
-            self._recover_from_degraded(events)
+            if not self._sample_is_new(o):
+                return self._decision(actions, events, notifications)
+            self._last_owner = o.bus_owner
+            self._start_measurement(o.now, "recovery")
+            self._reset_overload_timers()
+            self._accept_sample(o)
+            return self._decision(actions, events, notifications)
 
-        if o.bus_owner != self._last_owner or self.phase == LoadManagerPhase.DEGRADED:
+        if o.bus_owner != self._last_owner:
             self._last_owner = o.bus_owner
             self._start_measurement(o.now, "base")
             self._reset_overload_timers()
 
         # F5 / REQ-LOAD-14/16/18/19: сначала оцениваем gap относительно
         # предыдущего наблюдения, и только потом принимаем текущий sample. Иначе
-        # первый sample после долгой паузы сам стирает доказательство stale gap.
+        # первый sample после gap сам стирает доказательство stale gap.
         if self._samples_stale(o.now):
             self._reset_overload_timers()
             self._degrade(
@@ -518,6 +528,8 @@ class LoadManager:
         assert power is not None
         reason = self._measurement_reason or "base"
         self._reset_measurement()
+        if reason == "recovery":
+            self._recover_from_degraded(events)
         nominal = self._nominal(o)
 
         if reason.startswith("admission:"):
@@ -820,9 +832,17 @@ class LoadManager:
         self._measurement_started_at = now
         self._measurement_count = 0
         self._measurement_max = None
-        # Новое stabilization window начинает новую доказанную непрерывность
-        # samples. Завершение этого окна, напротив, stream markers не стирает.
-        self._reset_sample_stream()
+        # Measurement window и идентичность потока — разные вещи. Не стираем
+        # _last_sample_id: иначе frozen sample после stale выглядит как новый.
+
+    def _sample_is_new(self, o: LoadManagerObservation) -> bool:
+        power = self._number(o.generator_power)
+        return bool(
+            power is not None
+            and power >= 0
+            and o.power_sample_id is not None
+            and o.power_sample_id != self._last_sample_id
+        )
 
     def _accept_sample(
         self,
@@ -940,7 +960,10 @@ class LoadManager:
         *,
         main_message: str | None = None,
     ) -> None:
-        was_degraded = self.phase == LoadManagerPhase.DEGRADED
+        was_degraded = (
+            self.phase == LoadManagerPhase.DEGRADED
+            or self.degraded_reason is not None
+        )
         changed = self.degraded_reason != reason
         self._set_phase(LoadManagerPhase.DEGRADED, "degraded", reason)
 
@@ -962,7 +985,7 @@ class LoadManager:
             )
 
     def _recover_from_degraded(self, events) -> None:
-        if self.phase != LoadManagerPhase.DEGRADED or self._blocked_groups:
+        if self.degraded_reason is None or self._blocked_groups:
             return
         events.append(
             SupervisorEvent(
