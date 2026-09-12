@@ -2,17 +2,36 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import pytest
 
-from domain import EventVisibility, GeneratorSlot, PowerPath, PowerSource, SupervisorEvent
+from domain import (
+    EventVisibility,
+    GeneratorSlot,
+    PowerPath,
+    PowerSource,
+    SessionReason,
+    SupervisorEvent,
+)
 from energy_supervisor import EnergySupervisor
+from exercise_scheduler import ExerciseConfig, ExerciseScheduler
 from generator_bus import GeneratorBusOwner
 from ha_adapter import (
     ENERGY_ATS_DETAIL_LOG_ENTITY,
     ENERGY_ATS_LOG_ENTITY,
     HomeAssistantAdapter,
 )
+from load_manager import (
+    LoadAction,
+    LoadActionKind,
+    LoadGroup,
+    LoadManager,
+    LoadManagerConfig,
+    LoadManagerObservation,
+)
 from physical_event_log import PhysicalEventTracker
+from ups_run import BatteryObservation, UPSRun, UPSRunConfig, UPSRunObservation
 from user_messages import user_event
 
 
@@ -57,6 +76,41 @@ def _observe(
             GeneratorSlot.B: "Вепрь",
         },
         managed_slots=frozenset({GeneratorSlot.A}),
+    )
+
+
+def _load_observation(
+    *,
+    now=0.0,
+    owner=GeneratorSlot.A,
+    nominal=5000.0,
+    maximum=6500.0,
+    meter=True,
+    power=1000.0,
+    sample=1,
+    g1=True,
+    g2=True,
+    on_generator=True,
+    on_grid=False,
+    desired=False,
+    ready=False,
+):
+    return LoadManagerObservation(
+        now=now,
+        house_on_generator=on_generator,
+        house_on_grid=on_grid,
+        desired_generator_supply=desired,
+        managed_generator_ready=ready,
+        power_transition_in_progress=False,
+        bus_owner=owner,
+        nominal_power=nominal,
+        maximum_power=maximum,
+        meter_ready=meter,
+        generator_power=power,
+        power_sample_id=sample,
+        groups={LoadGroup.G1: g1, LoadGroup.G2: g2},
+        generator_name="Elemax",
+        actions_enabled=True,
     )
 
 
@@ -117,6 +171,154 @@ def test_physical_confirmations_are_detail_while_major_facts_are_main():
         if "Подтверждено" in message or "REMOTE" in message or "шины" in message
     )
     assert any(event.visibility == EventVisibility.MAIN for event in events)
+
+
+def test_exercise_scheduler_progress_notifications_are_detail():
+    scheduler = ExerciseScheduler(
+        {
+            GeneratorSlot.A: ExerciseConfig(True, 30, "12:00", 10, 3),
+            GeneratorSlot.B: ExerciseConfig(False, 30, "12:00", 10, 3),
+        }
+    )
+    event = scheduler.confirm_warning(
+        GeneratorSlot.A,
+        "2026-09-12",
+        "Elemax",
+        datetime(2026, 9, 12, 10, 0, tzinfo=timezone.utc),
+    )
+    assert event.visibility == EventVisibility.DETAIL
+
+
+def test_ups_target_soc_detail_does_not_duplicate_main_outcome():
+    ups_run = UPSRun(
+        UPSRunConfig(
+            delayed_start_enabled=True,
+            charge_cycle_enabled=True,
+            start_soc=40,
+            target_soc=80,
+            min_ttg_before_start=60,
+            max_start_delay=3600,
+            telemetry_stale_time=300,
+        )
+    )
+    decision = ups_run.step(
+        UPSRunObservation(
+            now=100,
+            grid_ready=False,
+            automatic_transfer_enabled=True,
+            core_delay_elapsed=True,
+            battery=BatteryObservation(
+                soc=80,
+                ttg_minutes=None,
+                discharging=False,
+                ready=True,
+                sample_id=1,
+            ),
+            session_reason=SessionReason.GRID_OUTAGE,
+            session_active=True,
+            session_on_generator=True,
+            session_cycle_owned=True,
+        )
+    )
+    target = [event for event in decision.events if "достигнут целевой" in event.message]
+    assert len(target) == 1
+    assert target[0].visibility == EventVisibility.DETAIL
+    assert decision.request_cycle_stop is True
+
+
+def test_load_manager_degrade_has_one_clean_main_and_technical_detail():
+    manager = LoadManager(LoadManagerConfig(enabled=True))
+    first = manager.step(_load_observation(owner=None))
+
+    main = [event for event in first.events if event.visibility == EventVisibility.MAIN]
+    detail = [event for event in first.events if event.visibility == EventVisibility.DETAIL]
+    assert [event.message for event in main] == [
+        "Автоматическое управление некритичными нагрузками временно недоступно. "
+        "Основное управление резервным питанием продолжает работу."
+    ]
+    assert detail
+    assert first.notifications == (main[0].message,)
+    assert not any(
+        word in main[0].message
+        for word in ("bus owner", "sample", "LOAD_SHEDDING", "core ATS")
+    )
+
+    second = manager.step(_load_observation(now=1, nominal=None, maximum=None, sample=2))
+    assert not any(
+        event.visibility == EventVisibility.MAIN for event in second.events
+    )
+    assert any(
+        event.visibility == EventVisibility.DETAIL for event in second.events
+    )
+    assert second.notifications == ()
+
+
+def test_load_manager_recovery_returns_to_main_once():
+    manager = LoadManager(LoadManagerConfig(enabled=True))
+    manager.step(_load_observation(owner=None))
+
+    recovered = manager.step(_load_observation(now=1, sample=2))
+    assert any(
+        event.visibility == EventVisibility.MAIN
+        and event.message
+        == "Автоматическое управление некритичными нагрузками восстановлено."
+        for event in recovered.events
+    )
+
+
+def test_load_manager_user_message_uses_ground_floor_name_not_basement():
+    manager = LoadManager(LoadManagerConfig(enabled=True))
+    actions: list[LoadAction] = []
+    manager._queue(
+        _load_observation(),
+        actions,
+        LoadGroup.G2,
+        False,
+        "nominal_overload",
+        "detail",
+    )
+    event, notification = manager.report_execution_failure(
+        actions[0],
+        "test failure",
+    )
+
+    assert "цокольного этажа" in event.message
+    assert "подвал" not in event.message.lower()
+    assert notification == event.message
+    assert "turn_off" not in event.message
+
+
+def test_repeated_pretransfer_problem_does_not_repeat_main_warning():
+    manager = LoadManager(LoadManagerConfig(enabled=True))
+    first = manager.step(
+        _load_observation(
+            on_generator=False,
+            on_grid=True,
+            desired=True,
+            ready=True,
+            g1=None,
+            g2=False,
+        )
+    )
+    second = manager.step(
+        _load_observation(
+            now=1,
+            on_generator=False,
+            on_grid=True,
+            desired=True,
+            ready=True,
+            g1=None,
+            g2=False,
+            sample=2,
+        )
+    )
+
+    assert sum(
+        event.visibility == EventVisibility.MAIN for event in first.events
+    ) == 1
+    assert not any(
+        event.visibility == EventVisibility.MAIN for event in second.events
+    )
 
 
 @pytest.mark.asyncio
