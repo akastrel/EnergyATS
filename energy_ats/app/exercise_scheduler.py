@@ -730,13 +730,12 @@ class ExerciseScheduler:
                     ExerciseWarning(
                         slot=slot,
                         window_date=window_date.isoformat(),
-                        message=(
-                            f"Пробный запуск генератора {o.generator_names[slot]} "
-                            f"состоится {day_word} в {config.start_time}. "
-                            "Это регулярный тестовый пуск для проверки "
-                            "работоспособности генератора. После автоматического "
-                            f"запуска генератор будет автоматически остановлен через "
-                            f"{config.run_minutes} минут."
+                        message=user_message(
+                            "exercise_warning_notification",
+                            generator=o.generator_names[slot],
+                            day_word=day_word,
+                            start_time=config.start_time,
+                            minutes=config.run_minutes,
                         ),
                     )
                 )
@@ -855,7 +854,7 @@ class ExerciseScheduler:
         elif o.family_present is True:
             return "семья находится дома"
         elif o.family_present is None:
-            return "невозможно достоверно определить присутствие семьи"
+            return "отсутствие семьи дома не подтверждено: состояние присутствия неизвестно"
 
         return None
 
