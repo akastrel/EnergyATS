@@ -61,7 +61,7 @@ from ups_run import (
 from power_transfer import PowerTransferController, TransferAction, TransferPhase
 from state_store import StateStore
 
-APP_VERSION = "1.0.7"
+APP_VERSION = "1.0.8"
 STATE_SCHEMA_VERSION = 3
 
 DEFAULT_OPTIONS: dict[str, Any] = {
@@ -1048,6 +1048,15 @@ class EnergySupervisorApp:
         # reconnect поздно: непосредственное сообщение пишется ниже в App log.
         self._ha_deferred_events = list(self.supervisor.take_events())
         self.supervisor.mark_connection_lost()
+
+        # R2/R3: gap наблюдений разрывает доказательство непрерывности. Старые
+        # timestamps Grid stability/failure и FIFO RUNNING history нельзя
+        # продолжать через интервал, в котором HA не наблюдал физические сигналы.
+        # Календарное время UPS Run при этом не сбрасывается.
+        self.supervisor.grid_ready_since = None
+        self.supervisor.grid_failed_since = None
+        self.generator_bus.invalidate_observation_history()
+
         self.power_transfer.mark_interrupted(
             timestamp, "Потеряна связь с Home Assistant."
         )
@@ -1201,8 +1210,10 @@ class EnergySupervisorApp:
         payload = self._status_payload(now, observation, hardware)
         if payload == self._last_status_payload:
             return
-        if await self.adapter.publish_status(payload["state"], payload["attributes"]):
-            self._last_status_payload = payload
+        await self.adapter.publish_status(payload["state"], payload["attributes"])
+        # Это last submitted desired payload. Факт успешной REST delivery хранит
+        # последовательный publisher HomeAssistantAdapter и сам выполняет retry.
+        self._last_status_payload = payload
 
     def _status_payload(
         self,
@@ -1398,6 +1409,10 @@ class EnergySupervisorApp:
 
     def _status_text(self, observation: SupervisorObservation) -> str:
         """Совместить core phase с более точным состоянием UPS Run."""
+        # Safety/Recovery всегда важнее штатного уточнения UPS Run. Иначе
+        # WAITING_ON_UPS маскирует RECOVERY_REQUIRED после E-stop/fault.
+        if self.supervisor.phase == SupervisorPhase.RECOVERY_REQUIRED:
+            return self.supervisor.status_text(observation)
         if self.ups_run.state == UPSRunState.WAITING_ON_UPS:
             return "Питание от UPS"
         return self.supervisor.status_text(observation)
