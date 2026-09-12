@@ -13,6 +13,7 @@ from typing import Mapping
 
 from domain import GeneratorSlot, PowerPath, PowerSource, SupervisorEvent
 from generator_bus import GeneratorBusOwner
+from user_messages import user_event
 
 
 @dataclass(frozen=True)
@@ -73,42 +74,30 @@ class PhysicalEventTracker:
             return ()
 
         events: list[SupervisorEvent] = []
-        self._append_bool_change(
+        self._append_bool_event(
             events,
             previous.grid_ready,
             current.grid_ready,
-            true_message="Входная сеть восстановлена (Grid Input Ready = ON).",
-            false_message="Входная сеть пропала (Grid Input Ready = OFF).",
-            unknown_message="Состояние входной сети стало неизвестно.",
+            true_key="grid_input_on",
+            false_key="grid_input_off",
+            unknown_key="grid_input_unknown",
             false_level="warning",
         )
 
         if previous.automatic_transfer_enabled != current.automatic_transfer_enabled:
             events.append(
-                SupervisorEvent(
-                    "info",
-                    "Автоматический переход на резерв "
-                    + ("разрешён." if current.automatic_transfer_enabled else "отключён."),
+                user_event(
+                    "automatic_transfer_on"
+                    if current.automatic_transfer_enabled
+                    else "automatic_transfer_off"
                 )
             )
 
         if previous.power_path != current.power_path:
-            events.append(
-                SupervisorEvent(
-                    "warning" if current.power_path == PowerPath.UNKNOWN else "info",
-                    self._power_path_message(previous.power_path, current.power_path),
-                )
-            )
+            events.append(self._power_path_event(previous.power_path, current.power_path))
 
         if previous.power_source != current.power_source:
-            events.append(
-                SupervisorEvent(
-                    "warning"
-                    if current.power_source in {PowerSource.NO_POWER, PowerSource.UNKNOWN}
-                    else "info",
-                    self._power_source_message(current.power_source),
-                )
-            )
+            events.append(self._power_source_event(current.power_source, current.power_path))
 
         for slot in (GeneratorSlot.A, GeneratorSlot.B):
             old = previous.generators[slot]
@@ -116,113 +105,120 @@ class PhysicalEventTracker:
             name = generator_names.get(slot, f"Generator {slot.value}")
             managed = slot in managed_slots
 
-            self._append_bool_change(
+            self._append_bool_event(
                 events,
                 old.remote_on,
                 new.remote_on,
-                true_message=f"{name}: REMOTE START включён.",
-                false_message=f"{name}: REMOTE START выключен.",
-                unknown_message=f"{name}: состояние REMOTE START стало неизвестно.",
+                true_key="generator_remote_on",
+                false_key="generator_remote_off",
+                unknown_key="generator_remote_unknown",
+                generator=name,
             )
 
             if old.running is not new.running:
                 if new.running is None:
                     events.append(
-                        SupervisorEvent(
-                            "warning",
-                            f"{name}: состояние RUNNING стало неизвестно.",
+                        user_event(
+                            "generator_running_unknown",
+                            level="warning",
+                            generator=name,
                         )
                     )
                 elif new.running:
-                    qualifier = (
-                        "managed EnergyATS"
-                        if managed
-                        else "внешний/неуправляемый запуск"
-                    )
                     events.append(
-                        SupervisorEvent(
-                            "info",
-                            f"{name}: RUNNING = ON — двигатель запущен ({qualifier}).",
+                        user_event(
+                            "generator_running_managed"
+                            if managed
+                            else "generator_running_external",
+                            generator=name,
                         )
                     )
                 else:
-                    qualifier = (
-                        "managed EnergyATS"
-                        if managed
-                        else "внешняя/неуправляемая остановка"
-                    )
                     events.append(
-                        SupervisorEvent(
-                            "info",
-                            f"{name}: RUNNING = OFF — двигатель остановлен ({qualifier}).",
+                        user_event(
+                            "generator_stopped_managed"
+                            if managed
+                            else "generator_stopped_external",
+                            generator=name,
                         )
                     )
 
         if previous.bus_owner != current.bus_owner:
             events.append(
-                SupervisorEvent(
-                    "warning" if current.bus_owner == GeneratorBusOwner.UNKNOWN else "info",
-                    "Generator bus owner изменился: "
-                    f"{self._owner_text(previous.bus_owner, generator_names)} → "
-                    f"{self._owner_text(current.bus_owner, generator_names)}.",
+                user_event(
+                    "bus_owner_changed",
+                    level=(
+                        "warning"
+                        if current.bus_owner == GeneratorBusOwner.UNKNOWN
+                        else "info"
+                    ),
+                    old=self._owner_text(previous.bus_owner, generator_names),
+                    new=self._owner_text(current.bus_owner, generator_names),
                 )
             )
 
-        self._append_bool_change(
+        self._append_bool_event(
             events,
             previous.emergency_stop,
             current.emergency_stop,
-            true_message="Generators Emergency Stop активирован.",
-            false_message="Generators Emergency Stop снят.",
-            unknown_message="Состояние Generators Emergency Stop стало неизвестно.",
+            true_key="emergency_stop_on",
+            false_key="emergency_stop_off",
+            unknown_key="emergency_stop_unknown",
             true_level="warning",
         )
         return tuple(events)
 
     @staticmethod
-    def _append_bool_change(
+    def _append_bool_event(
         events: list[SupervisorEvent],
         previous: bool | None,
         current: bool | None,
         *,
-        true_message: str,
-        false_message: str,
-        unknown_message: str,
+        true_key: str,
+        false_key: str,
+        unknown_key: str,
         true_level: str = "info",
         false_level: str = "info",
+        **values: object,
     ) -> None:
         if previous is current:
             return
         if current is None:
-            events.append(SupervisorEvent("warning", unknown_message))
+            events.append(user_event(unknown_key, level="warning", **values))
         elif current:
-            events.append(SupervisorEvent(true_level, true_message))
+            events.append(user_event(true_key, level=true_level, **values))
         else:
-            events.append(SupervisorEvent(false_level, false_message))
+            events.append(user_event(false_key, level=false_level, **values))
 
     @staticmethod
-    def _power_path_message(previous: PowerPath, current: PowerPath) -> str:
+    def _power_path_event(previous: PowerPath, current: PowerPath) -> SupervisorEvent:
         if current == PowerPath.GRID:
-            return "Сетевая ветвь дома подключена (Grid path подтверждён)."
+            return user_event("power_path_grid")
         if current == PowerPath.GENERATOR:
-            return "Генераторная ветвь дома подключена (Generator path подтверждён)."
+            return user_event("power_path_generator")
         if current == PowerPath.ISOLATED:
             if previous == PowerPath.GRID:
-                return "Подача входной сети в дом отключена; силовой ввод изолирован."
+                return user_event("power_path_isolated_from_grid")
             if previous == PowerPath.GENERATOR:
-                return "Подача от генераторной шины в дом отключена; силовой ввод изолирован."
-            return "Силовой ввод дома изолирован от Grid и generator bus."
-        return "Положение силовых вводов стало неизвестно."
+                return user_event("power_path_isolated_from_generator")
+            return user_event("power_path_isolated")
+        return user_event("power_path_unknown", level="warning")
 
     @staticmethod
-    def _power_source_message(source: PowerSource) -> str:
-        return {
-            PowerSource.GRID: "Подтверждено: дом питается от входной сети Grid.",
-            PowerSource.GENERATOR: "Подтверждено: дом питается от генераторной шины.",
-            PowerSource.UPS_ONLY: "Подтверждено: силовые вводы сняты; дом в режиме UPS_ONLY.",
-            PowerSource.NO_POWER: "Подтверждено: питание дома отсутствует.",
-            PowerSource.UNKNOWN: "Источник питания дома стал неизвестен.",
-        }[source]
+    def _power_source_event(source: PowerSource, path: PowerPath) -> SupervisorEvent:
+        if source == PowerSource.GRID:
+            return user_event("power_source_grid")
+        if source == PowerSource.GENERATOR:
+            return user_event("power_source_generator")
+        if source == PowerSource.UPS_ONLY:
+            return user_event(
+                "power_source_ups_grid_path"
+                if path == PowerPath.GRID
+                else "power_source_ups_isolated"
+            )
+        if source == PowerSource.NO_POWER:
+            return user_event("power_source_none", level="warning")
+        return user_event("power_source_unknown", level="warning")
 
     @staticmethod
     def _owner_text(
@@ -232,5 +228,5 @@ class PhysicalEventTracker:
         if owner.slot is not None:
             return generator_names.get(owner.slot, f"Generator {owner.slot.value}")
         if owner == GeneratorBusOwner.NONE:
-            return "none"
-        return "unknown"
+            return "нет"
+        return "неизвестен"
