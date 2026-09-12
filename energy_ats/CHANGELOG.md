@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.0.4
+
+Человеко-читаемый причинно-следственный журнал событий без изменения силовой policy EnergyATS.
+
+- Добавлен централизованный каталог пользовательских сообщений со стабильными ключами: `user_messages.py` выбирает язык, русские формулировки вынесены в `user_messages_ru.py`. Это отделяет тексты Logbook/notification от FSM и создаёт основу для будущей локализации.
+- Добавлен `PhysicalEventTracker`, который журналирует реально наблюдаемые изменения Grid, PowerPath/PowerSource, RUNNING/REMOTE обоих генераторов, generator bus owner, automatic transfer и Emergency Stop. Первый snapshot после start/reconnect задаёт baseline и не создаёт ложных событий.
+- Внешний запуск/остановка генератора отличим от managed-запуска EnergyATS; команды и подтверждённые физические изменения больше не смешиваются в одну запись.
+- Manual start/stop/reset, automatic outage start/fallback, return-to-Grid и Recovery получили пользовательские причинные сообщения без внутренних терминов FSM.
+- UPS Run журналирует начало ожидания на UPS, запуск по SoC/TTG/max-delay, отказ от ожидания при недостоверной telemetry, начало automatic charge и достижение целевого уровня заряда.
+- Scheduled Exercise журналирует due/start window, presence defer, forced-warning delivery, подтверждённый RUNNING, выдержанное время, SUCCESS/FAILED и handoff в Manual/Outage.
+- Исправлена семантика `UPS_ONLY` в журнале: отдельно различаются работа UPS при ещё физически подключённом Grid path и подтверждённая изоляция основных вводов.
+- Добавлены regression tests причинного журнала и message catalog; они проверяют последовательности trigger -> decision -> observed result и отсутствие технического жаргона в новых пользовательских сообщениях.
+- README и Home Assistant Documentation синхронизированы с новым журналом.
+- Финальный Python suite перед релизом: `314 passed`; production `addon-container-smoke` также проходит.
+- App и add-on version подняты до `1.0.4`; persistent `schema_version` остаётся `3`, формат persisted state не менялся.
+
+---
+
 ## 1.0.3
 
 Runtime hardening после диагностического review 1.0.1 и исправлений F1–F5 в 1.0.2. Новых пользовательских режимов не добавлено.
