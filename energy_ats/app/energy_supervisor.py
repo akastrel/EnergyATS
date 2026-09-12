@@ -6,7 +6,14 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Mapping
 
-from domain import GeneratorSlot, PowerPath, PowerSource, SessionReason, SupervisorEvent
+from domain import (
+    EventVisibility,
+    GeneratorSlot,
+    PowerPath,
+    PowerSource,
+    SessionReason,
+    SupervisorEvent,
+)
 from generator_bus import GeneratorBusOwner, GeneratorBusStatus
 from generator_controller import GeneratorPhase, GeneratorStatus
 from physical_event_log import PhysicalEventTracker
@@ -202,11 +209,19 @@ class EnergySupervisor:
 
     def request_manual_start(self) -> None:
         self._manual_start_requested = True
-        self._event("info", user_message("manual_start_requested"))
+        self._event(
+            "info",
+            user_message("manual_start_requested"),
+            visibility=EventVisibility.DETAIL,
+        )
 
     def request_manual_stop(self) -> None:
         self._manual_stop_requested = True
-        self._event("info", user_message("manual_stop_requested"))
+        self._event(
+            "info",
+            user_message("manual_stop_requested"),
+            visibility=EventVisibility.DETAIL,
+        )
 
     def request_cycle_stop(self) -> None:
         """Compatibility entry point; normal tick passes the UPS Run intent directly."""
@@ -225,7 +240,11 @@ class EnergySupervisor:
 
     def request_recovery_reset(self) -> None:
         self._recovery_reset_requested = True
-        self._event("info", user_message("recovery_reset_requested"))
+        self._event(
+            "info",
+            user_message("recovery_reset_requested"),
+            visibility=EventVisibility.DETAIL,
+        )
 
     @property
     def has_pending_session_request(self) -> bool:
@@ -372,7 +391,11 @@ class EnergySupervisor:
         self._recovery_reset_active = True
         self.desired_source = PowerSource.GRID
         self.desired_generators = _stopped_generators()
-        self._event("info", user_message("recovery_started"))
+        self._event(
+            "info",
+            user_message("recovery_started"),
+            visibility=EventVisibility.DETAIL,
+        )
 
     def reject_recovery_reset(self, message: str) -> None:
         self._event("warning", message)
@@ -1415,8 +1438,14 @@ class EnergySupervisor:
         self._manual_stop_requested = False
         self._cycle_stop_requested = False
 
-    def _event(self, level: str, message: str) -> None:
-        self._events.append(SupervisorEvent(level, message))
+    def _event(
+        self,
+        level: str,
+        message: str,
+        *,
+        visibility: EventVisibility = EventVisibility.MAIN,
+    ) -> None:
+        self._events.append(SupervisorEvent(level, message, visibility))
 
 
 def _generator_failed(status: GeneratorStatus) -> bool:
