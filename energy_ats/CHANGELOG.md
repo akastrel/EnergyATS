@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.0.5
+
+Разделение пользовательского журнала на MAIN/DETAIL и cleanup событий без изменения силовой policy EnergyATS.
+
+- Добавлен независимый `EventVisibility.MAIN/DETAIL`; severity (`info/warning/critical`) остаётся отдельным признаком.
+- Home Assistant Logbook разделён на основной журнал существенных событий и подробный диагностический журнал.
+- Scheduled Exercise сокращён в MAIN: промежуточные `due`, start window, warning delivery и duration-complete перенесены в DETAIL; фактический старт, defer/handoff и итог остаются MAIN.
+- Устранён двойной MAIN при достижении Target SoC в UPS Run / Charge Cycling.
+- Load Manager очищен от реализационного жаргона в пользовательских сообщениях; команды, thresholds, samples и технические причины остаются DETAIL, а в MAIN остаются подтверждённые существенные результаты и ошибки.
+- Для Load Manager G1 называется «некритичные нагрузки 1-го этажа», G2 — «некритичные нагрузки цокольного этажа».
+- Повтор одной и той же деградации Load Manager не создаёт повторный MAIN/notification; изменение технической причины остаётся в DETAIL.
+- Добавлены regression tests MAIN/DETAIL routing, Exercise visibility, Target SoC deduplication и Load Manager messages/recovery.
+- App и add-on version подняты до `1.0.5`; persistent `schema_version` остаётся `3`, формат persisted state не менялся.
+
+---
+
 ## 1.0.4
 
 Человеко-читаемый причинно-следственный журнал событий без изменения силовой policy EnergyATS.
