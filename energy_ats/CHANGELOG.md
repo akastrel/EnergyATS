@@ -16,6 +16,8 @@
 - В русских пользовательских сообщениях система называется «АВР», а значения SoC выводятся целыми процентами без лишнего `.0`.
 - M4-B и M6 записаны как PASS. M6 физически подтвердил цепочку `Delayed Start -> Start SoC -> отказ PRIMARY -> fallback на SECONDARY`.
 - Добавлен сквозной regression test отказа PRIMARY после запуска по SoC и успешного перехода на SECONDARY в той же UPS Run session.
+- Перезапуск или временная недоступность Home Assistant теперь учитывается как один интервал: повторные reconnect/HTTP 502 не создают дублирующиеся аварии, уже существующий `RECOVERY_REQUIRED` не выдаётся за следствие потери HA, а после восстановления публикуется одна сводка с длительностью и числом попыток.
+- Добавлены regression tests для `NORMAL`, стабильной работы от генератора, уже существующего Recovery и потери HA во время незавершённой операции Supervisor/TPC; Python suite: `338 passed`, `addon-container-smoke` проходит.
 - App и add-on version подняты до `1.0.7`; persistent `schema_version` остаётся `3`, формат persisted state не менялся.
 
 ---
@@ -57,7 +59,7 @@
 - Добавлен `PhysicalEventTracker`, который журналирует реально наблюдаемые изменения Grid, PowerPath/PowerSource, RUNNING/REMOTE обоих генераторов, generator bus owner, automatic transfer и Emergency Stop. Первый snapshot после start/reconnect задаёт baseline и не создаёт ложных событий.
 - Внешний запуск/остановка генератора отличим от managed-запуска EnergyATS; команды и подтверждённые физические изменения больше не смешиваются в одну запись.
 - Manual start/stop/reset, automatic outage start/fallback, return-to-Grid и Recovery получили пользовательские причинные сообщения без внутренних терминов FSM.
-- UPS Run журналирует начало ожидания на UPS, запуск по SoC/TTG/max-delay, отказ от ожидания при недостоверной telemetry, начало automatic charge и достижение целевого уровня заряда.
+- UPS Run журналирует начало ожидания на UPS, запуск по SoC/TTG/max-delay, отказ от ожидания при недостоверной/критической батарее, начало automatic charge и достижение целевого уровня заряда.
 - Scheduled Exercise журналирует due/start window, presence defer, forced-warning delivery, подтверждённый RUNNING, выдержанное время, SUCCESS/FAILED и handoff в Manual/Outage.
 - Исправлена семантика `UPS_ONLY` в журнале: отдельно различаются работа UPS при ещё физически подключённом Grid path и подтверждённая изоляция основных вводов.
 - Добавлены regression tests причинного журнала и message catalog; они проверяют последовательности trigger -> decision -> observed result и отсутствие технического жаргона в новых пользовательских сообщениях.
