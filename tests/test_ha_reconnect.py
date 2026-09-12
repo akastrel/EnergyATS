@@ -79,7 +79,7 @@ async def test_ha_restart_is_one_outage_without_false_critical(
     message = published[0].message
     assert "восстановлена после 20 с" in message
     assert "Попыток переподключения: 3" in message
-    assert "получено 2 состояний" in message
+    assert "загружено состояний HA: 2" in message
     assert "HTTP 502" in message
     if phase == SupervisorPhase.RECOVERY_REQUIRED:
         assert "существовало до потери связи" in message
