@@ -45,7 +45,15 @@ class SessionReason(str, Enum):
     GRID_OUTAGE = "grid_outage"
 
 
+class EventVisibility(str, Enum):
+    """Уровень детализации пользовательского журнала события."""
+
+    MAIN = "main"
+    DETAIL = "detail"
+
+
 @dataclass(frozen=True)
 class SupervisorEvent:
     level: str
     message: str
+    visibility: EventVisibility = EventVisibility.MAIN
