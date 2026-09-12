@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.0.8
+
+Production hardening по результатам повторного review версии 1.0.7. Новых пользовательских режимов и новых архитектурных слоёв не добавлено; исправлены шесть воспроизведённых дефектов R1–R6.
+
+- **R1 / Recovery:** Recovery при всё ещё выбранной generator-ветви и исчезнувшем generator feedback использует тот же безопасный break/`DESELECT_GENERATOR`, что обычный transfer. Принятый Recovery Reset больше не может бесконечно ждать неподтверждённую физическую операцию: каждый шаг имеет конечный timeout и при отказе остаётся в `RECOVERY_REQUIRED`.
+- **R2 / Grid continuity:** потеря наблюдения Home Assistant/reconnect разрывает доказанную непрерывность Grid. `grid_failure_delay` и `grid_restore_stable_time` после observation gap отсчитываются заново от валидных observations; wall-clock время внутри разрыва не считается доказательством стабильности.
+- **R3 / Generator bus FIFO:** persisted owner/run-context больше не считается доказанной непрерывной FIFO-историей через restart/gap. Если после разрыва оба generator уже RUNNING и порядок их запуска нельзя наблюдаемо доказать, owner остаётся `UNKNOWN`; persisted данные используются только как совместимый journal payload/диагностика.
+- **R4 / Status priority:** `RECOVERY_REQUIRED` имеет приоритет в основном пользовательском status над штатными локальными labels UPS Run/Exercise/Load Manager и больше не может отображаться как обычное «Питание от UPS».
+- **R5 / Status delivery:** `sensor.energy_ats_status` переведён на один последовательный latest-wins publisher с retry. Старый медленный REST write больше не может завершиться после нового аварийного состояния и затереть его; при временной ошибке доставляется последнее актуальное desired state.
+- **R6 / Load Manager:** frozen generator-power sample не считается восстановлением measurement stream. Recovery начинается только с новой revision/sample, затем обязательно проходит новый stabilization window; событие «восстановлено» публикуется только после успешного завершения этого окна, старые overload/admission timers не продолжаются.
+- `REQUIREMENTS_RU.md` синхронизирован с R1–R6: устранено противоречие `REQ-BUS-06/07`, уточнены Grid observation continuity, Recovery deadlines, status priority/latest-wins и meter recovery; обновлены `TC-CORE-14`, `TC-LOAD-25`, добавлены `TC-CORE-26/27` и `TC-OBS-01/02`.
+- Добавлен отдельный `tests/test_review_regressions_1_0_7.py` с человеко-читаемыми regression-сценариями R1–R6. Старые тесты, защищавшие небезопасную семантику persisted FIFO-owner и мгновенного meter recovery, скорректированы по требованиям.
+- Финальный Python suite перед release housekeeping: `347 passed`; production `addon-container-smoke` также проходит.
+- App и add-on version подняты до `1.0.8`; persistent `schema_version` остаётся `3`, формат persisted payload не расширялся.
+
+---
+
 ## 1.0.7
 
 Небольшие уточнения пользовательского состояния по результатам физических тестов M4, M5 и M6 без изменения силовой policy EnergyATS.
