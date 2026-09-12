@@ -2,7 +2,7 @@
 
 Home Assistant App для управления резервным электроснабжением дома с двумя генераторами, общей генераторной шиной, UPS-линией и подтверждаемой коммутацией Grid / Generator.
 
-Текущая версия: **1.0.3**. Статус add-on: `experimental` — программная модель и автоматические проверки стабильны, но окончательный ввод конкретной установки требует физических commissioning-тестов.
+Текущая версия: **1.0.4**. Статус add-on: `experimental` — программная модель и автоматические проверки стабильны, но окончательный ввод конкретной установки требует физических commissioning-тестов.
 
 ## Что умеет EnergyATS
 
@@ -17,6 +17,7 @@ Home Assistant App для управления резервным электро
 - **Load Manager** для двух некритичных групп G1/G2 с pre-transfer shedding, последовательным admission и continuous overload control;
 - Recovery при неоднозначном физическом состоянии или незавершённой hardware transaction;
 - persisted session/bus/exercise/load/UPS Run state;
+- причинно-следственный Logbook: trigger -> решение -> аппаратная команда -> подтверждённое физическое состояние;
 - диагностический `sensor.energy_ats_status`, Logbook и notifications.
 
 Все дополнительные функции — UPS Run, Scheduled Exercise и Load Manager — не создают отдельного центра принятия решений. Системный конфликт Manual / Outage / Exercise / Recovery разрешает только `EnergySupervisor`.
@@ -54,11 +55,28 @@ HomeAssistantAdapter      HA observations, hardware actions, background diagnost
 main.py                   composition/runtime dispatch, без второго policy layer
 ```
 
-В 1.0.3 Recovery arbitration окончательно находится в `EnergySupervisor`: Supervisor решает, можно ли выполнять reset, какие owned generators допустимо остановить и задаёт порядок `Grid path -> owned shutdown -> complete`. `main.py` только исполняет директивы TPC/GC.
+В 1.0.3 Recovery arbitration окончательно перенесён в `EnergySupervisor`: Supervisor решает, можно ли выполнять reset, какие owned generators допустимо остановить и задаёт порядок `Grid path -> owned shutdown -> complete`. `main.py` только исполняет директивы TPC/GC.
 
 Обычные status/Logbook/user publications выполняются best-effort вне критического control path и не должны задерживать аппаратную FSM на сетевой timeout. Исключение — предупреждение перед forced Scheduled Exercise: его доставка является safety prerequisite и подтверждается синхронно.
 
 Подробно: [`docs/ARCHITECTURE_RU.md`](docs/ARCHITECTURE_RU.md).
+
+## Причинный журнал событий
+
+Начиная с 1.0.4 Logbook предназначен не только для фиксации команд, но и для восстановления причинно-следственной цепочки события через месяцы после его возникновения.
+
+Для ключевых сценариев журнал различает:
+
+```text
+что изменилось физически
+  -> почему EnergyATS принял решение
+  -> какое действие было начато
+  -> какой feedback подтвердил результат
+```
+
+Отдельно журналируются потеря/возврат Grid, ручные команды, переходы UPS Run, Scheduled Exercise, Recovery, изменения RUNNING/REMOTE, PowerPath/PowerSource, generator bus owner и Emergency Stop. Первый snapshot после start/reconnect считается baseline и не создаёт ложных событий.
+
+Внешний запуск генератора явно отличается от запуска, которым управляет EnergyATS. Пользовательские причинные сообщения формируются через стабильные message keys и русский каталог `energy_ats/app/user_messages_ru.py`; control logic не зависит от конкретной русской формулировки.
 
 ## UPS Run
 
@@ -177,6 +195,6 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-Для 1.0.3 полный Python suite: **288 passed**. CI также собирает реальный add-on Docker image и внутри него выполняет production smoke через локальный test Home Assistant WebSocket/REST endpoint.
+Для 1.0.4 полный Python suite: **314 passed**. CI также собирает реальный add-on Docker image и внутри него выполняет production smoke через локальный test Home Assistant WebSocket/REST endpoint.
 
 Зелёный CI подтверждает программную модель и production packaging, но не заменяет commissioning на реальных генераторах, контакторах, DKG116, MAP, meter и G1/G2.
