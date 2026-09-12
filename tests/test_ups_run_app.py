@@ -103,6 +103,7 @@ async def test_78_wait_on_ups_has_no_hardware_commands(tmp_path):
     app, fake = setup(tmp_path)
     await wait_on_ups(app, fake)
     assert not switch_calls(fake)
+    assert fake.state_writes[-1][1] == "Питание от UPS"
     attrs = fake.state_writes[-1][2]
     assert attrs["source"] == "ups_only"
     assert attrs["delayed_start_elapsed_seconds"] == 0

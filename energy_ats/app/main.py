@@ -61,7 +61,7 @@ from ups_run import (
 from power_transfer import PowerTransferController, TransferAction, TransferPhase
 from state_store import StateStore
 
-APP_VERSION = "1.0.6"
+APP_VERSION = "1.0.7"
 STATE_SCHEMA_VERSION = 3
 
 DEFAULT_OPTIONS: dict[str, Any] = {
@@ -1143,7 +1143,7 @@ class EnergySupervisorApp:
         )
         return {
             "state": (
-                self.supervisor.status_text(observation)
+                self._status_text(observation)
                 if self.armed
                 else "DISARMED — только наблюдение"
             ),
@@ -1241,7 +1241,7 @@ class EnergySupervisorApp:
 
     def _log_runtime_if_changed(self, observation: SupervisorObservation) -> None:
         status = (
-            self.supervisor.status_text(observation)
+            self._status_text(observation)
             if self.armed
             else "DISARMED — только наблюдение"
         )
@@ -1285,6 +1285,12 @@ class EnergySupervisorApp:
         if signature != self._last_runtime_signature:
             self._last_runtime_signature = signature
             self.log.info("%s.", "; ".join(parts))
+
+    def _status_text(self, observation: SupervisorObservation) -> str:
+        """Совместить core phase с более точным состоянием UPS Run."""
+        if self.ups_run.state == UPSRunState.WAITING_ON_UPS:
+            return "Питание от UPS"
+        return self.supervisor.status_text(observation)
 
     # Process helpers -------------------------------------------------
 
