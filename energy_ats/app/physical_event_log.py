@@ -11,7 +11,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping
 
-from domain import GeneratorSlot, PowerPath, PowerSource, SupervisorEvent
+from domain import (
+    EventVisibility,
+    GeneratorSlot,
+    PowerPath,
+    PowerSource,
+    SupervisorEvent,
+)
 from generator_bus import GeneratorBusOwner
 from user_messages import user_event
 
@@ -113,6 +119,7 @@ class PhysicalEventTracker:
                 false_key="generator_remote_off",
                 unknown_key="generator_remote_unknown",
                 generator=name,
+                visibility=EventVisibility.DETAIL,
             )
 
             if old.running is not new.running:
@@ -152,6 +159,7 @@ class PhysicalEventTracker:
                         if current.bus_owner == GeneratorBusOwner.UNKNOWN
                         else "info"
                     ),
+                    visibility=EventVisibility.DETAIL,
                     old=self._owner_text(previous.bus_owner, generator_names),
                     new=self._owner_text(current.bus_owner, generator_names),
                 )
@@ -179,46 +187,93 @@ class PhysicalEventTracker:
         unknown_key: str,
         true_level: str = "info",
         false_level: str = "info",
+        visibility: EventVisibility = EventVisibility.MAIN,
         **values: object,
     ) -> None:
         if previous is current:
             return
         if current is None:
-            events.append(user_event(unknown_key, level="warning", **values))
+            events.append(
+                user_event(
+                    unknown_key,
+                    level="warning",
+                    visibility=visibility,
+                    **values,
+                )
+            )
         elif current:
-            events.append(user_event(true_key, level=true_level, **values))
+            events.append(
+                user_event(
+                    true_key,
+                    level=true_level,
+                    visibility=visibility,
+                    **values,
+                )
+            )
         else:
-            events.append(user_event(false_key, level=false_level, **values))
+            events.append(
+                user_event(
+                    false_key,
+                    level=false_level,
+                    visibility=visibility,
+                    **values,
+                )
+            )
 
     @staticmethod
     def _power_path_event(previous: PowerPath, current: PowerPath) -> SupervisorEvent:
         if current == PowerPath.GRID:
-            return user_event("power_path_grid")
+            return user_event("power_path_grid", visibility=EventVisibility.DETAIL)
         if current == PowerPath.GENERATOR:
-            return user_event("power_path_generator")
+            return user_event("power_path_generator", visibility=EventVisibility.DETAIL)
         if current == PowerPath.ISOLATED:
             if previous == PowerPath.GRID:
-                return user_event("power_path_isolated_from_grid")
+                return user_event(
+                    "power_path_isolated_from_grid",
+                    visibility=EventVisibility.DETAIL,
+                )
             if previous == PowerPath.GENERATOR:
-                return user_event("power_path_isolated_from_generator")
-            return user_event("power_path_isolated")
-        return user_event("power_path_unknown", level="warning")
+                return user_event(
+                    "power_path_isolated_from_generator",
+                    visibility=EventVisibility.DETAIL,
+                )
+            return user_event(
+                "power_path_isolated",
+                visibility=EventVisibility.DETAIL,
+            )
+        return user_event(
+            "power_path_unknown",
+            level="warning",
+            visibility=EventVisibility.DETAIL,
+        )
 
     @staticmethod
     def _power_source_event(source: PowerSource, path: PowerPath) -> SupervisorEvent:
         if source == PowerSource.GRID:
-            return user_event("power_source_grid")
+            return user_event("power_source_grid", visibility=EventVisibility.DETAIL)
         if source == PowerSource.GENERATOR:
-            return user_event("power_source_generator")
+            return user_event(
+                "power_source_generator",
+                visibility=EventVisibility.DETAIL,
+            )
         if source == PowerSource.UPS_ONLY:
             return user_event(
                 "power_source_ups_grid_path"
                 if path == PowerPath.GRID
-                else "power_source_ups_isolated"
+                else "power_source_ups_isolated",
+                visibility=EventVisibility.DETAIL,
             )
         if source == PowerSource.NO_POWER:
-            return user_event("power_source_none", level="warning")
-        return user_event("power_source_unknown", level="warning")
+            return user_event(
+                "power_source_none",
+                level="warning",
+                visibility=EventVisibility.DETAIL,
+            )
+        return user_event(
+            "power_source_unknown",
+            level="warning",
+            visibility=EventVisibility.DETAIL,
+        )
 
     @staticmethod
     def _owner_text(
