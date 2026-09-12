@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from domain import SupervisorEvent
+from domain import EventVisibility, SupervisorEvent
 from user_messages_ru import RU_MESSAGES
 
 
@@ -33,11 +33,16 @@ def user_event(
     key: str,
     *,
     level: str = "info",
+    visibility: EventVisibility = EventVisibility.MAIN,
     language: str = DEFAULT_LANGUAGE,
     **values: Any,
 ) -> SupervisorEvent:
     """Создать SupervisorEvent из локализованного пользовательского сообщения."""
-    return SupervisorEvent(level, user_message(key, language=language, **values))
+    return SupervisorEvent(
+        level=level,
+        message=user_message(key, language=language, **values),
+        visibility=visibility,
+    )
 
 
 def message_catalog(language: str = DEFAULT_LANGUAGE) -> dict[str, str]:
