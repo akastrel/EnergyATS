@@ -61,7 +61,7 @@ from ups_run import (
 from power_transfer import PowerTransferController, TransferAction, TransferPhase
 from state_store import StateStore
 
-APP_VERSION = "1.0.5"
+APP_VERSION = "1.0.6"
 STATE_SCHEMA_VERSION = 3
 
 DEFAULT_OPTIONS: dict[str, Any] = {
@@ -1077,7 +1077,6 @@ class EnergySupervisorApp:
         events: tuple[SupervisorEvent, ...],
     ) -> None:
         observation = self._supervisor_observation(hardware)
-        self._log_events(events)
         await self.adapter.publish_events(events)
         self._log_runtime_if_changed(observation)
         await self._publish_status(now, observation, hardware)
@@ -1286,15 +1285,6 @@ class EnergySupervisorApp:
         if signature != self._last_runtime_signature:
             self._last_runtime_signature = signature
             self.log.info("%s.", "; ".join(parts))
-
-    def _log_events(self, events: tuple[SupervisorEvent, ...]) -> None:
-        methods = {
-            "info": self.log.info,
-            "warning": self.log.warning,
-            "critical": self.log.critical,
-        }
-        for event in events:
-            methods.get(event.level, self.log.info)("%s", event.message)
 
     # Process helpers -------------------------------------------------
 

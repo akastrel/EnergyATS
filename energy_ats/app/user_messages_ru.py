@@ -215,13 +215,13 @@ RU_MESSAGES: dict[str, str] = {
     "generator_remote_off": "Подтверждено: {generator} REMOTE START = OFF.",
     "generator_remote_unknown": "{generator}: состояние REMOTE START стало неизвестно.",
     "generator_running_managed": (
-        "{generator}: двигатель фактически запущен. Запуск управляется EnergyATS."
+        "Генератор {generator} запущен. Запуск управляется АВР."
     ),
     "generator_running_external": (
         "{generator}: обнаружен внешний запуск двигателя. EnergyATS не принимает "
         "этот запуск под управление."
     ),
-    "generator_stopped_managed": "{generator}: двигатель фактически остановлен.",
+    "generator_stopped_managed": "Генератор {generator} остановлен.",
     "generator_stopped_external": "{generator}: внешний генератор остановился.",
     "generator_running_unknown": "{generator}: состояние RUNNING стало неизвестно.",
     "bus_owner_changed": (

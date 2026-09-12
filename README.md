@@ -78,6 +78,8 @@ main.py                   composition/runtime dispatch, без второго po
 
 Внешний запуск генератора явно отличается от запуска, которым управляет EnergyATS. Пользовательские причинные сообщения формируются через стабильные message keys и русский каталог `energy_ats/app/user_messages_ru.py`; control logic не зависит от конкретной русской формулировки.
 
+App log является полным последовательным журналом и содержит основные и диагностические события, аппаратные команды и отправляемые пользовательские сообщения. Основной поток Home Assistant Logbook намеренно короче: в него публикуются только существенные MAIN events.
+
 ## UPS Run
 
 UPS Run — стратегия работы при длительном отсутствии Grid. В неё входят две независимые opt-in функции:
@@ -95,7 +97,7 @@ OR UPS wait >= generator_max_start_delay
 
 Недостоверная или stale battery telemetry отменяет экономию топлива и приводит к обычному безопасному generator start. Manual request имеет приоритет. Stable Grid имеет приоритет над Target SoC.
 
-Нормативное поведение и все параметры находятся в [`docs/REQUIREMENTS_RU.md`](docs/REQUIREMENTS_RU.md), HA entities — в [`docs/ENTITIES_RU.md`](docs/ENTITIES_RU.md), физические проверки — в [`docs/USER_TESTS_RU.md`](docs/USER_TESTS_RU.md). Отдельного feature-документа для Delayed Start больше нет, чтобы не поддерживать вторую копию тех же правил.
+Нормативное поведение и все параметры находятся в [`docs/REQUIREMENTS_RU.md`](docs/REQUIREMENTS_RU.md), HA entities — в [`docs/ENTITIES_RU.md`](docs/ENTITIES_RU.md), физические проверки — в [`docs/USER_TESTS_RU.md`](docs/USER_TESTS_RU.md), их результаты — в [`docs/USER_TEST_RESULTS_RU.md`](docs/USER_TEST_RESULTS_RU.md). Отдельного feature-документа для Delayed Start больше нет, чтобы не поддерживать вторую копию тех же правил.
 
 ## Scheduled Exercise
 

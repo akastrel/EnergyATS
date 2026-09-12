@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.0.6
+
+Исправления журнала по результатам физического теста M2 без изменения силовой policy EnergyATS.
+
+- App log закреплён как полный последовательный журнал: в него попадают MAIN/DETAIL events, команды Generator Controller, Power Transfer и Load Manager, а также отправляемое предупреждение Scheduled Exercise.
+- В основной Home Assistant Logbook публикуются только существенные MAIN events; искусственная привязка DETAIL к `sensor.energy_ats_activity_detail` удалена.
+- Сообщения о managed RUNNING/STOP сформулированы естественнее: «Генератор Elemax запущен. Запуск управляется АВР.» и «Генератор Elemax остановлен.».
+- Добавлен журнал результатов физического commissioning; M2 отмечен как успешно пройденный с некритичными замечаниями.
+- Добавлены regression tests полноты App log и фильтрации HA Logbook.
+- App и add-on version подняты до `1.0.6`; persistent `schema_version` остаётся `3`, формат persisted state не менялся.
+
+---
+
 ## 1.0.5
 
 Разделение пользовательского журнала на MAIN/DETAIL и cleanup событий без изменения силовой policy EnergyATS.

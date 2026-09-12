@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from ha_adapter import HomeAssistantAdapter
@@ -64,13 +66,16 @@ def test_presence_entity_never_blocks_core_ats_readiness():
 
 
 @pytest.mark.asyncio
-async def test_forced_warning_delivery_uses_existing_notification_script():
+async def test_forced_warning_delivery_uses_existing_notification_script(caplog):
     fake = FakeClient()
-    adapter = HomeAssistantAdapter(fake, armed=True)
+    logger = logging.getLogger("test.exercise-warning-log")
+    adapter = HomeAssistantAdapter(fake, armed=True, logger=logger)
 
-    delivered = await adapter.publish_user_notification("Пробный запуск в 15:00")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        delivered = await adapter.publish_user_notification("Пробный запуск в 15:00")
 
     assert delivered is True
+    assert "Пробный запуск в 15:00" in caplog.messages
     assert fake.calls == [
         (
             "script",

@@ -384,6 +384,8 @@ script.notify_critical
 
 Load Manager warnings и другие обычные user notifications могут использовать тот же script.
 
+App log является полным журналом и содержит MAIN/DETAIL events, аппаратные команды и отправляемые сообщения. В основной поток Home Assistant Logbook публикуются только MAIN events; отдельной DETAIL-сущности нет.
+
 В 1.0.3 обычные status/Logbook/user publications выполняются best-effort background tasks и не должны задерживать control tick на сетевой timeout. При reconnect незавершённые background publications отменяются.
 
 Исключение — предупреждение перед forced Scheduled Exercise. Оно отправляется синхронно, потому что Scheduler не имеет права считать warning доставленным до успешного ответа Home Assistant.
