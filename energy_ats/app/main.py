@@ -164,6 +164,13 @@ class EnergySupervisorApp:
         self._last_runtime_signature: tuple[str, ...] | None = None
         self._last_generator_config_signature: tuple[Any, ...] | None = None
         self._last_status_payload: dict[str, Any] | None = None
+        # Один интервал недоступности HA должен давать одно safety-событие,
+        # независимо от числа последующих reconnect attempts.
+        self._ha_outage_started_at: float | None = None
+        self._ha_reconnect_failures = 0
+        self._ha_outage_saw_http_502 = False
+        self._ha_outage_preexisting_recovery = False
+        self._ha_deferred_events: list[SupervisorEvent] = []
         self.stop_event = asyncio.Event()
         self.commands_ready = False
 
@@ -236,6 +243,7 @@ class EnergySupervisorApp:
                 if self.stop_event.is_set():
                     break
                 self._sync_generator_configuration(self.adapter.snapshot())
+                await self._record_connection_restored()
                 self.commands_ready = True
                 while not self.stop_event.is_set():
                     if not self.client.connected.is_set():
@@ -246,11 +254,9 @@ class EnergySupervisorApp:
                 raise
             except Exception as exc:
                 if not self.stop_event.is_set():
-                    self._record_interrupted_connection(exc)
-                    self.log.error(
-                        "Рабочий цикл прерван: %s. Переподключение через %.0f с.",
+                    self._record_interrupted_connection(
                         exc,
-                        reconnect_delay,
+                        connection_was_ready=self.commands_ready,
                     )
             finally:
                 self.commands_ready = False
@@ -989,17 +995,118 @@ class EnergySupervisorApp:
         self.state_store.save(payload)
         self._saved_state_signature = signature
 
-    def _record_interrupted_connection(self, exc: Exception) -> None:
-        self.supervisor.mark_connection_lost()
-        self.power_transfer.mark_interrupted(
-            time.time(), "Потеряна связь с Home Assistant."
-        )
-        self._save_state(force=True)
-        if self.supervisor.phase == SupervisorPhase.RECOVERY_REQUIRED:
-            self.log.critical(
-                "Связь потеряна во время физической операции; управление заблокировано: %s",
+    def _record_interrupted_connection(
+        self,
+        exc: Exception,
+        *,
+        connection_was_ready: bool,
+        now: float | None = None,
+    ) -> None:
+        """Зафиксировать границу одного интервала недоступности Home Assistant."""
+        timestamp = time.time() if now is None else now
+
+        if self._ha_outage_started_at is not None:
+            self._ha_reconnect_failures += 1
+            self._ha_outage_saw_http_502 |= "502" in str(exc)
+            self.log.debug(
+                "Попытка переподключения к Home Assistant не удалась (%d): %s",
+                self._ha_reconnect_failures,
                 exc,
             )
+            return
+
+        # Ошибка до готовности первого рабочего соединения — это не «потеря»
+        # ранее установленной связи и не повод менять доменное состояние АВР.
+        if not connection_was_ready:
+            self.log.error(
+                "Не удалось установить рабочее соединение с Home Assistant: %s",
+                exc,
+            )
+            return
+
+        phase_before = self.supervisor.phase
+        transfer_was_in_progress = self.power_transfer.transition_in_progress
+        interrupted_physical_operation = (
+            phase_before
+            in {
+                SupervisorPhase.STARTING_GENERATOR,
+                SupervisorPhase.RETURNING_TO_GRID,
+                SupervisorPhase.RETURNING_TO_UPS,
+            }
+            or transfer_was_in_progress
+        )
+
+        self._ha_outage_started_at = timestamp
+        self._ha_reconnect_failures = 0
+        self._ha_outage_saw_http_502 = "502" in str(exc)
+        self._ha_outage_preexisting_recovery = (
+            phase_before == SupervisorPhase.RECOVERY_REQUIRED
+        )
+
+        # Если исключение возникло после формирования событий текущего tick,
+        # не теряем их. Connection-loss event самого Supervisor публиковать после
+        # reconnect поздно: непосредственное сообщение пишется ниже в App log.
+        self._ha_deferred_events = list(self.supervisor.take_events())
+        self.supervisor.mark_connection_lost()
+        self.power_transfer.mark_interrupted(
+            timestamp, "Потеряна связь с Home Assistant."
+        )
+        generated = list(self.supervisor.take_events())
+        if generated:
+            generated = generated[1:]
+        self._ha_deferred_events.extend(generated)
+        self._save_state(force=True)
+
+        if interrupted_physical_operation:
+            self.log.critical(
+                "Связь с Home Assistant потеряна во время незавершённой физической "
+                "операции; управление АВР заблокировано до восстановления связи: %s",
+                exc,
+            )
+        else:
+            self.log.warning(
+                "Home Assistant недоступен: %s. Управляющие команды АВР временно "
+                "заблокированы.",
+                exc,
+            )
+
+    async def _record_connection_restored(self, *, now: float | None = None) -> None:
+        """Завершить интервал недоступности одним сводным пользовательским событием."""
+        if self._ha_outage_started_at is None:
+            return
+
+        timestamp = time.time() if now is None else now
+        duration = max(0, int(round(timestamp - self._ha_outage_started_at)))
+        reconnect_attempts = self._ha_reconnect_failures + 1
+        state_count = len(getattr(self.client, "states", {}))
+
+        parts = [
+            f"Связь с Home Assistant восстановлена после {duration} с.",
+            (
+                f"Попыток переподключения: {reconnect_attempts}; "
+                f"загружено состояний HA: {state_count}."
+            ),
+            "Физические состояния оборудования перечитаны.",
+        ]
+        if self._ha_outage_saw_http_502:
+            parts.append(
+                "Во время недоступности Home Assistant Core возвращал HTTP 502."
+            )
+        if self._ha_outage_preexisting_recovery:
+            parts.append(
+                "Состояние «Требуется восстановление» существовало до потери связи "
+                "и не было вызвано этим отключением."
+            )
+
+        events = tuple(
+            (*self._ha_deferred_events, SupervisorEvent("info", " ".join(parts)))
+        )
+        self._ha_outage_started_at = None
+        self._ha_reconnect_failures = 0
+        self._ha_outage_saw_http_502 = False
+        self._ha_outage_preexisting_recovery = False
+        self._ha_deferred_events = []
+        await self.adapter.publish_events(events)
 
     def _supervisor_config(self, primary: GeneratorSlot) -> SupervisorConfig:
         return SupervisorConfig(
