@@ -1,4 +1,4 @@
-# Energy ATS 1.0.3
+# Energy ATS 1.0.4
 
 Home Assistant App для управления резервным электроснабжением дома с двумя генераторами, общей generator bus и отдельной UPS-линией через МАП.
 
@@ -13,6 +13,7 @@ Home Assistant App для управления резервным электро
 - **Scheduled Exercise** для периодических пробных запусков A/B;
 - **Load Manager** для двух некритичных групп G1/G2;
 - Recovery при неоднозначном физическом состоянии;
+- причинно-следственный Logbook с отдельными trigger/action/feedback/result событиями;
 - persistent state и диагностический `sensor.energy_ats_status`.
 
 ## Важно перед включением ARMED
@@ -60,6 +61,21 @@ G2 = switch.non_critical_loads_basement_floor
 
 Load Manager снимает некритичные нагрузки перед generator transfer, возвращает их по одной при достаточном запасе мощности и выполняет shedding при устойчивой перегрузке. Meter/G1/G2/power metadata являются soft dependencies: их отказ не должен ломать core ATS.
 
+## Причинный Logbook
+
+В 1.0.4 журнал разделяет причину, команду и реально наблюдённый результат. Для ключевых сценариев можно восстановить последовательность:
+
+```text
+изменение входного/physical signal
+  -> решение EnergyATS
+  -> аппаратное действие
+  -> подтверждённый feedback
+```
+
+Отдельно фиксируются Grid, PowerPath/PowerSource, RUNNING/REMOTE обоих генераторов, generator bus owner, Emergency Stop, manual commands, UPS Run, Scheduled Exercise и Recovery. Первый snapshot после start/reconnect используется только как baseline и не создаёт ложных событий.
+
+Внешний запуск генератора отличим от managed-запуска EnergyATS. Новые причинные пользовательские тексты формируются через стабильные message keys и русский каталог `app/user_messages_ru.py`, поэтому формулировки можно локализовать без изменения FSM.
+
 ## Управление
 
 Поддерживаются команды App:
@@ -94,4 +110,4 @@ sensor.energy_ats_status
 - [Физические тесты](https://github.com/akastrel/EnergyATS/blob/main/docs/USER_TESTS_RU.md)
 - [Changelog](https://github.com/akastrel/EnergyATS/blob/main/energy_ats/CHANGELOG.md)
 
-Текущая версия 1.0.3 проходит полный Python suite (**288 tests**) и production-container smoke. Это не заменяет проверку на реальной электроустановке.
+Текущая версия 1.0.4 проходит полный Python suite (**314 tests**) и production-container smoke. Это не заменяет проверку на реальной электроустановке.
