@@ -8,6 +8,7 @@ from enum import Enum
 from typing import Any, Mapping
 
 from domain import GeneratorSlot, SupervisorEvent
+from user_messages import user_message
 
 SLOTS = (GeneratorSlot.A, GeneratorSlot.B)
 _HISTORY_LIMIT = 50
@@ -207,14 +208,18 @@ class ExerciseScheduler:
         self.active_attempt: ExerciseAttempt | None = None
         self.history: list[dict[str, Any]] = []
 
-        # Эти три поля намеренно не persist-ятся. Для обычного observed run после
+        # Эти поля намеренно не persist-ятся. Для обычного observed run после
         # restart непрерывность доказывается заново. Active exercise имеет свой
-        # persisted started_at/run_until.
+        # persisted started_at/run_until. Повтор due-сообщения после restart
+        # допустим: оно информативно и не влияет на schedule/ownership.
         self._run_started_at: dict[GeneratorSlot, float | None] = {
             slot: None for slot in SLOTS
         }
         self._run_faulted = {slot: False for slot in SLOTS}
         self._run_qualified = {slot: False for slot in SLOTS}
+        self._due_announced_for: dict[GeneratorSlot, str | None] = {
+            slot: None for slot in SLOTS
+        }
 
     @property
     def any_enabled(self) -> bool:
@@ -248,11 +253,23 @@ class ExerciseScheduler:
 
         self._initialize_references(o.local_now)
         self._track_qualifying_runs(o)
+        events.extend(self._due_events(o))
 
         if self.active_attempt is not None:
             events.extend(self._step_active(o))
         else:
-            warnings.extend(self._due_warnings(o))
+            due_warnings = self._due_warnings(o)
+            warnings.extend(due_warnings)
+            for warning in due_warnings:
+                events.append(
+                    SupervisorEvent(
+                        "info",
+                        user_message(
+                            "exercise_grace_expired",
+                            generator=o.generator_names[warning.slot],
+                        ),
+                    )
+                )
             events.extend(self._maybe_start(o))
 
         attempt = self.active_attempt
@@ -282,8 +299,7 @@ class ExerciseScheduler:
         state.warning_sent_at = sent_at.isoformat()
         return SupervisorEvent(
             "info",
-            f"Предупреждение о пробном запуске {generator_name} "
-            "успешно отправлено заранее.",
+            user_message("exercise_warning_sent", generator=generator_name),
         )
 
     def fail_active(
@@ -307,8 +323,10 @@ class ExerciseScheduler:
         return (
             SupervisorEvent(
                 "warning",
-                f"Пробный запуск {o.generator_names[slot]} передан outage-сессии; "
-                "дальнейшая работа и остановка принадлежат АВР.",
+                user_message(
+                    "exercise_handoff_outage",
+                    generator=o.generator_names[slot],
+                ),
             ),
         )
 
@@ -326,8 +344,10 @@ class ExerciseScheduler:
         return (
             SupervisorEvent(
                 "info",
-                f"Пробный запуск {o.generator_names[slot]} передан ручной "
-                "managed-сессии; повторный запуск двигателя не требуется.",
+                user_message(
+                    "exercise_handoff_manual",
+                    generator=o.generator_names[slot],
+                ),
             ),
         )
 
@@ -354,7 +374,11 @@ class ExerciseScheduler:
         return (
             SupervisorEvent(
                 "info",
-                f"Пробный запуск {o.generator_names[slot]} отложен: {reason}",
+                user_message(
+                    "exercise_deferred",
+                    generator=o.generator_names[slot],
+                    reason=reason,
+                ),
             ),
         )
 
@@ -490,6 +514,30 @@ class ExerciseScheduler:
                 self.states[slot].last_qualifying_run = o.local_now.isoformat()
                 self._run_qualified[slot] = True
 
+    def _due_events(self, o: ExerciseObservation) -> list[SupervisorEvent]:
+        events: list[SupervisorEvent] = []
+        for slot in SLOTS:
+            config = self.configs[slot]
+            due = self._next_due(slot)
+            if not config.enabled or due is None or o.local_now < due:
+                self._due_announced_for[slot] = None
+                continue
+            due_key = due.isoformat()
+            if self._due_announced_for[slot] == due_key:
+                continue
+            self._due_announced_for[slot] = due_key
+            events.append(
+                SupervisorEvent(
+                    "info",
+                    user_message(
+                        "exercise_due",
+                        generator=o.generator_names[slot],
+                        days=config.interval_days,
+                    ),
+                )
+            )
+        return events
+
     def _step_active(self, o: ExerciseObservation) -> list[SupervisorEvent]:
         assert self.active_attempt is not None
         attempt = self.active_attempt
@@ -529,9 +577,11 @@ class ExerciseScheduler:
                 events.append(
                     SupervisorEvent(
                         "info",
-                        f"Пробный запуск {o.generator_names[attempt.slot]} подтверждён; "
-                        f"контрольная работа "
-                        f"{self.configs[attempt.slot].run_minutes} мин.",
+                        user_message(
+                            "exercise_started",
+                            generator=o.generator_names[attempt.slot],
+                            minutes=self.configs[attempt.slot].run_minutes,
+                        ),
                     )
                 )
             return events
@@ -548,8 +598,11 @@ class ExerciseScheduler:
                 events.append(
                     SupervisorEvent(
                         "info",
-                        f"Пробный запуск {o.generator_names[attempt.slot]} выдержал "
-                        "требуемое время; начинаем штатную остановку.",
+                        user_message(
+                            "exercise_duration_complete",
+                            generator=o.generator_names[attempt.slot],
+                            minutes=self.configs[attempt.slot].run_minutes,
+                        ),
                     )
                 )
             return events
@@ -564,8 +617,10 @@ class ExerciseScheduler:
                     events.append(
                         SupervisorEvent(
                             "info",
-                            f"Пробный запуск {o.generator_names[slot]} "
-                            "успешно завершён.",
+                            user_message(
+                                "exercise_success",
+                                generator=o.generator_names[slot],
+                            ),
                         )
                     )
             return events
@@ -592,8 +647,11 @@ class ExerciseScheduler:
         return [
             SupervisorEvent(
                 "critical",
-                f"Пробный запуск генератора "
-                f"{o.generator_names[attempt.slot]} завершился ошибкой: {reason}",
+                user_message(
+                    "exercise_failed",
+                    generator=o.generator_names[attempt.slot],
+                    reason=reason,
+                ),
             )
         ]
 
@@ -718,13 +776,23 @@ class ExerciseScheduler:
                     forced,
                     reason,
                 )
-                events.append(
-                    SupervisorEvent(
-                        "info",
-                        f"Пробный запуск {o.generator_names[slot]} "
-                        f"отложен: {reason}",
+                if not forced and o.family_present is True:
+                    message = user_message(
+                        "exercise_deferred_presence",
+                        generator=o.generator_names[slot],
                     )
-                )
+                elif not forced and o.family_present is None:
+                    message = user_message(
+                        "exercise_deferred_presence_unknown",
+                        generator=o.generator_names[slot],
+                    )
+                else:
+                    message = user_message(
+                        "exercise_deferred",
+                        generator=o.generator_names[slot],
+                        reason=reason,
+                    )
+                events.append(SupervisorEvent("info", message))
                 continue
 
             self.active_attempt = ExerciseAttempt(
@@ -735,8 +803,10 @@ class ExerciseScheduler:
             events.append(
                 SupervisorEvent(
                     "info",
-                    f"Начат плановый пробный запуск генератора "
-                    f"{o.generator_names[slot]}.",
+                    user_message(
+                        "exercise_start_time",
+                        generator=o.generator_names[slot],
+                    ),
                 )
             )
             # Цикл продолжается, чтобы второй slot с тем же окном получил
@@ -782,8 +852,10 @@ class ExerciseScheduler:
                 return "время предупреждения не содержит timezone"
             if warning_sent_at > scheduled - _WARNING_MIN_LEAD:
                 return "предупреждение было отправлено менее чем за 60 минут"
-        elif o.family_present is not False:
-            return "отсутствие семьи дома не подтверждено"
+        elif o.family_present is True:
+            return "семья находится дома"
+        elif o.family_present is None:
+            return "невозможно достоверно определить присутствие семьи"
 
         return None
 
