@@ -79,31 +79,29 @@ schema:
   generator_b_enabled: bool
 
   load_management_enabled: bool
-  load_measurement_stabilization_time: "float(1,120)"
-  load_restore_margin_percent: "float(0,50)"
-  nominal_overload_time: "float(1,300)"
-  maximum_overload_confirmation_time: "float(0.5,60)"
-  load_restore_retry_interval: "float(1,3600)"
+  load_measurement_stabilization_time: "float(0,120)"
+  load_restore_margin_percent: "float(0,99)"
+  nominal_overload_time: "float(0,300)"
+  maximum_overload_confirmation_time: "float(0,60)"
+  load_restore_retry_interval: "float(0,3600)"
 
   delayed_generator_start_enabled: bool
   generator_charge_cycle_enabled: bool
   generator_start_soc: "float(1,99)"
-  generator_target_charge_soc: "float(2,100)"
+  generator_target_charge_soc: "float(1,100)"
   generator_min_ttg_before_start: "float(0,1440)"
-  generator_max_start_delay: "float(0,86400)"
+  generator_max_start_delay: "float(0,604800)"
 
   family_presence_entity: str
 
   generator_a_exercise_enabled: bool
-  generator_a_exercise_interval_days: "int(1,365)"
+  generator_a_exercise_interval_days: "int(1,3650)"
   generator_a_exercise_start_time: str
-  generator_a_exercise_run_minutes: "int(1,120)"
-  generator_a_exercise_presence_grace_days: "int(0,30)"
+  generator_a_exercise_run_minutes: "int(1,1440)"
+  generator_a_exercise_presence_grace_days: "int(0,365)"
 
   generator_b_exercise_enabled: bool
-  generator_b_exercise_interval_days: "int(1,365)"
+  generator_b_exercise_interval_days: "int(1,3650)"
   generator_b_exercise_start_time: str
-  generator_b_exercise_run_minutes: "int(1,120)"
-  generator_b_exercise_presence_grace_days: "int(0,30)"
-
-image: "ghcr.io/akastrel/{arch}-addon-energy-ats"
+  generator_b_exercise_run_minutes: "int(1,1440)"
+  generator_b_exercise_presence_grace_days: "int(0,365)"
