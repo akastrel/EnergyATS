@@ -12,6 +12,8 @@ DOCS_WITHOUT_RELEASE_HISTORY = (
     ROOT / "README.md",
     ROOT / "energy_ats" / "README.md",
     ROOT / "energy_ats" / "DOCS.md",
+    ROOT / "docs" / "ENTITIES_RU.md",
+    ROOT / "docs" / "SETTINGS_RU.md",
 )
 
 

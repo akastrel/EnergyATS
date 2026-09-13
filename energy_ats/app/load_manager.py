@@ -707,7 +707,7 @@ class LoadManager:
                 else "генератора"
             )
             message = (
-                f"{'Критическая перегрузка' if maximum else 'Перегрузка'} "
+                "Перегрузка "
                 f"{generator}: нагрузка {power:.0f} Вт. Все управляемые "
                 "некритичные нагрузки уже отключены."
             )
@@ -717,7 +717,7 @@ class LoadManager:
                 events.append(SupervisorEvent(level, message))
                 events.append(
                     SupervisorEvent(
-                        level,
+                        "warning",
                         "Диагностика Load Manager: нагрузка "
                         f"{power:.0f} Вт превышает "
                         f"{'максимальный' if maximum else 'номинальный'} предел "

@@ -201,7 +201,7 @@ async def test_r4_recovery_status_has_priority_over_ups_wait(tmp_path):
 
     assert app.supervisor.phase == SupervisorPhase.RECOVERY_REQUIRED
     state = fake.state_writes[-1][1]
-    assert state == "Требуется восстановление"
+    assert state == "Требуется внимание технического специалиста"
     await app.adapter.cancel_background_publications()
 
 
