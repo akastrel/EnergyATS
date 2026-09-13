@@ -1,0 +1,154 @@
+name: Apply SETTINGS message sync
+
+on:
+  push:
+    branches:
+      - docs/settings-guide
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: ${{ !contains(github.event.head_commit.message, '[settings-sync]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: docs/settings-guide
+          fetch-depth: 0
+
+      - name: Apply agreed user-facing text changes
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace(path: str, old: str, new: str, *, count: int | None = None) -> None:
+              p = Path(path)
+              text = p.read_text(encoding="utf-8")
+              occurrences = text.count(old)
+              if occurrences == 0:
+                  raise SystemExit(f"Expected text not found in {path}: {old!r}")
+              if count is not None and occurrences != count:
+                  raise SystemExit(
+                      f"Unexpected occurrence count in {path}: {occurrences}, expected {count}"
+                  )
+              p.write_text(text.replace(old, new), encoding="utf-8")
+
+          # Central message catalog.
+          replace(
+              "energy_ats/app/user_messages_ru.py",
+              '''    "generator_fallback": (\n        "{failed} недоступен: {reason} Запускаем резервный {secondary}; это "\n        "единственная автоматическая попытка переключения на второй генератор."\n    ),''',
+              '''    "generator_fallback": (\n        "Генератор {failed} не запустился: {reason}. Запускаем резервный "\n        "генератор {secondary}."\n    ),''',
+              count=1,
+          )
+          replace(
+              "energy_ats/app/user_messages_ru.py",
+              '''    "recovery_required": (\n        "АВР остановил автоматическое управление: {reason}. Требуется "\n        "безопасное восстановление."\n    ),''',
+              '''    "recovery_required": (\n        "АВР остановил автоматическое управление: {reason}. Требуется внимание "\n        "технического специалиста и сброс ошибки."\n    ),''',
+              count=1,
+          )
+          replace(
+              "energy_ats/app/user_messages_ru.py",
+              '''    "ha_connection_lost_transition": (\n        "Потеряна связь с Home Assistant во время незавершённой силовой операции. "\n        "АВР перешёл в безопасное восстановление и не будет угадывать "\n        "положение оборудования."\n    ),''',
+              '''    "ha_connection_lost_transition": (\n        "Потеряна связь с Home Assistant во время переключения. АВР не может "\n        "однозначно определить состояние, поэтому переходит в режим «Требуется "\n        "внимание технического специалиста»."\n    ),''',
+              count=1,
+          )
+
+          # Messages still emitted directly by EnergySupervisor.
+          replace(
+              "energy_ats/app/energy_supervisor.py",
+              '''                f"Managed-запуск отклонён: уже работает внешний генератор ({names}).",''',
+              '''                f"Управляемый АВР запуск отклонён, т.к. уже работает генератор ({names}). "\n                "АВР не управляет данным генератором.",''',
+              count=1,
+          )
+          replace(
+              "energy_ats/app/energy_supervisor.py",
+              '''                f"Отказ {o.generators[failed].display_name}: {reason} "\n                f"Работающий {other_status.display_name} остаётся внешним.",''',
+              '''                f"Отказ генератора {o.generators[failed].display_name}: {reason}. "\n                f"Генератор {other_status.display_name} уже запущен и продолжает "\n                "работу, но НЕ управляется АВР.",''',
+              count=1,
+          )
+          replace(
+              "energy_ats/app/energy_supervisor.py",
+              '''            return "Требуется восстановление"''',
+              '''            return "Требуется внимание технического специалиста"''',
+              count=1,
+          )
+          replace(
+              "energy_ats/app/energy_supervisor.py",
+              '''                "Связь потеряна во время незавершённой физической операции."''',
+              '''                "Потеряна связь с Home Assistant во время переключения; состояние силовой схемы не подтверждено."''',
+              count=1,
+          )
+
+          # One user-facing overload text regardless of nominal/maximum threshold.
+          # Severity remains CRITICAL for maximum and WARNING for nominal.
+          replace(
+              "energy_ats/app/load_manager.py",
+              '''                f"{'Критическая перегрузка' if maximum else 'Перегрузка'} "''',
+              '''                "Перегрузка "''',
+              count=1,
+          )
+          # The technical DETAIL record must not create a second CRITICAL push.
+          replace(
+              "energy_ats/app/load_manager.py",
+              '''                    SupervisorEvent(\n                        level,\n                        "Диагностика Load Manager: нагрузка "''',
+              '''                    SupervisorEvent(\n                        "warning",\n                        "Диагностика Load Manager: нагрузка "''',
+              count=1,
+          )
+
+          # Status documentation follows the same Russian operator term.
+          replace(
+              "docs/ENTITIES_RU.md",
+              '''Требуется восстановление\nDISARMED — только наблюдение''',
+              '''Требуется внимание технического специалиста\nDISARMED — только наблюдение''',
+              count=1,
+          )
+          replace(
+              "docs/ENTITIES_RU.md",
+              '''`Требуется восстановление` соответствует машинному состоянию `phase=recovery_required`; в пользовательской терминологии это **«Требуется внимание технического специалиста»**.''',
+              '''`Требуется внимание технического специалиста` соответствует машинному состоянию `phase=recovery_required`.''',
+              count=1,
+          )
+
+          # Keep tests aligned with the final operator wording where they assert text.
+          replacements = {
+              "Требуется безопасное восстановление.": "Требуется внимание технического специалиста и сброс ошибки.",
+              "Требуется восстановление": "Требуется внимание технического специалиста",
+              "Критическая перегрузка": "Перегрузка",
+              "Потеряна связь с Home Assistant во время незавершённой силовой операции. АВР перешёл в безопасное восстановление и не будет угадывать положение оборудования.": "Потеряна связь с Home Assistant во время переключения. АВР не может однозначно определить состояние, поэтому переходит в режим «Требуется внимание технического специалиста».",
+          }
+          for p in Path("tests").glob("test_*.py"):
+              text = p.read_text(encoding="utf-8")
+              updated = text
+              for old, new in replacements.items():
+                  updated = updated.replace(old, new)
+              if updated != text:
+                  p.write_text(updated, encoding="utf-8")
+
+          # Guard release-agnostic operator docs as well.
+          p = Path("tests/test_docs_no_release_versions.py")
+          text = p.read_text(encoding="utf-8")
+          marker = '    ROOT / "energy_ats" / "DOCS.md",\n'
+          addition = (
+              marker
+              + '    ROOT / "docs" / "ENTITIES_RU.md",\n'
+              + '    ROOT / "docs" / "SETTINGS_RU.md",\n'
+          )
+          if 'ROOT / "docs" / "ENTITIES_RU.md"' not in text:
+              if marker not in text:
+                  raise SystemExit("docs version guard marker not found")
+              p.write_text(text.replace(marker, addition), encoding="utf-8")
+          PY
+
+      - name: Remove one-shot workflow and commit changes
+        shell: bash
+        run: |
+          rm .github/workflows/apply-settings-message-sync.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "feat: sync operator messages with SETTINGS_RU [settings-sync]"
+          git push origin HEAD:docs/settings-guide
