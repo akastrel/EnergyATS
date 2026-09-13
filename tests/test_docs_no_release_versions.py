@@ -1,4 +1,4 @@
-"""README/DOCS описывают текущее состояние и не привязаны к номеру релиза."""
+"""Актуальная пользовательская документация не привязана к номеру релиза."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ DOCS_WITHOUT_RELEASE_HISTORY = (
 
 
 def test_readme_and_user_docs_do_not_contain_release_versions() -> None:
-    """Актуальные README/DOCS не должны превращаться в историю конкретных релизов."""
+    """README и эксплуатационные документы должны описывать текущее состояние."""
     offenders: list[str] = []
     for path in DOCS_WITHOUT_RELEASE_HISTORY:
         text = path.read_text(encoding="utf-8")
@@ -27,6 +27,7 @@ def test_readme_and_user_docs_do_not_contain_release_versions() -> None:
             offenders.append(f"{path.relative_to(ROOT)}: {', '.join(versions)}")
 
     assert not offenders, (
-        "Номера релизов допустимы в CHANGELOG/metadata, но не в README/DOCS:\n"
+        "Номера релизов допустимы в CHANGELOG/metadata, но не в актуальной "
+        "пользовательской документации:\n"
         + "\n".join(offenders)
     )
