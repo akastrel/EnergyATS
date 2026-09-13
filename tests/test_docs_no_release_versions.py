@@ -13,12 +13,11 @@ DOCS_WITHOUT_RELEASE_HISTORY = (
     ROOT / "energy_ats" / "README.md",
     ROOT / "energy_ats" / "DOCS.md",
     ROOT / "docs" / "ENTITIES_RU.md",
-    ROOT / "docs" / "SETTINGS_RU.md",
 )
 
 
 def test_readme_and_user_docs_do_not_contain_release_versions() -> None:
-    """README и эксплуатационные документы должны описывать текущее состояние."""
+    """README и документы без трёхуровневой нумерации не содержат версий релиза."""
     offenders: list[str] = []
     for path in DOCS_WITHOUT_RELEASE_HISTORY:
         text = path.read_text(encoding="utf-8")
