@@ -128,7 +128,16 @@ async def test_ha_loss_during_supervisor_transition_requires_recovery_once(
     await app._record_connection_restored(now=215.0)
 
     assert [event.level for event in published] == ["critical", "info"]
-    assert sum("Потеряна связь" in event.message for event in published) == 0
+    # Отдельное промежуточное сообщение о потере HA не публикуется после reconnect.
+    # Пользователь получает один итоговый CRITICAL C1 с причиной перехода в
+    # состояние «Требуется внимание технического специалиста».
+    assert "АВР остановил автоматическое управление:" in published[0].message
+    assert "Требуется внимание технического специалиста и сброс ошибки." in published[0].message
+    assert not any(
+        "поэтому переходит в режим «Требуется внимание технического специалиста»"
+        in event.message
+        for event in published
+    )
     assert "Попыток переподключения: 3" in published[-1].message
 
 
