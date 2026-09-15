@@ -580,6 +580,10 @@ class HomeAssistantAdapter:
 
     async def cancel_background_publications(self) -> None:
         """Отменить незавершённый best-effort I/O перед закрытием HA transport."""
+        # sensor.energy_ats_status создаётся через REST set_state и не переживает
+        # restart HA Core. После разрыва transport старый successful write больше
+        # не доказывает, что entity существует в новом runtime Home Assistant.
+        self._status_delivered = None
         tasks = tuple(self._publication_tasks)
         if not tasks:
             self._status_publisher_task = None
