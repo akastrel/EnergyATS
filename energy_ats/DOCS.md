@@ -26,8 +26,28 @@ EnergyATS управляет резервным электроснабжение
 - A и B могут одновременно быть RUNNING;
 - общей generator bus физически владеет только один generator благодаря аппаратной блокировке;
 - `RUNNING`, `REMOTE`, selector command и feedback — разные сигналы;
+- качество Grid (`normal / partial / lost`) и положение сетевого контактора — разные физические факты;
 - EnergyATS не угадывает неизвестный bus owner;
 - внешний RUNNING generator не становится managed автоматически.
+
+### 2.1. Состояние трёхфазной Grid
+
+EnergyATS использует два связанных, но разных сигнала:
+
+```text
+binary_sensor.grid_input_ready
+sensor.grid_input_state
+```
+
+`grid_input_ready = ON` означает, что вся сеть пригодна. `grid_input_state` уточняет физическую ситуацию:
+
+```text
+normal  — все три фазы пригодны
+partial — одна или две фазы отсутствуют либо отключены защитой
+lost    — пригодных фаз не осталось
+```
+
+При `partial` АВР не считает силовую топологию неисправной: сетевой контактор может оставаться подтверждённо включённым, пока часть дома питается от оставшихся фаз. И `partial`, и `lost` проходят обычную выдержку `grid_failure_delay`; восстановление в `normal` до её окончания отменяет автоматический запуск.
 
 ## 3. Первый запуск
 
@@ -40,6 +60,7 @@ armed: false
 Проверьте в Home Assistant и `sensor.energy_ats_status`:
 
 - Grid определяется правильно;
+- `sensor.grid_input_state` показывает `normal`, `partial` или `lost` согласно фактическому состоянию фаз;
 - оба generator names/models корректны;
 - `select.primary_generator` указывает нужный generator;
 - оба RUNNING/REMOTE отображаются правильно;
@@ -267,6 +288,7 @@ sensor.energy_ats_status
 
 ```text
 source
+grid_input_state
 phase
 generator
 generator_model
