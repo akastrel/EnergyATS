@@ -93,6 +93,7 @@ async def complete_cycle(app, fake, now):
 
 def grid_returns(fake):
     fake.states[ENTITIES["grid_ready"]] = "on"
+    fake.states[ENTITIES["grid_input_state"]] = "normal"
     if fake.states[ENTITIES["grid_power"]] == "on":
         fake.states[ENTITIES["house_grid"]] = "on"
 
