@@ -277,19 +277,30 @@ Safety / Recovery
 
 ```text
 grid_input_ready = ON
+grid_input_state = normal
 grid_power = ON
 use_generator_as_power_source = OFF
 house_powered_by_grid = ON
 house_powered_by_generator = OFF
 ```
 
+`grid_input_state` описывает качество трёхфазного входа (`normal / partial / lost`), а `house_powered_by_grid` — подтверждение управляющей цепи сетевого контактора. Эти факты не должны подменять друг друга.
+
 #### REQ-GRID-02. Намеренное отключение Grid
 
 `grid_input_ready = ON` при `grid_power = OFF` означает исправную внешнюю Grid, намеренно отключённую управляющей схемой. Это не является физическим outage и само по себе не запускает automatic outage-session. Исключение — сохраняемая EnergyATS-owned обязанность восстановления после REQ-BEH-14: она не превращает произвольный `grid_power=OFF` в право auto-reconnect.
 
-#### REQ-GRID-03. Outage определяется физическим входом
+#### REQ-GRID-03. Непригодность Grid определяется физическим входом
 
-Automatic outage начинается только по `binary_sensor.grid_input_ready = OFF`.
+Automatic outage-delay начинается по `binary_sensor.grid_input_ready = OFF`.
+
+Для диагностики причина уточняется через `sensor.grid_input_state`:
+
+- `normal` — все три фазы пригодны;
+- `partial` — пригодна только часть фаз;
+- `lost` — пригодных фаз не осталось.
+
+`partial` и `lost` используют один и тот же `grid_failure_delay`, если отдельным требованием не задано иное.
 
 #### REQ-GRID-04. UPS появляется автоматически
 
@@ -299,11 +310,24 @@ Automatic outage начинается только по `binary_sensor.grid_inpu
 
 Любой таймер, смысл которого требует **непрерывно наблюдаемого** состояния Grid (`grid_failure_delay`, `grid_restore_stable_time` и аналогичные safety delays), считается доказанным только при непрерывной последовательности валидных observations. Потеря связи с Home Assistant, `unknown/unavailable` обязательного Grid input либо другой observation gap сбрасывает уже накопленную непрерывность; после восстановления валидных данных отсчёт начинается заново. Истёкшее wall-clock время внутри gap само по себе не доказывает стабильность Grid.
 
+#### REQ-GRID-06. Качество Grid не определяет положение силового пути
+
+Потеря одной или всех фаз сама по себе не является contradiction основных контакторов. В частности, при `grid_input_state=partial` допустимо устойчивое сочетание:
+
+```text
+grid_input_ready = OFF
+grid_power = ON
+house_powered_by_grid = ON
+house_powered_by_generator = OFF
+```
+
+TPC обязан считать положение сетевого пути подтверждённым по управляющей обратной связи контакторов независимо от того, пригодны ли сейчас все фазы внешней сети. `partial` или `lost` не должны переводить систему в Recovery без отдельного противоречия/таймаута физической операции.
+
 ### 5.2. Автоматический outage start
 
 #### REQ-AUTO-01. Grid failure delay
 
-При `grid_input_ready = OFF` и разрешённом АВР EnergyATS выдерживает конфигурируемый `grid_failure_delay` (текущий default 60 s). Непрерывность этого интервала определяется REQ-GRID-05.
+При `grid_input_ready = OFF` и разрешённом АВР EnergyATS выдерживает конфигурируемый `grid_failure_delay` (текущий default 60 s). Это относится и к `grid_input_state=partial`, и к `grid_input_state=lost`. Если за время выдержки сеть вернулась в `normal`, автоматический запуск не начинается. Непрерывность этого интервала определяется REQ-GRID-05.
 
 #### REQ-AUTO-02. Состояние во время задержки
 
@@ -1106,7 +1130,7 @@ Restart во время неподтверждённой физической tr
 
 #### REQ-FAULT-03. Grid control выбран, feedback не пришёл
 
-Аналогично confirmed available Grid должна дать expected Grid feedback в timeout.
+Confirmed available Grid должна дать expected Grid feedback в timeout. При этом `grid_input_ready=OFF` или `grid_input_state=partial/lost` не являются сами по себе отсутствием feedback контактора: положение Grid path доказывается `grid_power`, selector и `house_powered_by_grid`.
 
 #### REQ-FAULT-04. Grid feedback противоречит command
 
