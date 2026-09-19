@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.1.0
+
+Первый minor release после production-hardening: уточнён публичный HA-контракт входной сети и устранена ложная аварийная блокировка при потере отдельной фазы.
+
+- Добавлен `sensor.grid_input_state` со значениями `normal / partial / lost`; `binary_sensor.grid_input_ready` остаётся совместимым признаком «вся сеть пригодна».
+- Power Transfer Controller больше не использует качество внешней сети как доказательство положения сетевого контактора. Состояние `grid_input_ready=OFF + grid_input_state=partial + house_powered_by_grid=ON` является штатным и не приводит к Recovery.
+- `partial` и `lost` проходят обычный `grid_failure_delay`; если сеть восстановилась раньше, генератор не запускается, если нет — начинается штатная outage-session.
+- `grid_input_state` публикуется в атрибутах `sensor.energy_ats_status`; physical event journal различает частичную потерю фаз и полный blackout.
+- Исправлен lifecycle `sensor.energy_ats_status`: после restart/reconnect Home Assistant REST-created entity публикуется заново даже при неизменившемся status.
+- Некорректная конфигурация UPS Run теперь диагностируется сразу после запуска App с конкретной причиной; ошибка отключает только Delayed Start / Charge Cycling и не блокирует обычный запуск генератора.
+- Синхронизированы `REQUIREMENTS_RU.md`, `PHYSICAL_POWER_TOPOLOGY_RU.md`, `ENTITIES_RU.md`, `SETTINGS_RU.md`, README и встроенная Home Assistant Documentation.
+- Regression suite покрывает partial < delay, partial >= delay, complete loss, Grid-path interpretation, startup UPS validation и HA status recreation.
+- Финальный Python suite: `358 passed`; production `addon-container-smoke` проходит.
+- App и add-on version подняты до `1.1.0`; persistent `schema_version` остаётся `3`.
+
+---
+
 ## 1.0.8
 
 Production hardening по результатам повторного review версии 1.0.7. Новых пользовательских режимов и новых архитектурных слоёв не добавлено; исправлены шесть воспроизведённых дефектов R1–R6.
