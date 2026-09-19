@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
-from domain import PowerPath, PowerSource
+from domain import GridInputState, PowerPath, PowerSource
 
 
 class TransferPhase(str, Enum):
@@ -46,6 +46,7 @@ class PowerTransferObservation:
     grid_connected: bool | None
     generator_selected: bool | None
     emergency_stop: bool | None
+    grid_input_state: GridInputState | None = None
 
     @property
     def required_states_known(self) -> bool:
@@ -378,8 +379,18 @@ class PowerTransferController:
             return None
 
         if o.grid_connected is True:
-            if o.grid_ready is True and o.house_on_grid is True:
+            # Положение сетевого контактора и качество внешней сети — разные
+            # физические факты. При отключении одной фазы реле напряжения
+            # grid_ready уже False, но сетевой контактор может оставаться
+            # подтверждённо включённым и часть дома продолжает питаться от Grid.
+            if o.house_on_grid is True:
+                if o.grid_input_state == GridInputState.LOST:
+                    return PowerPath.GRID, PowerSource.UPS_ONLY
                 return PowerPath.GRID, PowerSource.GRID
+
+            # При полностью пропавшей/непригодной сети контактор может быть
+            # выбран, но его управляющая обратная связь уже отпала. Это всё ещё
+            # известный Grid-path, а не неоднозначная силовая топология.
             if o.grid_ready is False and o.house_on_grid is False:
                 return PowerPath.GRID, PowerSource.UPS_ONLY
             return None
