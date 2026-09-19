@@ -9,6 +9,7 @@ from typing import Any, Mapping
 from domain import (
     EventVisibility,
     GeneratorSlot,
+    GridInputState,
     PowerPath,
     PowerSource,
     SessionReason,
@@ -131,6 +132,7 @@ class SupervisorObservation:
     generators: Mapping[GeneratorSlot, GeneratorStatus]
     power_inputs_known: bool = True
     bus: GeneratorBusStatus | None = None
+    grid_input_state: GridInputState | None = None
 
     @property
     def required_states_known(self) -> bool:
@@ -345,6 +347,7 @@ class EnergySupervisor:
         self._events.extend(
             self._physical_events.observe(
                 grid_ready=o.grid_ready,
+                grid_input_state=o.grid_input_state,
                 automatic_transfer_enabled=o.automatic_transfer_enabled,
                 power_path=o.power.actual_path,
                 power_source=o.power.actual_source,
