@@ -104,6 +104,7 @@ def populated_states() -> dict[str, str]:
         ENTITIES["automatic_transfer"]: "off",
         ENTITIES["test_mode"]: "off",
         ENTITIES["grid_ready"]: "on",
+        ENTITIES["grid_input_state"]: "normal",
         ENTITIES["house_grid"]: "on",
         ENTITIES["house_generator"]: "off",
         ENTITIES["generator_a_running"]: "off",
