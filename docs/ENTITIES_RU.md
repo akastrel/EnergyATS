@@ -102,7 +102,25 @@ switch.use_generator_as_power_source
         {% endif %}
 ```
 
-Существующий `binary_sensor.grid_input_ready` остаётся входом «сеть полностью пригодна / не пригодна» и сохраняется для совместимости. Новый sensor нужен для различения частичной потери фаз и полного blackout; если он ещё не установлен, основная логика АВР продолжает работать по старому binary input.
+Существующий `binary_sensor.grid_input_ready` остаётся входом «сеть полностью пригодна / не пригодна» и сохраняется для совместимости. После добавления трёхсостоянийного sensor его лучше упростить и не дублировать пороги напряжения:
+
+```yaml
+- binary_sensor:
+    - name: "Grid Input Ready"
+      unique_id: grid_input_ready
+      availability: >
+        {{ has_value('sensor.grid_input_state') }}
+      state: >
+        {{ is_state('sensor.grid_input_state', 'normal') }}
+      icon: >
+        {% if is_state(this.entity_id, 'on') %}
+          mdi:transmission-tower
+        {% else %}
+          mdi:transmission-tower-off
+        {% endif %}
+```
+
+Таким образом, `sensor.grid_input_state` является единственным местом классификации фаз, а binary sensor остаётся простым совместимым признаком полной готовности. Если новый sensor ещё не установлен, EnergyATS продолжает работать по старому binary input.
 
 ## 3. Работа и дистанционный запуск генераторов
 
