@@ -64,6 +64,7 @@ def accelerate_generators(app: EnergySupervisorApp) -> None:
 def set_grid_outage(fake: PhysicalFakeClient, *, automatic: bool = True) -> None:
     fake.states[ENTITIES["automatic_transfer"]] = "on" if automatic else "off"
     fake.states[ENTITIES["grid_ready"]] = "off"
+    fake.states[ENTITIES["grid_input_state"]] = "lost"
     fake.states[ENTITIES["house_grid"]] = "off"
     fake.states[ENTITIES["test_mode"]] = "off"
 
