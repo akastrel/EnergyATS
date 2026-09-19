@@ -78,7 +78,6 @@ async def test_partial_grid_loss_longer_than_delay_starts_normal_outage_session(
 
 def test_adapter_reads_normal_partial_and_lost_grid_states():
     """Новый HA sensor передаёт три состояния без перегрузки binary ready."""
-    app, fake = make_app.__globals__["make_app"], None
     # Используем лёгкий fake из общего adapter test, без запуска EnergyATS.
     from ha_adapter import HomeAssistantAdapter
     from test_app_adapter import FakeClient, populated_states
