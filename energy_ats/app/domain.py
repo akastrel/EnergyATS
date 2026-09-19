@@ -11,6 +11,14 @@ class GeneratorSlot(str, Enum):
     B = "B"
 
 
+class GridInputState(str, Enum):
+    """Физическое состояние трёхфазной входной сети."""
+
+    NORMAL = "normal"
+    PARTIAL = "partial"
+    LOST = "lost"
+
+
 class PowerSource(str, Enum):
     """Наблюдаемый источник/режим питания дома."""
 

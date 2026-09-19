@@ -9,6 +9,7 @@ from typing import Any, Mapping
 from domain import (
     EventVisibility,
     GeneratorSlot,
+    GridInputState,
     PowerPath,
     PowerSource,
     SessionReason,
@@ -131,6 +132,7 @@ class SupervisorObservation:
     generators: Mapping[GeneratorSlot, GeneratorStatus]
     power_inputs_known: bool = True
     bus: GeneratorBusStatus | None = None
+    grid_input_state: GridInputState | None = None
 
     @property
     def required_states_known(self) -> bool:
@@ -345,6 +347,7 @@ class EnergySupervisor:
         self._events.extend(
             self._physical_events.observe(
                 grid_ready=o.grid_ready,
+                grid_input_state=o.grid_input_state,
                 automatic_transfer_enabled=o.automatic_transfer_enabled,
                 power_path=o.power.actual_path,
                 power_source=o.power.actual_source,
@@ -430,7 +433,7 @@ class EnergySupervisor:
         if self.phase in _TRANSIENT_PHASES:
             self._event("critical", user_message("ha_connection_lost_transition"))
             self._require_recovery(
-                "Связь потеряна во время незавершённой физической операции."
+                "Потеряна связь с Home Assistant во время переключения; состояние силовой схемы не подтверждено."
             )
         else:
             self._event("warning", user_message("ha_connection_lost_stable"))
@@ -884,8 +887,9 @@ class EnergySupervisor:
             self.phase = SupervisorPhase.ON_GENERATOR
             self._event(
                 "critical",
-                f"Отказ {o.generators[failed].display_name}: {reason} "
-                f"Работающий {other_status.display_name} остаётся внешним.",
+                f"Отказ генератора {o.generators[failed].display_name}: {reason}. "
+                f"Генератор {other_status.display_name} уже запущен и продолжает "
+                "работу, но НЕ управляется АВР.",
             )
             return
 
@@ -1076,7 +1080,8 @@ class EnergySupervisor:
             names = ", ".join(o.generators[slot].display_name for slot in active)
             self._event(
                 "warning",
-                f"Managed-запуск отклонён: уже работает внешний генератор ({names}).",
+                f"Управляемый АВР запуск отклонён, т.к. уже работает генератор ({names}). "
+                "АВР не управляет данным генератором.",
             )
             return
         self._begin_session(o, SessionReason.MANUAL_GENERATOR_START)
@@ -1278,7 +1283,7 @@ class EnergySupervisor:
         if self.phase == SupervisorPhase.EXTERNAL_RUNNING:
             return "Обнаружен внешний запуск"
         if self.phase == SupervisorPhase.RECOVERY_REQUIRED:
-            return "Требуется восстановление"
+            return "Требуется внимание технического специалиста"
         if self.phase == SupervisorPhase.ON_GENERATOR:
             if (
                 self.session is not None

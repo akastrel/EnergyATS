@@ -12,7 +12,7 @@ from collections.abc import Coroutine
 from dataclasses import dataclass
 from typing import Any, Hashable
 
-from domain import EventVisibility, GeneratorSlot, SupervisorEvent
+from domain import EventVisibility, GeneratorSlot, GridInputState, SupervisorEvent
 from generator_controller import (
     GeneratorAction,
     GeneratorActionKind,
@@ -32,6 +32,7 @@ ENTITIES = {
     "automatic_transfer": "input_boolean.automatic_generator_transfer",
     "test_mode": "input_boolean.generator_test_mode",
     "grid_ready": "binary_sensor.grid_input_ready",
+    "grid_input_state": "sensor.grid_input_state",
     "house_grid": "binary_sensor.house_powered_by_grid",
     "house_generator": "binary_sensor.house_powered_by_generator",
     "generator_a_running": "binary_sensor.generator_a_is_running",
@@ -102,6 +103,7 @@ class LoadManagementSnapshot:
 @dataclass(frozen=True)
 class HardwareSnapshot:
     grid_ready: bool | None
+    grid_input_state: GridInputState | None
     automatic_transfer_enabled: bool
     test_mode: bool | None
     emergency_stop: bool | None
@@ -157,6 +159,7 @@ class HomeAssistantAdapter:
 
     def snapshot(self) -> HardwareSnapshot:
         grid_ready = self.bool_state(ENTITIES["grid_ready"])
+        grid_input_state = self.grid_input_state(grid_ready)
         house_grid = self.bool_state(ENTITIES["house_grid"])
         house_generator = self.bool_state(ENTITIES["house_generator"])
         emergency_stop = self.bool_state(ENTITIES["emergency_stop"])
@@ -273,6 +276,7 @@ class HomeAssistantAdapter:
 
         return HardwareSnapshot(
             grid_ready=grid_ready,
+            grid_input_state=grid_input_state,
             automatic_transfer_enabled=(
                 self.bool_state(ENTITIES["automatic_transfer"]) is True
             ),
@@ -293,6 +297,7 @@ class HomeAssistantAdapter:
                 grid_connected=self.bool_state(ENTITIES["grid_power"]),
                 generator_selected=self.bool_state(ENTITIES["source_generator"]),
                 emergency_stop=emergency_stop,
+                grid_input_state=grid_input_state,
             ),
             load_management=load_management,
             battery=battery,
@@ -305,7 +310,8 @@ class HomeAssistantAdapter:
     ) -> list[str]:
         # Load Manager, UPS Run battery entities и Nominal/Maximum metadata
         # намеренно не входят сюда: это soft dependencies и они не могут
-        # блокировать старт core ATS.
+        # блокировать старт core ATS. sensor.grid_input_state пока также не
+        # блокирует upgrade: без него используется совместимый binary Grid input.
         state_required = [
             ENTITIES["automatic_transfer"],
             ENTITIES["grid_ready"],
@@ -580,6 +586,10 @@ class HomeAssistantAdapter:
 
     async def cancel_background_publications(self) -> None:
         """Отменить незавершённый best-effort I/O перед закрытием HA transport."""
+        # sensor.energy_ats_status создаётся через REST set_state и не переживает
+        # restart HA Core. После разрыва transport старый successful write больше
+        # не доказывает, что entity существует в новом runtime Home Assistant.
+        self._status_delivered = None
         tasks = tuple(self._publication_tasks)
         if not tasks:
             self._status_publisher_task = None
@@ -636,6 +646,30 @@ class HomeAssistantAdapter:
         if state in {"not_home", "off"}:
             return False
         return None
+
+    def grid_input_state(self, grid_ready: bool | None) -> GridInputState | None:
+        """Прочитать трёхсостоянийный Grid input с безопасной совместимостью.
+
+        Новый sensor.grid_input_state различает normal/partial/lost. Пока он ещё
+        не установлен, старый binary_sensor.grid_input_ready остаётся достаточным
+        для основной логики: ON -> normal, OFF -> lost. Некорректное значение
+        нового sensor не подменяется догадкой и считается неизвестным.
+        """
+        entity_id = ENTITIES["grid_input_state"]
+        if not self.client.has_entity(entity_id):
+            if grid_ready is True:
+                return GridInputState.NORMAL
+            if grid_ready is False:
+                return GridInputState.LOST
+            return None
+
+        raw = self.text_state(entity_id)
+        if raw is None:
+            return None
+        try:
+            return GridInputState(raw.strip().lower())
+        except ValueError:
+            return None
 
     def float_state(self, entity_id: str) -> float | None:
         state = self.client.get_state(entity_id)

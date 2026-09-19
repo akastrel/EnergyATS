@@ -41,7 +41,7 @@ class UPSRunConfig:
     telemetry_stale_time: float = 300.0
 
     @property
-    def valid(self) -> bool:
+    def validation_error(self) -> str | None:
         values = (
             self.start_soc,
             self.target_soc,
@@ -49,13 +49,28 @@ class UPSRunConfig:
             self.max_start_delay,
             self.telemetry_stale_time,
         )
-        return (
-            all(math.isfinite(value) for value in values)
-            and 0 < self.start_soc < self.target_soc <= 100
-            and self.min_ttg_before_start >= 0
-            and self.max_start_delay >= 0
-            and self.telemetry_stale_time > 0
-        )
+        if not all(math.isfinite(value) for value in values):
+            return "один из числовых параметров не является конечным числом."
+        if not 0 < self.start_soc < 100:
+            return "уровень запуска генератора должен быть между 0% и 100%."
+        if not 0 < self.target_soc <= 100:
+            return "уровень остановки генератора должен быть больше 0% и не выше 100%."
+        if self.start_soc >= self.target_soc:
+            return (
+                f"уровень запуска генератора ({self.start_soc:.0f}%) должен быть "
+                f"ниже уровня остановки ({self.target_soc:.0f}%)."
+            )
+        if self.min_ttg_before_start < 0:
+            return "порог оставшегося времени UPS не может быть отрицательным."
+        if self.max_start_delay < 0:
+            return "максимальное время ожидания на UPS не может быть отрицательным."
+        if self.telemetry_stale_time <= 0:
+            return "допустимый возраст телеметрии должен быть больше нуля."
+        return None
+
+    @property
+    def valid(self) -> bool:
+        return self.validation_error is None
 
 
 @dataclass(frozen=True)
@@ -142,6 +157,21 @@ class UPSRun:
             self._last_ttg_sample_id = ttg_sample
             self._last_ttg_sample_at = o.now
 
+        # Ошибка конфигурации должна быть видна сразу после запуска App, а не
+        # впервые во время реального отключения сети. Это локальная деградация
+        # UPS Run: обычный core generator start остаётся разрешён.
+        validation_error = self.config.validation_error
+        if self.enabled and validation_error is not None:
+            reason = (
+                f"Некорректны настройки UPS Run: {validation_error} "
+                "Отложенный запуск и циклическая подзарядка недоступны; "
+                "при отключении сети будет использован обычный запуск генератора."
+            )
+            self.state = UPSRunState.DEGRADED
+            self.last_reason = reason
+            self._emit_once(events, "invalid_config", "warning", reason)
+            return UPSRunDecision(reason=reason, events=tuple(events))
+
         if o.grid_ready is True:
             # Короткое появление сети не обнуляет текущий battery interval.
             # После cycle stop сетевой ввод изолирован нами: обязанность
@@ -178,13 +208,6 @@ class UPSRun:
             self.state = UPSRunState.IDLE
             self.last_reason = None
             return UPSRunDecision()
-
-        if not self.config.valid:
-            reason = "Некорректны настройки Delayed Start / Charge Cycling."
-            self.state = UPSRunState.DEGRADED
-            self.last_reason = reason
-            self._emit_once(events, "invalid_config", "warning", reason)
-            return UPSRunDecision(reason=reason, events=tuple(events))
 
         if o.session_active:
             self._reset_wait()

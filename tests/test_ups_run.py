@@ -236,6 +236,21 @@ def test_invalid_threshold_configuration_disables_optimization_only():
     assert p.state == UPSRunState.DEGRADED
 
 
+def test_invalid_configuration_is_reported_while_grid_is_healthy():
+    """Ошибочная UPS Run конфигурация должна быть видна на первом штатном tick."""
+    p = UPSRun(cfg(start_soc=80, target_soc=40))
+    d = p.step(obs(grid=True))
+
+    assert p.state == UPSRunState.DEGRADED
+    assert len(d.events) == 1
+    message = d.events[0].message
+    assert "80%" in message
+    assert "40%" in message
+    assert "обычный запуск генератора" in message
+    assert not d.defer_automatic_start
+    assert not d.request_cycle_stop
+
+
 def test_waiting_since_survives_restart_but_freshness_does_not():
     p = UPSRun(cfg(max_start_delay=100))
     p.step(obs(10, b=battery(sample=1)))
