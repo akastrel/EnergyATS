@@ -45,6 +45,7 @@ input_boolean.generator_test_mode
 
 ```text
 binary_sensor.grid_input_ready
+sensor.grid_input_state
 binary_sensor.house_powered_by_grid
 binary_sensor.house_powered_by_generator
 switch.grid_power
@@ -53,7 +54,8 @@ switch.use_generator_as_power_source
 
 Смысл:
 
-- `grid_input_ready` — физическая доступность и пригодность внешней сети;
+- `grid_input_ready` — бинарный признак полной пригодности внешней сети: `ON` только когда все три фазы пригодны;
+- `grid_input_state` — уточнение состояния входной сети: `normal` / `partial` / `lost`;
 - `house_powered_by_grid` — обратная связь управляющей цепи основного сетевого контактора;
 - `house_powered_by_generator` — обратная связь управляющей цепи основного генераторного контактора;
 - `grid_power` — разрешение сетевой ветви;
@@ -62,6 +64,45 @@ switch.use_generator_as_power_source
 Важно: `house_powered_by_*` находятся в управляющих цепях и не являются независимым силовым измерением после контактора.
 
 Успешное выполнение команды Home Assistant не считается физическим подтверждением переключения. АВР ждёт соответствующий сигнал обратной связи.
+
+`grid_input_state` разделяет качество внешней сети и положение силового пути:
+
+- `normal` — все три фазы пригодны;
+- `partial` — пригодна только часть фаз; например, одно реле напряжения временно отключило свою фазу;
+- `lost` — пригодных фаз не осталось.
+
+`partial` и `lost` сами по себе **не являются неисправностью контакторов и не требуют Recovery**. Они запускают обычную выдержку `grid_failure_delay`; если сеть не нормализовалась за это время, АВР начинает штатный переход на резерв.
+
+Рекомендуемая Home Assistant template-сущность:
+
+```yaml
+- sensor:
+    - name: "Grid Input State"
+      unique_id: grid_input_state
+      availability: >
+        {{
+          has_value('binary_sensor.grid_meter_status') and
+          has_value('sensor.grid_l1_voltage') and
+          has_value('sensor.grid_l2_voltage') and
+          has_value('sensor.grid_l3_voltage')
+        }}
+      state: >
+        {% set meter_ok = is_state('binary_sensor.grid_meter_status', 'on') %}
+        {% set l1 = states('sensor.grid_l1_voltage') | float(0) > 160 %}
+        {% set l2 = states('sensor.grid_l2_voltage') | float(0) > 160 %}
+        {% set l3 = states('sensor.grid_l3_voltage') | float(0) > 160 %}
+        {% if not meter_ok %}
+          lost
+        {% elif l1 and l2 and l3 %}
+          normal
+        {% elif not l1 and not l2 and not l3 %}
+          lost
+        {% else %}
+          partial
+        {% endif %}
+```
+
+Существующий `binary_sensor.grid_input_ready` остаётся входом «сеть полностью пригодна / не пригодна» и сохраняется для совместимости. Новый sensor нужен для различения частичной потери фаз и полного blackout; если он ещё не установлен, основная логика АВР продолжает работать по старому binary input.
 
 ## 3. Работа и дистанционный запуск генераторов
 
@@ -275,6 +316,7 @@ DISARMED — только наблюдение
 
 ```text
 source
+grid_input_state
 phase
 generator
 generator_model
@@ -301,6 +343,17 @@ ups_only
 no_power
 unknown
 ```
+
+`grid_input_state`:
+
+```text
+normal
+partial
+lost
+unknown
+```
+
+Это качество внешней трёхфазной сети, а не положение сетевого контактора.
 
 `phase`:
 
