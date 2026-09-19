@@ -1,6 +1,6 @@
 from dataclasses import replace
 
-from domain import PowerPath, PowerSource
+from domain import GridInputState, PowerPath, PowerSource
 from power_transfer import (
     PowerTransferController,
     PowerTransferObservation,
@@ -17,6 +17,7 @@ def observed(
     grid_connected=True,
     generator_selected=False,
     emergency_stop=False,
+    grid_input_state=None,
 ):
     return PowerTransferObservation(
         grid_ready=grid_ready,
@@ -25,6 +26,7 @@ def observed(
         grid_connected=grid_connected,
         generator_selected=generator_selected,
         emergency_stop=emergency_stop,
+        grid_input_state=grid_input_state,
     )
 
 
@@ -46,6 +48,38 @@ def test_grid_path_without_physical_grid_is_ups_only():
     controller.step(0.0, no_grid, None, desired_generator_ready=False)
     assert controller.status().actual_path == PowerPath.GRID
     assert controller.status().actual_source == PowerSource.UPS_ONLY
+
+
+def test_partial_grid_keeps_grid_path_confirmed_without_recovery():
+    """Отключение одной фазы не является потерей подтверждения контактора."""
+    controller = PowerTransferController(confirmation_timeout=60.0)
+    partial = observed(
+        grid_ready=False,
+        grid_input_state=GridInputState.PARTIAL,
+        house_on_grid=True,
+        grid_connected=True,
+    )
+
+    controller.step(0.0, partial, None, desired_generator_ready=False)
+    controller.step(61.0, partial, None, desired_generator_ready=False)
+
+    assert controller.status().actual_path == PowerPath.GRID
+    assert controller.status().actual_source == PowerSource.GRID
+    assert controller.status().recovery_required is False
+
+
+def test_complete_grid_loss_with_selected_grid_path_is_ups_only():
+    controller = PowerTransferController()
+    lost = observed(
+        grid_ready=False,
+        grid_input_state=GridInputState.LOST,
+        house_on_grid=True,
+        grid_connected=True,
+    )
+    controller.step(0.0, lost, None, desired_generator_ready=False)
+    assert controller.status().actual_path == PowerPath.GRID
+    assert controller.status().actual_source == PowerSource.UPS_ONLY
+    assert controller.status().recovery_required is False
 
 
 def test_deliberately_disconnected_grid_is_isolated():
