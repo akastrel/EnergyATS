@@ -611,6 +611,7 @@ class EnergySupervisorApp:
             },
             power_inputs_known=hardware.power_transfer.required_states_known,
             bus=self.generator_bus.status(),
+            grid_input_state=hardware.grid_input_state,
         )
 
     def _ups_run_observation(
@@ -1234,6 +1235,11 @@ class EnergySupervisorApp:
             "friendly_name": "Energy ATS Status",
             "icon": "mdi:transfer-switch",
             "source": observation.power.actual_source.value,
+            "grid_input_state": (
+                hardware.grid_input_state.value
+                if hardware.grid_input_state is not None
+                else "unknown"
+            ),
             "phase": self.supervisor.phase.value,
             "generator": (
                 self._profile(actual_slot).display_name if actual_slot else None
