@@ -29,6 +29,7 @@ armed: false
 Перед `armed: true` проверьте:
 
 - `binary_sensor.grid_input_ready`;
+- `sensor.grid_input_state` (`normal / partial / lost`);
 - `binary_sensor.house_powered_by_grid` / `_by_generator`;
 - RUNNING/REMOTE обоих генераторов;
 - `switch.grid_power` и `switch.use_generator_as_power_source`;
@@ -36,6 +37,8 @@ armed: false
 - имена/модели генераторов и `select.primary_generator`.
 
 После этого выполните физические commissioning-тесты из `USER_TESTS_RU.md`.
+
+`grid_input_ready` отвечает только на вопрос «вся сеть пригодна?». `grid_input_state` отдельно различает нормальную сеть, частичную потерю фаз и полный blackout. Положение сетевого контактора определяется по собственному feedback и не выводится из качества Grid.
 
 ## UPS Run
 
