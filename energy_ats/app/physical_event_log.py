@@ -14,6 +14,7 @@ from typing import Mapping
 from domain import (
     EventVisibility,
     GeneratorSlot,
+    GridInputState,
     PowerPath,
     PowerSource,
     SupervisorEvent,
@@ -30,7 +31,7 @@ class _GeneratorPhysicalState:
 
 @dataclass(frozen=True)
 class _PhysicalState:
-    grid_ready: bool | None
+    grid_input_state: GridInputState | None
     automatic_transfer_enabled: bool
     power_path: PowerPath
     power_source: PowerSource
@@ -53,6 +54,7 @@ class PhysicalEventTracker:
         self,
         *,
         grid_ready: bool | None,
+        grid_input_state: GridInputState | None = None,
         automatic_transfer_enabled: bool,
         power_path: PowerPath,
         power_source: PowerSource,
@@ -62,8 +64,15 @@ class PhysicalEventTracker:
         generator_names: Mapping[GeneratorSlot, str],
         managed_slots: frozenset[GeneratorSlot] = frozenset(),
     ) -> tuple[SupervisorEvent, ...]:
+        effective_grid_state = grid_input_state
+        if effective_grid_state is None:
+            if grid_ready is True:
+                effective_grid_state = GridInputState.NORMAL
+            elif grid_ready is False:
+                effective_grid_state = GridInputState.LOST
+
         current = _PhysicalState(
-            grid_ready=grid_ready,
+            grid_input_state=effective_grid_state,
             automatic_transfer_enabled=automatic_transfer_enabled,
             power_path=power_path,
             power_source=power_source,
@@ -80,15 +89,15 @@ class PhysicalEventTracker:
             return ()
 
         events: list[SupervisorEvent] = []
-        self._append_bool_event(
-            events,
-            previous.grid_ready,
-            current.grid_ready,
-            true_key="grid_input_on",
-            false_key="grid_input_off",
-            unknown_key="grid_input_unknown",
-            false_level="warning",
-        )
+        if previous.grid_input_state != current.grid_input_state:
+            if current.grid_input_state == GridInputState.NORMAL:
+                events.append(user_event("grid_input_on"))
+            elif current.grid_input_state == GridInputState.PARTIAL:
+                events.append(user_event("grid_input_partial", level="warning"))
+            elif current.grid_input_state == GridInputState.LOST:
+                events.append(user_event("grid_input_lost", level="warning"))
+            else:
+                events.append(user_event("grid_input_unknown", level="warning"))
 
         if previous.automatic_transfer_enabled != current.automatic_transfer_enabled:
             events.append(
