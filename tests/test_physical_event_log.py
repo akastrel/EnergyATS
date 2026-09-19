@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from domain import GeneratorSlot, PowerPath, PowerSource
+from domain import GeneratorSlot, GridInputState, PowerPath, PowerSource
 from generator_bus import GeneratorBusOwner
 from physical_event_log import PhysicalEventTracker
 from user_messages import user_message
@@ -18,6 +18,7 @@ def observe(
     tracker: PhysicalEventTracker,
     *,
     grid_ready=True,
+    grid_input_state=None,
     automatic=True,
     path=PowerPath.GRID,
     source=PowerSource.GRID,
@@ -31,6 +32,7 @@ def observe(
 ):
     return tracker.observe(
         grid_ready=grid_ready,
+        grid_input_state=grid_input_state,
         automatic_transfer_enabled=automatic,
         power_path=path,
         power_source=source,
@@ -65,7 +67,7 @@ def test_grid_loss_and_later_isolation_are_distinct_physical_facts():
         path=PowerPath.GRID,
         source=PowerSource.UPS_ONLY,
     )
-    assert user_message("grid_input_off") in messages(lost)
+    assert user_message("grid_input_lost") in messages(lost)
     assert user_message("power_source_ups_grid_path") in messages(lost)
     assert user_message("power_path_isolated_from_grid") not in messages(lost)
 
@@ -77,6 +79,32 @@ def test_grid_loss_and_later_isolation_are_distinct_physical_facts():
     )
     assert user_message("power_path_isolated_from_grid") in messages(isolated)
     assert user_message("power_source_ups_isolated") not in messages(isolated)
+
+
+def test_partial_grid_loss_is_distinct_from_complete_blackout():
+    """Потеря одной/нескольких фаз должна быть отдельным важным событием."""
+    tracker = PhysicalEventTracker()
+    observe(
+        tracker,
+        grid_ready=True,
+        grid_input_state=GridInputState.NORMAL,
+    )
+
+    partial = observe(
+        tracker,
+        grid_ready=False,
+        grid_input_state=GridInputState.PARTIAL,
+    )
+    assert user_message("grid_input_partial") in messages(partial)
+    assert user_message("grid_input_lost") not in messages(partial)
+
+    lost = observe(
+        tracker,
+        grid_ready=False,
+        grid_input_state=GridInputState.LOST,
+        source=PowerSource.UPS_ONLY,
+    )
+    assert user_message("grid_input_lost") in messages(lost)
 
 
 def test_managed_running_transition_is_marked_as_energyats_start():
