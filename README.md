@@ -6,7 +6,7 @@ Home Assistant App для управления резервным электро
 
 ## Что умеет EnergyATS
 
-- автоматический переход на резерв при физическом исчезновении Grid;
+- автоматический переход на резерв при непригодной Grid, включая частичную потерю фаз и полный blackout;
 - ручной запуск/остановка managed generator session;
 - выбор PRIMARY generator из Home Assistant и один fallback `PRIMARY -> SECONDARY` без ping-pong;
 - корректная работа физической схемы, в которой A и B могут одновременно быть RUNNING, но общей generator bus владеет только один аппаратно выбранный generator;
@@ -32,6 +32,7 @@ Home Assistant App для управления резервным электро
 - аппаратная взаимная блокировка допускает только одного owner общей generator bus;
 - `GeneratorBusTracker` восстанавливает FIFO-owner по истории RUNNING; если историю доказать нельзя, owner остаётся `UNKNOWN`;
 - RUNNING двигателя, REMOTE command, selector state и feedback — разные факты;
+- качество трёхфазной Grid (`normal / partial / lost`) и положение сетевого контактора — разные физические факты;
 - внешний RUNNING generator не становится managed автоматически;
 - автоматический fallback ограничен одним переходом на другой slot;
 - generator не останавливается под подтверждённой нагрузкой дома;
