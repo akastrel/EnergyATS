@@ -15,7 +15,6 @@ from enum import Enum
 from typing import Any, Mapping
 
 from domain import GeneratorSlot, GridInputState, SupervisorEvent
-from user_messages import user_message
 
 
 class HealthLevel(str, Enum):
@@ -69,6 +68,7 @@ class HealthStatus:
     def attributes(self) -> dict[str, Any]:
         return {
             "friendly_name": "АВР — состояние",
+            "level": self.level.value,
             "summary": self.summary,
             "reasons": list(self.reasons),
             "icon": self.icon,
@@ -195,7 +195,7 @@ def build_weekly_exercise_summary(
         )
         for slot in GeneratorSlot
     ]
-    message = user_message("exercise_weekly_summary", summary=" ".join(parts))
+    message = f"Плановые проверки генераторов. {' '.join(parts)}"
     return WeeklyExerciseSummary(week_key, SupervisorEvent("info", message))
 
 
@@ -264,8 +264,7 @@ def _relative_due_text(days: int) -> str:
     if days == 1:
         return "завтра"
     if days < 0:
-        overdue = -days
-        return f"просрочен на {_duration_days_ru(overdue)}"
+        return f"просрочен на {_duration_days_ru(-days)}"
     if days < 7:
         return f"через {_duration_days_ru(days)}"
 
