@@ -451,26 +451,20 @@ def test_brief_grid_outage_without_handoff_does_not_cancel_shutdown_obligation()
     assert decision.authorized_shutdown_slot == GeneratorSlot.A
 
 
-def test_qualifying_outage_run_updates_next_due_without_scheduled_exercise():
+def test_qualifying_run_fact_updates_next_due_without_scheduled_exercise():
     scheduler = ExerciseScheduler(configs(b=False))
     initial = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
     scheduler.step(observation(initial))
 
-    started = datetime(2026, 1, 10, 8, 0, tzinfo=timezone.utc)
-    scheduler.step(
-        observation(started, grid=False, grid_path=False, a_running=True, a_remote=True)
-    )
-    qualified = started + timedelta(minutes=10)
-    scheduler.step(
-        observation(qualified, grid=False, grid_path=False, a_running=True, a_remote=True)
-    )
+    qualified = datetime(2026, 1, 10, 8, 10, tzinfo=timezone.utc)
+    scheduler.record_qualifying_runs({GeneratorSlot.A: qualified})
 
-    assert scheduler.states[GeneratorSlot.A].last_qualifying_run is not None
+    assert scheduler.states[GeneratorSlot.A].last_qualifying_run == qualified.isoformat()
     attrs = scheduler.status_attributes(qualified, qualified.timestamp())
     assert attrs["generator_a_exercise_next_due"].startswith("2026-02-09")
 
 
-def test_short_observed_run_does_not_update_qualifying_history():
+def test_scheduler_does_not_infer_qualifying_run_from_running_observation():
     scheduler = ExerciseScheduler(configs(b=False))
     initial = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
     scheduler.step(observation(initial))
@@ -479,9 +473,9 @@ def test_short_observed_run_does_not_update_qualifying_history():
     scheduler.step(observation(started, a_running=True, a_remote=True))
     scheduler.step(
         observation(
-            started + timedelta(minutes=5),
-            a_running=False,
-            a_remote=False,
+            started + timedelta(minutes=15),
+            a_running=True,
+            a_remote=True,
         )
     )
 
@@ -533,7 +527,7 @@ def test_restart_after_duration_preserves_shutdown_obligation():
     assert decision.authorized_shutdown_slot == GeneratorSlot.A
 
 
-def test_qualifying_history_survives_handoff_when_duration_was_reached_first():
+def test_qualifying_history_survives_handoff_when_fact_was_recorded_first():
     scheduler = ExerciseScheduler(configs(b=False))
     scheduler.step(
         observation(datetime(2026, 1, 1, 14, 0, tzinfo=timezone.utc))
@@ -551,10 +545,11 @@ def test_qualifying_history_survives_handoff_when_duration_was_reached_first():
         a_running=True,
         a_remote=True,
     )
+    scheduler.record_qualifying_runs({GeneratorSlot.A: qualified})
     scheduler.step(current)
     qualifying_time = scheduler.states[GeneratorSlot.A].last_qualifying_run
     scheduler.handoff_to_outage(GeneratorSlot.A, current)
 
-    assert qualifying_time is not None
+    assert qualifying_time == qualified.isoformat()
     assert scheduler.states[GeneratorSlot.A].last_qualifying_run == qualifying_time
     assert scheduler.history[-1]["result"] == ExerciseResult.INTERRUPTED_BY_OUTAGE.value
