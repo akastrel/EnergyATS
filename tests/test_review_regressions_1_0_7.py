@@ -13,7 +13,7 @@ import pytest
 from domain import GeneratorSlot
 from energy_supervisor import SupervisorPhase
 from generator_bus import GeneratorBusOwner, GeneratorBusTracker
-from ha_adapter import ENTITIES, HomeAssistantAdapter
+from ha_adapter import ENERGY_ATS_STATUS_ENTITY, ENTITIES, HomeAssistantAdapter
 from ha_client import HomeAssistantConnectionError
 from power_transfer import (
     PowerTransferController,
@@ -200,8 +200,10 @@ async def test_r4_recovery_status_has_priority_over_ups_wait(tmp_path):
     await app._tick(3)
 
     assert app.supervisor.phase == SupervisorPhase.RECOVERY_REQUIRED
-    state = fake.state_writes[-1][1]
-    assert state == "Требуется внимание технического специалиста"
+    status_writes = [
+        item for item in fake.state_writes if item[0] == ENERGY_ATS_STATUS_ENTITY
+    ]
+    assert status_writes[-1][1] == "Требуется внимание технического специалиста"
     await app.adapter.cancel_background_publications()
 
 
