@@ -132,8 +132,12 @@ class StateStore:
             supervisor.require_recovery(
                 f"Не удалось восстановить persistent state: {exc}"
             )
+            # JSON и schema уже были успешно прочитаны. Сохраняем исходный
+            # payload доступным для независимых soft-state consumers (например
+            # GeneratorRun history и operator weekly marker), как это было до
+            # выноса restore из main.py.
             return RestoredAppState(
-                None,
+                saved,
                 GeneratorBusTracker(),
                 supervisor,
                 fresh_scheduler,
