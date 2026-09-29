@@ -129,7 +129,13 @@ _READY_PHASES = {
 
 
 class GeneratorController:
-    """Подтверждаемый FSM одного двигателя; ownership задаёт Supervisor."""
+    """Подтверждаемый FSM одного двигателя; ownership задаёт Supervisor.
+
+    ``observe`` синхронизирует локальную FSM только с уже случившимися физическими
+    фактами. ``plan`` применяет intent Supervisor и может сформировать команды.
+    Legacy ``step`` оставлен как совместимый observe+plan wrapper для unit tests и
+    внешнего кода; application loop должен вызывать observe и plan раздельно.
+    """
 
     def __init__(self, profile: GeneratorProfile) -> None:
         self.profile = profile
@@ -168,77 +174,16 @@ class GeneratorController:
             return True
         return False
 
-    def step_authorized_shutdown(
+    def observe(
         self,
         now: float,
         o: GeneratorObservation,
-    ) -> tuple[list[GeneratorAction], str | None]:
-        """Остановить разгруженный двигатель, на который Supervisor дал право."""
-        if not o.required_states_known:
-            return [], f"{self.profile.display_name}: неизвестны RUNNING или REMOTE."
-        if o.emergency_stop is not False:
-            return [], "Активен Generators Emergency Stop."
-        if o.load_connected is not False:
-            return [], f"{self.profile.display_name}: нагрузка не подтверждена как отключённая."
-
-        if o.running is False and o.remote_on is False:
-            self._idle()
-            self.initialized = True
-            return [], None
-
-        self.initialized = True
-        if self.phase == GeneratorPhase.WAITING_FOR_STOP:
-            if self._expired(now):
-                reason = (
-                    f"{self.profile.display_name} не подтвердил остановку за "
-                    f"{int(self.profile.stop_timeout_seconds)} с."
-                )
-                self._latch_fault(reason)
-                return [], reason
-            return [], None
-
-        if self.phase == GeneratorPhase.COOLING_DOWN:
-            if o.running is False or self._expired(now):
-                return self._remote_off(now), None
-            return [], None
-
-        ensure_choke_run = self._choke_position_uncertain()
-        if o.running is True:
-            self.phase = GeneratorPhase.COOLING_DOWN
-            self.deadline = now + self.profile.cooldown_seconds
-            self.fault = None
-            if ensure_choke_run:
-                return [
-                    self._action(
-                        GeneratorActionKind.CHOKE_TO_RUN,
-                        f"{self.profile.display_name}: перед безопасной остановкой "
-                        "приводим заслонку в рабочее положение.",
-                    )
-                ], None
-            return [], None
-
-        actions: list[GeneratorAction] = []
-        if ensure_choke_run:
-            actions.append(
-                self._action(
-                    GeneratorActionKind.CHOKE_TO_RUN,
-                    f"{self.profile.display_name}: перед остановкой открываем заслонку.",
-                )
-            )
-        actions.extend(self._remote_off(now))
-        return actions, None
-
-    def step(
-        self,
-        now: float,
-        o: GeneratorObservation,
-        desired_running: bool,
         *,
-        actions_allowed: bool = True,
         stable_managed_session: bool = False,
-    ) -> list[GeneratorAction]:
+    ) -> None:
+        """Применить физический snapshot без формирования hardware actions."""
         if not o.required_states_known:
-            return []
+            return
 
         if not self.initialized:
             self._initialize(now, o, stable_managed_session)
@@ -246,13 +191,31 @@ class GeneratorController:
 
         if o.emergency_stop is True:
             self._latch_fault("Активен Generators Emergency Stop")
-            return []
+            return
 
-        if self.phase == GeneratorPhase.EXTERNAL_RUNNING:
-            if o.running is False and o.remote_on is False:
-                self._idle()
+        if (
+            self.phase == GeneratorPhase.EXTERNAL_RUNNING
+            and o.running is False
+            and o.remote_on is False
+        ):
+            self._idle()
+
+    def plan(
+        self,
+        now: float,
+        o: GeneratorObservation,
+        desired_running: bool,
+        *,
+        actions_allowed: bool = True,
+    ) -> list[GeneratorAction]:
+        """Применить desired state и сформировать разрешённые hardware actions."""
+        if not o.required_states_known:
             return []
-        if self.phase == GeneratorPhase.FAULT or not actions_allowed:
+        if o.emergency_stop is True:
+            return []
+        if self.phase in {GeneratorPhase.EXTERNAL_RUNNING, GeneratorPhase.FAULT}:
+            return []
+        if not actions_allowed:
             return []
 
         if self.phase == GeneratorPhase.IDLE:
@@ -387,6 +350,88 @@ class GeneratorController:
                     f"{int(self.profile.stop_timeout_seconds)} с."
                 )
         return []
+
+    def step(
+        self,
+        now: float,
+        o: GeneratorObservation,
+        desired_running: bool,
+        *,
+        actions_allowed: bool = True,
+        stable_managed_session: bool = False,
+    ) -> list[GeneratorAction]:
+        """Backward-compatible observe + plan wrapper."""
+        self.observe(
+            now,
+            o,
+            stable_managed_session=stable_managed_session,
+        )
+        return self.plan(
+            now,
+            o,
+            desired_running,
+            actions_allowed=actions_allowed,
+        )
+
+    def step_authorized_shutdown(
+        self,
+        now: float,
+        o: GeneratorObservation,
+    ) -> tuple[list[GeneratorAction], str | None]:
+        """Остановить разгруженный двигатель, на который Supervisor дал право."""
+        if not o.required_states_known:
+            return [], f"{self.profile.display_name}: неизвестны RUNNING или REMOTE."
+        if o.emergency_stop is not False:
+            return [], "Активен Generators Emergency Stop."
+        if o.load_connected is not False:
+            return [], f"{self.profile.display_name}: нагрузка не подтверждена как отключённая."
+
+        if o.running is False and o.remote_on is False:
+            self._idle()
+            self.initialized = True
+            return [], None
+
+        self.initialized = True
+        if self.phase == GeneratorPhase.WAITING_FOR_STOP:
+            if self._expired(now):
+                reason = (
+                    f"{self.profile.display_name} не подтвердил остановку за "
+                    f"{int(self.profile.stop_timeout_seconds)} с."
+                )
+                self._latch_fault(reason)
+                return [], reason
+            return [], None
+
+        if self.phase == GeneratorPhase.COOLING_DOWN:
+            if o.running is False or self._expired(now):
+                return self._remote_off(now), None
+            return [], None
+
+        ensure_choke_run = self._choke_position_uncertain()
+        if o.running is True:
+            self.phase = GeneratorPhase.COOLING_DOWN
+            self.deadline = now + self.profile.cooldown_seconds
+            self.fault = None
+            if ensure_choke_run:
+                return [
+                    self._action(
+                        GeneratorActionKind.CHOKE_TO_RUN,
+                        f"{self.profile.display_name}: перед безопасной остановкой "
+                        "приводим заслонку в рабочее положение.",
+                    )
+                ], None
+            return [], None
+
+        actions: list[GeneratorAction] = []
+        if ensure_choke_run:
+            actions.append(
+                self._action(
+                    GeneratorActionKind.CHOKE_TO_RUN,
+                    f"{self.profile.display_name}: перед остановкой открываем заслонку.",
+                )
+            )
+        actions.extend(self._remote_off(now))
+        return actions, None
 
     # State helpers ----------------------------------------------------
 
