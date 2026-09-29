@@ -10,7 +10,8 @@ Home Assistant App для управления резервным электро
 - корректная работа с двумя одновременно RUNNING генераторами и аппаратным FIFO-owner общей шины;
 - `UPS_ONLY` без отдельного Battery contactor;
 - **UPS Run**: Delayed Start и charge cycling для длительных отключений;
-- **Scheduled Exercise** для периодических пробных запусков A/B и еженедельная пользовательская сводка плановых проверок;
+- **Scheduled Exercise** для периодических пробных запусков A/B;
+- общая история физических запусков генераторов и еженедельная пользовательская сводка;
 - **Load Manager** для двух некритичных групп G1/G2;
 - Recovery при неоднозначном физическом состоянии;
 - причинно-следственный Logbook с отдельными trigger/action/feedback/result событиями;
@@ -40,6 +41,24 @@ armed: false
 
 `grid_input_ready` отвечает только на вопрос «вся сеть пригодна?». `grid_input_state` отдельно различает нормальную сеть, частичную потерю фаз и полный blackout. Положение сетевого контактора определяется по собственному feedback и не выводится из качества Grid.
 
+## Архитектура runtime
+
+В каждом нормальном control tick используется один и тот же порядок:
+
+```text
+observe physical state
+  -> local subsystem facts
+  -> EnergySupervisor decision
+  -> plan GC/TPC actions
+  -> execute hardware actions
+  -> publish status/health/log
+  -> persist state
+```
+
+`GeneratorController` и `PowerTransferController` сначала один раз принимают физический feedback через `observe()` и не формируют новых команд. После единственного системного решения `EnergySupervisor` они выполняют `plan()` и только тогда создают разрешённые actions. Это исключает прежний двойной mutating `step()` до и после Supervisor.
+
+`main.py` остаётся composition root. Persistence policy находится в `StateStore`, узкие DTO для subsystem строятся в `runtime_observations.py`, а status/health/runtime-log/weekly summary — в `operator_status.py`. Ни один из этих слоёв не является вторым policy center.
+
 ## UPS Run
 
 UPS Run определяет стратегию длительного outage. Две функции включаются независимо и по умолчанию выключены:
@@ -53,7 +72,9 @@ Manual request имеет приоритет над ожиданием/cycle sto
 
 Плановые пробные запуски настраиваются отдельно для A и B и по умолчанию выключены. Ordinary Exercise выполняется только при подтверждённом отсутствии семьи; forced run после grace требует заранее успешно доставленного warning. Exercise не переводит дом с Grid на generator bus и не имеет maintenance fallback.
 
-Раз в ISO-неделю после понедельника 09:00 локального времени Home Assistant App публикует одну MAIN-запись с последним успешным qualifying run и следующей плановой датой каждого генератора. Если App не работал в понедельник утром, запись появляется при первом последующем tick недели; persisted week key предотвращает повтор после restart.
+Qualifying RUNNING вычисляется единым monitor-ом физической истории запусков, а не параллельно Scheduler-ом. Достаточно длинный fault-free run любого происхождения может перенести следующий due соответствующего генератора.
+
+Раз в ISO-неделю после понедельника 09:00 локального времени Home Assistant App публикует одну MAIN-запись. Для каждого генератора она показывает последний фактический запуск с доступной длительностью/типом/результатом и следующую плановую дату; если общей истории ещё нет, используется последний qualifying run Scheduler-а. Persisted week key предотвращает повтор после restart.
 
 Если due-запуск отложен из-за присутствия семьи или неизвестного presence, Scheduler сообщает об этом один раз в соответствующее календарное окно запуска; на следующий день причина откладывания снова будет видна.
 
@@ -106,7 +127,7 @@ sensor.energy_ats_status
 sensor.energy_ats_health
 ```
 
-`energy_ats_status` показывает фактический source, phase, generator/bus owner, PRIMARY, managed session, Exercise, UPS Run и Load Manager state.
+`energy_ats_status` показывает фактический source, phase, generator/bus owner, PRIMARY, managed session, Exercise, UPS Run, Load Manager и компактную статистику запусков каждого генератора. Полный bounded history не публикуется в HA attributes, чтобы не раздувать Recorder.
 
 `energy_ats_health` — максимально высокоуровневый светофор:
 
@@ -128,4 +149,4 @@ sensor.energy_ats_health
 - [Физические тесты](https://github.com/akastrel/EnergyATS/blob/main/docs/USER_TESTS_RU.md)
 - [Changelog](https://github.com/akastrel/EnergyATS/blob/main/energy_ats/CHANGELOG.md)
 
-CI выполняет полный Python suite и production-container smoke. Это не заменяет проверку на реальной электроустановке.
+CI выполняет полный Python suite, отдельные regression tests границы `observe -> plan` и production-container smoke. Это не заменяет проверку на реальной электроустановке.

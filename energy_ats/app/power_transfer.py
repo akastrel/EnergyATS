@@ -83,7 +83,12 @@ _TRANSITIONS = {
 
 
 class PowerTransferController:
-    """Подтверждаемый break-before-make автомат основных контакторов."""
+    """Подтверждаемый break-before-make автомат основных контакторов.
+
+    ``observe`` синхронизирует FSM с физической топологией и подтверждениями уже
+    выполненного шага. ``plan`` применяет desired source и формирует максимум одну
+    новую силовую команду. Legacy ``step`` оставлен как observe+plan wrapper.
+    """
 
     def __init__(self, confirmation_timeout: float = 60.0) -> None:
         self.confirmation_timeout = confirmation_timeout
@@ -117,25 +122,22 @@ class PowerTransferController:
 
     # Normal operation -------------------------------------------------
 
-    def step(
+    def observe(
         self,
         now: float,
         observation: PowerTransferObservation,
-        desired_source: PowerSource | None,
-        *,
-        desired_generator_ready: bool,
-        actions_allowed: bool = True,
-    ) -> list[TransferAction]:
+    ) -> None:
+        """Применить physical feedback без формирования новой силовой команды."""
         if not observation.required_states_known:
             if not self.initialized:
                 self._set_unknown(TransferPhase.WAITING_FOR_DATA)
-            return []
+            return
 
         if self._unsafe_overlap(observation):
             self._require_recovery(
                 "Одновременно обнаружены несовместимые сетевой и генераторный вводы."
             )
-            return []
+            return
 
         if not self.initialized:
             self.initialized = True
@@ -144,13 +146,12 @@ class PowerTransferController:
                 self._require_recovery(
                     "После запуска Power Transfer физическая топология неоднозначна."
                 )
-                return []
+                return
             self._set_stable(*topology)
 
-        self.target_source = desired_source
         if self.phase == TransferPhase.RECOVERY_REQUIRED:
             self._observe_only(observation)
-            return []
+            return
 
         if self.transition_in_progress:
             if self._timed_out(now):
@@ -158,16 +159,46 @@ class PowerTransferController:
                     f"Не получено подтверждение силового шага {self.phase.value} "
                     f"за {int(self.confirmation_timeout)} с."
                 )
-                return []
+                return
             if not self._settle_transition(observation):
-                return []
+                return
+
+        topology = self._infer_topology(observation)
+        if topology is None:
+            if self.feedback_lost_since is None:
+                self.feedback_lost_since = now
+            elif now - self.feedback_lost_since >= self.confirmation_timeout:
+                self._require_recovery(
+                    "Устойчивая силовая топология потеряла подтверждение."
+                )
+            return
+
+        self.feedback_lost_since = None
+        self._set_stable(*topology)
+
+    def plan(
+        self,
+        now: float,
+        observation: PowerTransferObservation,
+        desired_source: PowerSource | None,
+        *,
+        desired_generator_ready: bool,
+        actions_allowed: bool = True,
+    ) -> list[TransferAction]:
+        """Применить Supervisor intent после отдельного observation pass."""
+        self.target_source = desired_source
+        if not observation.required_states_known:
+            return []
+        if self.phase == TransferPhase.RECOVERY_REQUIRED:
+            return []
+        if self.transition_in_progress:
+            return []
 
         topology = self._infer_topology(observation)
         if topology is None:
             # F3 / REQ-FAULT-02: исчезновение напряжения generator bus не доказывает
             # положение силовых контактов, но подтверждённый selector=ON даёт право
-            # выполнить только безопасный break — DESELECT. Это не угадывание
-            # topology и не разрешение make-команды по отсутствующему feedback.
+            # выполнить только безопасный break — DESELECT.
             if (
                 actions_allowed
                 and desired_source in {
@@ -181,20 +212,35 @@ class PowerTransferController:
             ):
                 self.feedback_lost_since = None
                 return self._begin(now, TransferActionKind.DESELECT_GENERATOR)
-
-            if self.feedback_lost_since is None:
-                self.feedback_lost_since = now
-            elif now - self.feedback_lost_since >= self.confirmation_timeout:
-                self._require_recovery(
-                    "Устойчивая силовая топология потеряла подтверждение."
-                )
             return []
 
-        self.feedback_lost_since = None
-        self._set_stable(*topology)
         if desired_source is None or not actions_allowed:
             return []
-        return self._drive(now, observation, desired_source, desired_generator_ready)
+        return self._drive(
+            now,
+            observation,
+            desired_source,
+            desired_generator_ready,
+        )
+
+    def step(
+        self,
+        now: float,
+        observation: PowerTransferObservation,
+        desired_source: PowerSource | None,
+        *,
+        desired_generator_ready: bool,
+        actions_allowed: bool = True,
+    ) -> list[TransferAction]:
+        """Backward-compatible observe + plan wrapper."""
+        self.observe(now, observation)
+        return self.plan(
+            now,
+            observation,
+            desired_source,
+            desired_generator_ready=desired_generator_ready,
+            actions_allowed=actions_allowed,
+        )
 
     def _drive(
         self,

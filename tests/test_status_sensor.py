@@ -5,7 +5,8 @@ import pytest
 from domain import GeneratorSlot, SessionReason
 from energy_supervisor import GeneratorSession, SupervisorPhase
 from ha_adapter import ENTITIES, ENERGY_ATS_STATUS_ENTITY
-from main import DEFAULT_OPTIONS, EnergySupervisorApp, _seconds_left
+from main import DEFAULT_OPTIONS, EnergySupervisorApp
+from operator_status import _seconds_left
 from state_store import StateStore
 
 
@@ -111,10 +112,16 @@ def test_status_reports_ups_only_when_grid_is_intentionally_isolated(tmp_path):
 async def test_status_publication_is_deduplicated(tmp_path):
     app, fake = app_with_fake(tmp_path)
     observation, hardware = normal_state(app, 100.0)
-    await app._publish_status(100.0, observation, hardware)
-    await app._publish_status(100.0, observation, hardware)
-    assert len(fake.published) == 1
-    entity_id, state, attributes = fake.published[0]
+    del observation
+
+    await app._finish_tick(100.0, hardware, ())
+    await app._finish_tick(100.0, hardware, ())
+
+    status_publications = [
+        item for item in fake.published if item[0] == ENERGY_ATS_STATUS_ENTITY
+    ]
+    assert len(status_publications) == 1
+    entity_id, state, attributes = status_publications[0]
     assert entity_id == ENERGY_ATS_STATUS_ENTITY
     assert state == "Питание от основной сети"
     assert attributes["source"] == "grid"
@@ -122,7 +129,7 @@ async def test_status_publication_is_deduplicated(tmp_path):
 
 def test_grid_restore_remaining_time_uses_only_current_supervisor_phase(tmp_path):
     app, _ = app_with_fake(tmp_path)
-    observation, _ = normal_state(app, 100.0)
+    observation, hardware = normal_state(app, 100.0)
     app.supervisor.session = GeneratorSession.begin(
         SessionReason.GRID_OUTAGE,
         GeneratorSlot.A,
@@ -131,7 +138,8 @@ def test_grid_restore_remaining_time_uses_only_current_supervisor_phase(tmp_path
     app.supervisor.phase = SupervisorPhase.ON_GENERATOR
     app.supervisor.grid_ready_since = 90.0
 
-    assert app._remaining_seconds(100.0, observation) == 50
+    payload = app._status_payload(100.0, observation, hardware)
+    assert payload["attributes"]["remaining_seconds"] == 50
 
 
 def test_corrupted_generator_bus_journal_requires_recovery(tmp_path):

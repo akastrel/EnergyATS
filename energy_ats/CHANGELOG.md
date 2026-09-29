@@ -1,5 +1,40 @@
 # Changelog
 
+## 1.3.0
+
+Крупный архитектурный рефакторинг runtime без намеренного изменения силовой policy АВР. Цель — вернуть `main.py` роль прозрачного composition root и сделать порядок принятия/исполнения решений явно читаемым и проверяемым.
+
+- Нормальный control tick теперь имеет явный поток `observe -> decide -> plan -> execute -> publish/persist`.
+- `GeneratorController` и `PowerTransferController` разделены на `observe()` и `plan()`: физический feedback применяется ровно один раз до Supervisor, новые hardware actions формируются только после системного решения. Прежний двойной mutating `step()` до/после Supervisor в application loop удалён; `step()` временно оставлен как compatibility wrapper для unit/external callers.
+- Добавлен `runtime_observations.py`: построение узких observation DTO для Supervisor, Scheduled Exercise, UPS Run и Load Manager вынесено из `main.py` в чистые application-layer функции без state/policy.
+- `StateStore` стал единственной persistence boundary: schema validation, core restore, локализованное soft restore, сборка общего snapshot, deduplication и атомарное сохранение больше не дублируются в `main.py`.
+- `operator_status.py` стал единой read-only presentation boundary для `sensor.energy_ats_status`, `sensor.energy_ats_health`, runtime-log signature и weekly summary. Presentation не выполняет hardware I/O и не продвигает управляющие FSM.
+- `main.py` оставляет process/HA lifecycle, sequencing, Supervisor/Recovery dispatch, выполнение hardware actions и delivery готовых operator projections; бизнес-арбитраж, persistence policy и formatting из него убраны.
+- Сохранена fail-safe семантика restart/reconnect: observation gap разрывает доказательство физической непрерывности, core pending action остаётся Recovery trigger, а повреждение soft Load Manager / UPS Run state локализуется.
+- Добавлены отдельные regression tests границы `observe -> plan`: observation сам не начинает новый запуск/transfer, а следующая hardware command появляется только в planning pass после intent.
+- Тесты status/runtime-log переведены с private presentation-методов `main.py` на новую presentation boundary, чтобы архитектурная граница проверялась тестами, а не обходилась compatibility-кодом.
+- `ARCHITECTURE_RU.md`, repository README и встроенный App README синхронизированы с новой runtime/persistence/presentation моделью; одновременно исправлено устаревшее описание weekly summary после 1.2.1.
+- Финальный Python suite после рефакторинга и version sync: `398 passed`; production `addon-container-smoke` проходит.
+- App и add-on version подняты до `1.3.0`; persistent `schema_version` остаётся `3`, migration не требуется.
+
+---
+
+## 1.2.1
+
+Единая наблюдаемая история всех физических запусков генераторов и устранение параллельного учёта qualifying RUNNING в Scheduled Exercise.
+
+- Добавлен общий monitor фактических запусков A/B: учитываются automatic, manual, exercise и external RUNNING с типом, временем начала/окончания, длительностью, результатом и причиной ошибки.
+- Для каждого генератора сохраняются aggregate `total_starts` / `total_runtime_seconds` и bounded history последних 100 завершённых запусков. Полный history намеренно не публикуется в HA attributes, чтобы не раздувать Recorder.
+- `sensor.energy_ats_status` получил компактные per-generator totals и данные последнего завершённого запуска.
+- Первый уже-RUNNING snapshot после restart/reconnect не превращается в выдуманный historical start; неизвестное время до observation gap не добавляется к runtime. После gap непрерывность должна быть доказана заново.
+- Qualifying run для Scheduled Exercise теперь определяется тем же владельцем физической RUNNING continuity, что и общая история. `ExerciseScheduler` больше не ведёт параллельные `_run_started_at/_run_faulted/_run_qualified`, а принимает только подтверждённый qualifying timestamp.
+- Достаточно длинный fault-free run любого происхождения может переносить следующий Exercise due. После restart уже работающий generator должен заново доказать полный configured interval; это не создаёт фиктивную historical запись.
+- Weekly summary при наличии истории показывает последний фактический запуск с доступной длительностью/типом/результатом; старый `last_qualifying_run` используется только как fallback.
+- Добавлены unit/app/summary/qualification regression tests, включая fault-before-threshold и restart-baseline без выдуманного start/runtime.
+- App и add-on version подняты до `1.2.1`; persistent `schema_version` остаётся `3`, `generator_runs` является обратно совместимым optional payload.
+
+---
+
 ## 1.2.0
 
 Пользовательский слой наблюдаемости АВР без изменения силовой policy: отдельный светофор состояния и регулярная сводка плановых проверок генераторов.
@@ -41,7 +76,7 @@ Production hardening по результатам повторного review в�
 
 - **R1 / Recovery:** Recovery при всё ещё выбранной generator-ветви и исчезнувшем generator feedback использует тот же безопасный break/`DESELECT_GENERATOR`, что обычный transfer. Принятый Recovery Reset больше не может бесконечно ждать неподтверждённую физическую операцию: каждый шаг имеет конечный timeout и при отказе остаётся в `RECOVERY_REQUIRED`.
 - **R2 / Grid continuity:** потеря наблюдения Home Assistant/reconnect разрывает доказанную непрерывность Grid. `grid_failure_delay` и `grid_restore_stable_time` после observation gap отсчитываются заново от валидных observations; wall-clock время внутри разрыва не считается доказательством стабильности.
-- **R3 / Generator bus FIFO:** persisted owner/run-context больше не считается доказанной непрерывной FIFO-историей через restart/gap. Если после разрыва оба generator уже RUNNING и порядок их запуска нельзя наблюдаемо доказать, owner остаётся `UNKNOWN`; persisted данные используются только как совместимый journal payload/диагностика.
+- **R3 / Generator bus FIFO:** persisted owner/run-context больше не считается доказанной непрерывной FIFO-историей через restart/gap. Если после разрыва оба уже RUNNING и порядок их запуска нельзя наблюдаемо доказать, owner остаётся `UNKNOWN`; persisted данные используются только как совместимый journal payload/диагностика.
 - **R4 / Status priority:** `RECOVERY_REQUIRED` имеет приоритет в основном пользовательском status над штатными локальными labels UPS Run/Exercise/Load Manager и больше не может отображаться как обычное «Питание от UPS».
 - **R5 / Status delivery:** `sensor.energy_ats_status` переведён на один последовательный latest-wins publisher с retry. Старый медленный REST write больше не может завершиться после нового аварийного состояния и затереть его; при временной ошибке доставляется последнее актуальное desired state.
 - **R6 / Load Manager:** frozen generator-power sample не считается восстановлением measurement stream. Recovery начинается только с новой revision/sample, затем обязательно проходит новый stabilization window; событие «восстановлено» публикуется только после успешного завершения этого окна, старые overload/admission timers не продолжаются.
