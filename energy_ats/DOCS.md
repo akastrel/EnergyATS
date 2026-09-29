@@ -14,10 +14,11 @@ EnergyATS управляет резервным электроснабжение
 - безопасный Grid / Generator transfer с подтверждением каждого шага;
 - работа только от критической UPS-линии (`UPS_ONLY`);
 - UPS Run для длительных отключений;
-- Scheduled Exercise для периодических пробных запусков;
+- Scheduled Exercise для периодических пробных запусков и еженедельная сводка их расписания;
 - Load Manager для двух некритичных групп;
 - Recovery после неоднозначной или незавершённой физической операции;
-- причинно-следственный журнал ключевых решений и физических подтверждений.
+- причинно-следственный журнал ключевых решений и физических подтверждений;
+- отдельный пользовательский светофор состояния АВР.
 
 ## 2. Важные особенности физической схемы
 
@@ -67,6 +68,8 @@ armed: false
 - `bus_owner = none`, если оба generator остановлены;
 - нет `RECOVERY_REQUIRED` без причины;
 - optional functions остаются выключенными, если вы ещё не готовы их тестировать.
+
+В режиме `armed: false` `sensor.energy_ats_health` закономерно показывает `red`: аппаратные команды запрещены и автоматическое резервирование нельзя считать работоспособным. Это не означает физическую неисправность установки.
 
 Только после этого переходите к:
 
@@ -225,6 +228,18 @@ Ordinary Exercise:
 
 После grace presence больше не блокирует forced run, но safety checks сохраняются. Forced run разрешён только после заранее **успешно доставленного** warning.
 
+Если due-запуск не состоялся из-за присутствия семьи или неизвестного presence, пользовательская запись создаётся один раз в календарное окно запуска. На следующий день Scheduler снова объяснит причину отсрочки, если она сохранилась.
+
+### Еженедельная сводка пробных запусков
+
+Раз в ISO-неделю после понедельника 09:00 по локальному времени Home Assistant в MAIN Logbook появляется одна запись вида:
+
+> Плановые проверки генераторов. Elemax: последний успешный запуск — 5 сентября; следующий пробный запуск — 5 октября (через 6 дней). Вепрь: последний успешный запуск — 2 сентября; следующий пробный запуск — 8 октября (через 9 дней).
+
+Сводка использует те же `last_qualifying_run` и `next_due`, которые уже рассчитывает `ExerciseScheduler`; отдельного расписания для сообщения нет. Если App не работал в понедельник утром, сообщение публикуется при первом последующем tick текущей недели. Ключ последней опубликованной ISO-недели сохраняется в persistent state, поэтому restart не создаёт дубль.
+
+Если automatic Exercise для конкретного генератора выключен, сводка прямо сообщает об этом. Просроченный due показывается как «просрочен на …».
+
 Если во время RUNNING Exercise появляется manual request или реальный outage, EnergyATS может явно передать этот же generator соответствующей managed session. До подтверждённого handoff Scheduler остаётся ответственным за stop.
 
 ## 8. Load Manager
@@ -276,13 +291,16 @@ switch.non_critical_loads_basement_floor
 
 Потеря meter или load entity переводит только Load Manager в `DEGRADED`; core ATS продолжает работу. Stale power stream также считается потерей достоверного measurement и требует нового stabilization после восстановления.
 
-## 9. Status sensor
+## 9. Status и Health
 
-EnergyATS публикует:
+EnergyATS публикует два read-only sensor:
 
 ```text
 sensor.energy_ats_status
+sensor.energy_ats_health
 ```
+
+### `sensor.energy_ats_status`
 
 Наиболее полезные поля:
 
@@ -309,7 +327,34 @@ armed
 - UPS Run battery/wait/cycle state;
 - Load Manager phase/reason/power/limits/G1/G2 ownership.
 
-Status — только диагностика. Управляющая логика не использует его как input.
+### `sensor.energy_ats_health`
+
+Это пользовательский светофор, который не повторяет подробную FSM, а сводит уже известные факты к вопросу «нужно ли сейчас вмешательство?»:
+
+```text
+green   — всё в порядке
+yellow  — АВР работает, но требуется внимание
+red     — АВР неработоспособен как автоматический резерв
+```
+
+Примеры `yellow`: один разрешённый generator имеет fault, второй остаётся доступен; Grid находится в `partial`; UPS Run или Load Manager локально `DEGRADED`.
+
+Примеры `red`: `armed=false`, автоматический transfer отключён, Emergency Stop активен/неизвестен, обязательные feedback неизвестны, Supervisor находится в `RECOVERY_REQUIRED`, невозможно определить owner работающей generator bus либо все разрешённые генераторы находятся в fault.
+
+Обычный полный Grid outage не является неисправностью АВР. Если резервирование работает штатно, сам факт `lost` не переводит health в `yellow/red`.
+
+Атрибуты health:
+
+```text
+level
+summary
+reasons
+icon
+```
+
+`reasons` содержит конкретные причины текущего `yellow/red`, а не отдельную историю ошибок. Поэтому одна и та же неисправность не ведётся параллельно в нескольких состояниях.
+
+Оба sensor — только диагностика. Управляющая логика не использует их как input.
 
 ## 10. Logbook и notifications
 
@@ -330,7 +375,7 @@ trigger / физическое изменение
 
 Полную последовательность событий следует смотреть в App log: туда попадают MAIN/DETAIL events, команды Generator Controller, Power Transfer и Load Manager, а также отправляемые пользовательские сообщения. Основной поток Home Assistant Logbook намеренно содержит только существенные MAIN events; отдельная DETAIL-сущность не используется.
 
-Critical events используют `script.notify_critical`. Обычные status/Logbook/user publications выполняются best-effort и не должны задерживать control tick из-за сетевого timeout. При reconnect незавершённые background publications отменяются.
+Critical events используют `script.notify_critical`. Обычные status/health/Logbook/user publications выполняются best-effort и не должны задерживать control tick из-за сетевого timeout. `sensor.energy_ats_status` и `sensor.energy_ats_health` используют один общий последовательный latest-wins publisher с retry; после reconnect оба REST-created sensor публикуются заново.
 
 Исключение — warning перед forced Scheduled Exercise: Scheduler считает его доставленным только после успешного ответа Home Assistant.
 
@@ -341,6 +386,7 @@ EnergyATS сохраняет состояние, необходимое для �
 - managed session;
 - GeneratorBusTracker;
 - Scheduled Exercise;
+- ключ последней опубликованной weekly Exercise summary;
 - UPS Run;
 - Load Manager ownership;
 - незавершённые core hardware actions.
