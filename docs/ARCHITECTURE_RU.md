@@ -54,7 +54,17 @@ EnergyATS — один Home Assistant App и один Python-процесс. В�
 
 ### 2.4. Composition и I/O
 
-`main.py` собирает наблюдения, вызывает компоненты в определённом порядке и механически исполняет полученное решение. Он не содержит отдельного слоя бизнес-арбитража.
+Начиная с 1.3.0 runtime намеренно разделён на пять последовательных фаз:
+
+```text
+observe -> decide -> plan -> execute -> publish/persist
+```
+
+`main.py` остаётся composition root и задаёт только порядок этих фаз. Он не содержит отдельного слоя бизнес-арбитража.
+
+В начале каждого tick выполняется **ровно один physical observation pass**: `GeneratorController.observe()` и `PowerTransferController.observe()` синхронизируют свои FSM только с уже случившимися физическими фактами и не формируют новые hardware commands. После этого специализированные подсистемы вычисляют локальные факты, `EnergySupervisor` принимает общесистемное решение, а `GeneratorController.plan()` и `PowerTransferController.plan()` превращают уже принятое intent в конкретные разрешённые команды.
+
+Это устраняет прежнюю неочевидную схему, когда `step()` исполнительных FSM вызывался до Supervisor с `actions_allowed=False`, а затем повторно после решения. В 1.3.0 application loop больше не использует такой двойной mutating pass.
 
 Допустимы `if` для технического dispatch, например «если Supervisor выдал handoff directive — вызвать соответствующий метод Scheduler». Недопустимо решать в `main.py`, **когда** outage важнее Exercise, должен ли Target SoC проиграть manual request, можно ли захватить уже работающий generator либо какие generators Recovery имеет право остановить.
 
@@ -66,15 +76,17 @@ EnergyATS — один Home Assistant App и один Python-процесс. В�
 |---|---|
 | `domain.py` | Общие доменные типы: A/B, `PowerSource`, `PowerPath`, причины managed-session и другие shared values |
 | `generator_bus.py` | Фактический FIFO-owner общей generator bus и контекст непрерывных RUNNING |
-| `generator_controller.py` | Lifecycle одного двигателя: choke, REMOTE, start, warmup, ready, cooldown, stop |
-| `power_transfer.py` | Основные Grid/Generator контакторы и break-before-make |
+| `generator_controller.py` | Lifecycle одного двигателя; отдельные `observe()` физического состояния и `plan()` разрешённых действий |
+| `power_transfer.py` | Grid/Generator break-before-make; отдельные `observe()` feedback и `plan()` следующего силового шага |
 | `energy_supervisor.py` | **Единая системная логика:** `REQ-BEH-*`, managed-session, manual/outage, fallback, return, Recovery и разрешение пересечений режимов |
 | `exercise_scheduler.py` | Локальная логика Scheduled Exercise: schedule/history/warning/duration/result и ответственность за собственный auto-run до явного handoff |
 | `ups_run.py` | UPS Run subsystem: оценка battery/TTG/time, ожидание в `UPS_ONLY`, условия начала/окончания charge cycle. Не является вторым Supervisor |
 | `load_manager.py` | G1/G2: pre-transfer shedding, admission, continuous overload control, own-OFF ownership и локальный DEGRADED |
-| `ha_adapter.py` | HA states -> observations, hardware service calls, safety checks; routine status/Logbook/user publications выполняются best-effort background tasks |
-| `main.py` | Composition root: snapshot, вызов компонентов, механический dispatch `SupervisorDecision` / `RecoveryDecision`, hardware execution и persistence |
-| `state_store.py` | Атомарное сохранение persistent state |
+| `runtime_observations.py` | Чистые application-layer builders DTO для Supervisor, Exercise, UPS Run и Load Manager; state и policy не хранит |
+| `operator_status.py` | Чистая пользовательская проекция одного tick: status, health, runtime-log signature и weekly summary; управляющих решений не принимает |
+| `ha_adapter.py` | HA states -> physical snapshot, hardware service calls, safety checks и publications |
+| `main.py` | Composition root: process lifecycle, порядок `observe -> decide -> plan -> execute -> publish`, Recovery dispatch и hardware execution |
+| `state_store.py` | Единая persistence boundary: schema validation, core/soft restore, сборка snapshot, deduplication и атомарная запись |
 | `ha_client.py` | WebSocket/REST transport Home Assistant и revisions входящих HA states |
 
 Функциональная область и runtime-модуль называются одинаково: **UPS Run / `ups_run.py`**.
@@ -179,6 +191,13 @@ GC выдаёт только локальные engine actions:
 - `CHOKE_TO_COLD_START`;
 - `CHOKE_TO_RUN`.
 
+С 1.3.0 GC имеет две явные runtime-операции:
+
+- `observe(now, observation, ...)` — принимает physical snapshot, инициализирует/синхронизирует FSM, может зафиксировать физически наблюдаемый local fault, но **не возвращает hardware actions**;
+- `plan(now, observation, desired_running, ...)` — получает уже принятое верхним уровнем желание и только тогда формирует разрешённые engine actions.
+
+Legacy `step()` остаётся временным совместимым `observe() + plan()` wrapper для unit tests/внешнего кода, но application loop его не использует. Архитектурный контракт — один observation pass и один planning pass за tick.
+
 GC может определить локальный `FAULT`, но не принимает системное решение о fallback, Exercise result или `RECOVERY_REQUIRED`.
 
 `step_authorized_shutdown()` используется только после того, как верхний уровень уже разрешил остановить конкретный разгруженный двигатель.
@@ -198,6 +217,13 @@ TPC управляет только основной парой Grid / Generator
 - устойчивые: `STABLE_GRID`, `STABLE_ISOLATED`, `STABLE_GENERATOR`;
 - переходные: `DISCONNECTING_GRID`, `SELECTING_GENERATOR`, `DISCONNECTING_GENERATOR`, `CONNECTING_GRID`;
 - служебные: `WAITING_FOR_DATA`, `RECOVERY_REQUIRED`.
+
+С 1.3.0 TPC так же разделён на два этапа:
+
+- `observe()` интерпретирует фактическую силовую топологию, подтверждает/завершает ранее начатый transition, проверяет timeout/unsafe overlap и ничего нового не включает;
+- `plan()` получает `desired_source` после Supervisor arbitration и формирует максимум одну следующую силовую команду.
+
+Legacy `step()` является совместимым `observe() + plan()` wrapper и не используется runtime loop.
 
 Grid -> Generator:
 
@@ -340,9 +366,9 @@ Manual request во время cycle снимает automatic Target SoC stop ч
 
 После подтверждённой cycle stop UPS Run начинает новый post-cycle wait. Следующий automatic start снова проходит обычный Supervisor/GC/LoadManager/TPC path.
 
-### 8.10. Recovery в 1.0.3
+### 8.10. Recovery
 
-Recovery больше не является скрытой policy внутри `main.py`. `EnergySupervisor.recovery_step()` получает общие observations плюс локальный TPC blocker и Exercise-owned slot и возвращает `RecoveryDecision`.
+Recovery не является скрытой policy внутри `main.py`. `EnergySupervisor.recovery_step()` получает общие observations плюс локальный TPC blocker и Exercise-owned slot и возвращает `RecoveryDecision`.
 
 Внутренние directives:
 
@@ -456,7 +482,7 @@ Warning запрашивается заранее, а факт успешной 
 
 ### 10.2. Qualifying run и ответственность за stop
 
-Scheduler наблюдает qualifying RUNNING независимо от причины запуска. Достоверный run достаточной длительности может обновить `last_qualifying_run`.
+Scheduler больше не ведёт параллельную FSM физического RUNNING. Qualifying факт приходит из общего monitor-а физического запуска, который доказывает непрерывный fault-free RUNNING и передаёт Scheduler timestamp. Это устраняет дублирование истории RUNNING между Exercise и общей историей генераторов.
 
 После физического старта собственного automatic Exercise Scheduler сохраняет ответственность за stop до одного из событий:
 
@@ -552,11 +578,13 @@ Adapter:
 - читает обязательные core physical/control entities;
 - читает configurable presence entity;
 - читает soft battery/UPS, Load Manager и power metadata inputs;
-- формирует observations;
+- формирует общий physical `HardwareSnapshot`;
 - выполняет разрешённые Generator/TPC actions;
 - отдельно выполняет G1/G2 actions с локализацией ошибок;
 - выполняет аппаратные safety checks;
 - публикует status, Logbook и notifications.
+
+Узкие DTO конкретных subsystem больше не строятся внутри `main.py`: их без side effects формирует `runtime_observations.py` из общего snapshot и уже известных runtime facts.
 
 Presence является soft Scheduler input. `unknown/unavailable` presence не блокирует core ATS, а только не позволяет обычный presence-gated Exercise.
 
@@ -566,15 +594,16 @@ Load Manager и UPS Run battery inputs намеренно не входят в �
 
 ### 12.1. Runtime publications
 
-В 1.0.3 публикации разделены по семантике.
+Routine diagnostics и пользовательские проекции строятся в `operator_status.py`, а доставка остаётся ответственностью Adapter.
 
 **Routine diagnostics**:
 
 - status sensor;
+- health sensor;
 - Logbook;
 - обычные user notifications, включая Load Manager warnings.
 
-Они выполняются best-effort background tasks. HA/network timeout не должен удерживать критический control tick. Перед reconnect/закрытием transport незавершённые publication tasks отменяются.
+Они не являются управляющими inputs и не имеют права менять policy/FSM. Публикация deduplicate-ится на application boundary; транспортный latest-wins/retry остаётся в HA Adapter.
 
 **Safety-significant confirmed publication**:
 
@@ -582,7 +611,7 @@ Load Manager и UPS Run battery inputs намеренно не входят в �
 
 Он остаётся синхронным: Scheduler не может persist-ить факт delivery и разрешить future forced start, пока Home Assistant не подтвердил успешную отправку.
 
-Hardware service calls Generator/TPC/G1/G2 не относятся к background diagnostics: они исполняются в соответствующем control path и подтверждаются обычной физической моделью.
+Hardware service calls Generator/TPC/G1/G2 не относятся к routine diagnostics: они исполняются в соответствующем control path и подтверждаются обычной физической моделью.
 
 ---
 
@@ -590,27 +619,32 @@ Hardware service calls Generator/TPC/G1/G2 не относятся к background
 
 `main.py` — **composition root, а не второй Supervisor**.
 
-Нормальный поток одного tick:
+Нормальный поток одного tick в 1.3.0:
 
 ```text
 HA snapshot
   -> GeneratorBusTracker
-  -> refresh observations GC/TPC
+  -> GC.observe(A/B) + TPC.observe()        # один physical observation pass
+  -> build SupervisorObservation
+  -> GeneratorRunMonitor.observe()
   -> EnergySupervisor.recovery_step(...) if Recovery/reset active
        -> main mechanically executes RecoveryDirective via TPC/GC
-  -> otherwise ExerciseScheduler.step()    # локальные schedule/lifecycle facts
-  -> UPS Run step()                        # локальные battery/wait/cycle facts
-  -> EnergySupervisor.step(...)            # ЕДИНСТВЕННОЕ обычное системное решение
+  -> otherwise ExerciseScheduler.step()     # локальные schedule/lifecycle facts
+  -> UPS Run step()                         # локальные battery/wait/cycle facts
+  -> EnergySupervisor.step(...)             # ЕДИНСТВЕННОЕ обычное системное решение
   -> dispatch Supervisor directives to Exercise / UPS Run
-  -> LoadManager.step(...)                 # downstream G1/G2 execution constraints
-  -> G1/G2 soft actions
-  -> GC actions / authorized shutdown
-  -> Load Manager execution gate for Grid -> Generator
-  -> TPC actions
+  -> LoadManager.step(...)                  # downstream G1/G2 execution constraints
+  -> execute G1/G2 soft actions
+  -> GC.plan(A/B) / authorized shutdown     # planning только после Supervisor
+  -> TPC.plan()                             # planning только после Supervisor
+  -> persist pending core actions
   -> awaited hardware service calls
-  -> schedule routine status/log/notifications in background
-  -> persistence
+  -> build operator output
+  -> publish events/status/health
+  -> persist completed state
 ```
+
+Критичный инвариант: application loop не вызывает mutating `GC.step()`/`TPC.step()` до и после Supervisor. Physical facts применяются один раз через `observe()`, а новые команды планируются один раз через `plan()` после системной arbitration.
 
 Порядок вызова не даёт `main.py` права интерпретировать конфликт режимов. Все условия вида:
 
@@ -625,27 +659,37 @@ Recovery + Exercise
 
 должны быть разрешены в `EnergySupervisor` и трассированы к `REQ-BEH-*` либо к узкому recovery requirement.
 
-`main.py` может только исполнять результат: вызвать handoff/defer method, начать post-cycle wait, передать desired source/desired running, механически исполнить `RecoveryDirective` и записать события.
-
-Status/log/persistence не имеют права повторно выполнять управляющие FSM либо менять принятое решение.
+`main.py` может только исполнять результат: вызвать handoff/defer method, начать post-cycle wait, передать desired source/desired running, механически исполнить `RecoveryDirective`, выполнить разрешённые actions и передать готовые факты presentation/persistence слоям.
 
 ---
 
 ## 14. Persistent state и journal
 
-Persistent state хранит только данные, необходимые для безопасного restart и восстановления ownership/таймеров.
+`state_store.py` является единственной application persistence boundary. `main.py` больше не содержит раздельную логику `_load_state/_restore_state` и не собирает JSON payload вручную.
+
+`StateStore` отвечает за:
+
+- чтение JSON и проверку `schema_version`;
+- восстановление core `GeneratorBusTracker`, `EnergySupervisor`, `ExerciseScheduler`;
+- локализованное восстановление soft `LoadManager` и UPS Run;
+- сохранение исходного читаемого payload для независимых optional consumers (например generator run history/operator marker), даже если core restore потребовал Recovery;
+- сборку единого snapshot;
+- deduplication неизменившегося state;
+- атомарную запись через temp + `fsync` + rename.
 
 Сохраняются как минимум:
 
 - `app_version`;
 - Supervisor managed session/state;
 - `GeneratorBusTracker`;
+- общая история/статистика запусков генераторов;
 - `ExerciseScheduler`;
 - `LoadManager`;
 - UPS Run local state в ключе `ups_run`;
+- optional operator state;
 - core `pending_actions`.
 
-Текущая schema persistent state — `3`. Миграция старых schema не выполняется: несовместимый state отклоняется явно.
+Текущая schema persistent state — `3`. Рефакторинг 1.3.0 не требует migration: формат остаётся обратно совместимым в рамках schema 3.
 
 Load Manager сохраняет own-OFF (`shed_by_energy_ats`), phase/reason, pending consumer state и restore retry data. Measurement samples не persist-ятся: после restart power-based decision доказывается новым stabilization window.
 
@@ -659,31 +703,24 @@ G1/G2 soft actions не должны превращать consumer switch failur
 
 ## 15. Status sensor и наблюдаемость
 
-`sensor.energy_ats_status` — диагностическая проекция, а не источник решений.
+`sensor.energy_ats_status` и `sensor.energy_ats_health` — диагностические проекции, а не источники решений.
 
-Core attributes включают source/phase/generator/model/managed/bus owner/run-context/PRIMARY/fallback/session/timers/armed.
+Начиная с 1.3.0 все пользовательские read-only представления одного tick строятся в `operator_status.py` из уже принятых/наблюдаемых фактов:
 
-Exercise публикует для A/B due/history/forced-warning/active/result state.
+- status state + attributes;
+- health state + reasons;
+- runtime log signature/message;
+- weekly generator/exercise summary.
 
-UPS Run публикует как минимум:
+`operator_status.py` не выполняет HA I/O и не имеет права продвигать GC/TPC/Supervisor/Exercise/UPS/LoadManager FSM. `main.py` только сравнивает готовый output с предыдущим и передаёт изменившиеся projections в `HomeAssistantAdapter`.
 
-- enabled state Delayed Start / Charge Cycling;
-- battery SoC/TTG validity;
-- current UPS wait elapsed/remaining;
-- reason ожидания либо запуска;
-- cycle state / cycle ownership;
-- Target/Start thresholds.
+Core status attributes включают source/phase/generator/model/managed/bus owner/run-context/PRIMARY/fallback/session/timers/armed.
 
-Load Manager публикует:
+Exercise публикует для A/B due/history/forced-warning/active/result state. Общая история генераторов добавляет totals и последний фактический запуск без публикации полного bounded history в HA attributes.
 
-- enabled/phase;
-- degraded reason;
-- measured generator power;
-- active nominal/maximum owner;
-- G1/G2 state и `shed_by_energy_ats`;
-- overload timers;
-- next restore retry;
-- last reason.
+UPS Run публикует как минимум enabled state, battery SoC/TTG validity, current UPS wait, reason и cycle ownership/thresholds.
+
+Load Manager публикует enabled/phase, degraded reason, measured power, active owner limits, G1/G2 state/ownership, overload timers, restore retry и last reason.
 
 UI/log обязаны использовать реальные generator names, а не A/B там, где речь идёт о пользователе.
 
@@ -716,8 +753,10 @@ Diagnostic publication failure не изменяет desired source/session. И�
 21. `main.py` не принимает бизнес-решения о пересечении режимов или Recovery ownership/order.
 22. Каждая нетривиальная системная decision branch Supervisor трассируется к конкретному requirement.
 23. UI/log/persistence не продвигают управляющие FSM.
-24. Routine diagnostic network I/O не удерживает control tick на HA timeout.
+24. Routine diagnostic network I/O не становится источником управляющего решения.
 25. Forced Exercise warning считается доставленным только после подтверждённого успешного HA call.
+26. Каждый normal tick имеет один physical `observe()` pass GC/TPC до Supervisor и один `plan()` pass после Supervisor.
+27. Persistence restore/save policy принадлежит `StateStore`, а operator projection — `operator_status.py`; `main.py` не дублирует эти правила.
 
 ---
 
@@ -749,6 +788,8 @@ REQ-BEH-* -> EnergySupervisor branch -> TC-BEH-* / integration scenario
 
 Для локальных feature requirements аналогично используются соответствующие `REQ-*` и `TC-*` families.
 
-Начиная с 1.0.3 CI проверяет не только pytest environment: `addon-container-smoke` собирает настоящий add-on image и внутри него проверяет production `HomeAssistantClient` через test WebSocket/REST endpoint и App command handling.
+Начиная с 1.3.0 отдельные regression tests фиксируют runtime boundary: `observe()` не формирует новую команду, `plan()` делает это только после intent, а TPC после observation подтверждения не начинает следующий силовой шаг самопроизвольно.
+
+CI проверяет полный pytest suite и `addon-container-smoke`, который собирает настоящий add-on image и внутри него проверяет production `HomeAssistantClient` через test WebSocket/REST endpoint и App command handling.
 
 Зелёный CI проверяет программную модель и packaging/runtime, но не заменяет физические испытания контакторов, generator bus, G1/G2, meter, генераторов, DKG116 и MAP.
