@@ -74,7 +74,7 @@ from ups_run import (
 from power_transfer import PowerTransferController, TransferAction, TransferPhase
 from state_store import StateStore
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 STATE_SCHEMA_VERSION = 3
 
 DEFAULT_OPTIONS: dict[str, Any] = {
