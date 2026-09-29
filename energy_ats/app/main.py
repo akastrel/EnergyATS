@@ -37,7 +37,10 @@ from exercise_scheduler import (
     ExerciseObservation,
     ExerciseScheduler,
 )
-from generator_bus import GeneratorBusOwner, GeneratorBusTracker
+from generator_bus import (
+    GeneratorBusOwner,
+    GeneratorBusTracker,
+)
 from generator_controller import (
     GeneratorAction,
     GeneratorController,
@@ -45,6 +48,7 @@ from generator_controller import (
     GeneratorProfile,
     default_generator_profiles,
 )
+from generator_run_monitor import GeneratorRunMonitor
 from ha_adapter import HardwareSnapshot, HomeAssistantAdapter
 from ha_client import HomeAssistantClient, HomeAssistantConnectionError
 from load_manager import (
@@ -68,7 +72,7 @@ from ups_run import (
 from power_transfer import PowerTransferController, TransferAction, TransferPhase
 from state_store import StateStore
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 STATE_SCHEMA_VERSION = 3
 
 DEFAULT_OPTIONS: dict[str, Any] = {
@@ -164,6 +168,12 @@ class EnergySupervisorApp:
             exercise_configs,
             load_manager_config,
             ups_run_config,
+        )
+        self.generator_runs = GeneratorRunMonitor.from_saved_state(
+            saved,
+            exercise_scheduler=self.exercise_scheduler,
+            generator_name=lambda slot: self._profile(slot).display_name,
+            logger=self.log,
         )
 
         operator_state = (
@@ -300,10 +310,17 @@ class EnergySupervisorApp:
         self._sync_generator_configuration(hardware)
         self._refresh_component_views(now, hardware)
 
-        if await self._tick_recovery(now, hardware):
+        observation = self._supervisor_observation(hardware)
+        run_events = self.generator_runs.observe(
+            now=now,
+            local_now=datetime.fromtimestamp(now, self.local_time_zone),
+            observation=observation,
+            session=self.supervisor.session,
+        )
+
+        if await self._tick_recovery(now, hardware, run_events):
             return
 
-        observation = self._supervisor_observation(hardware)
         exercise_observation = self._exercise_observation(now, hardware, observation)
         exercise_decision = self.exercise_scheduler.step(exercise_observation)
         exercise_events = list(exercise_decision.events)
@@ -436,6 +453,7 @@ class EnergySupervisorApp:
             hardware,
             tuple(
                 (
+                    *run_events,
                     *decision.events,
                     *exercise_events,
                     *ups_run_decision.events,
@@ -772,7 +790,12 @@ class EnergySupervisorApp:
 
     # Recovery --------------------------------------------------------
 
-    async def _tick_recovery(self, now: float, hardware: HardwareSnapshot) -> bool:
+    async def _tick_recovery(
+        self,
+        now: float,
+        hardware: HardwareSnapshot,
+        run_events: tuple[SupervisorEvent, ...] = (),
+    ) -> bool:
         """Механически исполнить RecoveryDecision EnergySupervisor.
 
         Здесь нет выбора owner/приоритета/порядка восстановления: main только
@@ -832,7 +855,11 @@ class EnergySupervisorApp:
 
         # FINISH_TICK намеренно не выполняет hardware actions: Supervisor уже
         # отклонил/завершил текущий recovery decision и вернул событие пользователю.
-        await self._finish_tick(now, hardware, self.supervisor.take_events())
+        await self._finish_tick(
+            now,
+            hardware,
+            (*run_events, *self.supervisor.take_events()),
+        )
         return True
 
     def _grid_path_confirmed(self, hardware: HardwareSnapshot) -> bool:
@@ -1004,6 +1031,7 @@ class EnergySupervisorApp:
             "app_version": APP_VERSION,
             "supervisor": self.supervisor.to_dict(),
             "generator_bus": self.generator_bus.to_dict(),
+            "generator_runs": self.generator_runs.to_dict(),
             "exercise_scheduler": self.exercise_scheduler.to_dict(),
             "load_manager": self.load_manager.to_dict(),
             "ups_run": self.ups_run.to_dict(),
@@ -1079,6 +1107,7 @@ class EnergySupervisorApp:
         self.supervisor.grid_ready_since = None
         self.supervisor.grid_failed_since = None
         self.generator_bus.invalidate_observation_history()
+        self.generator_runs.invalidate_observation_history()
 
         self.power_transfer.mark_interrupted(
             timestamp, "Потеряна связь с Home Assistant."
@@ -1221,9 +1250,11 @@ class EnergySupervisorApp:
         observation = self._supervisor_observation(hardware)
         local_now = datetime.fromtimestamp(now, self.local_time_zone)
         exercise_attributes = self.exercise_scheduler.status_attributes(local_now, now)
+        run_attributes = self.generator_runs.status_attributes()
         weekly = build_weekly_exercise_summary(
             local_now=local_now,
             exercise_attributes=exercise_attributes,
+            run_attributes=run_attributes,
             generator_names={
                 slot: self._profile(slot).display_name for slot in GeneratorSlot
             },
@@ -1357,6 +1388,7 @@ class EnergySupervisorApp:
         }
         local_now = datetime.fromtimestamp(now, self.local_time_zone)
         attributes.update(self.exercise_scheduler.status_attributes(local_now, now))
+        attributes.update(self.generator_runs.status_attributes())
         attributes.update(self.load_manager.status_attributes())
         attributes.update(self.ups_run.status_attributes(now, hardware.battery))
         exercise_slot = self.exercise_scheduler.owned_slot
