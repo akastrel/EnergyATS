@@ -14,10 +14,11 @@ Home Assistant App для управления резервным электро
 - `UPS_ONLY` без вымышленного Battery contactor: МАП самостоятельно поддерживает критическую UPS-линию;
 - **UPS Run** для длительных outage: Delayed Start и опциональные charge cycles по SoC/TTG/времени;
 - **Scheduled Exercise** для периодических пробных запусков A/B с presence/grace/warning и сохранением ownership через restart;
-- еженедельная пользовательская сводка Scheduled Exercise с последним успешным и следующим плановым запуском каждого генератора;
+- общая история физических запусков каждого генератора с total starts/runtime и последним запуском в status;
+- еженедельная пользовательская сводка с последним фактическим запуском и следующей плановой проверкой каждого генератора;
 - **Load Manager** для двух некритичных групп G1/G2 с pre-transfer shedding, последовательным admission и continuous overload control;
 - Recovery при неоднозначном физическом состоянии или незавершённой hardware transaction;
-- persisted session/bus/exercise/load/UPS Run state;
+- persisted session/bus/exercise/load/UPS Run/generator-run state;
 - причинно-следственный Logbook: trigger -> решение -> аппаратная команда -> подтверждённое физическое состояние;
 - диагностический `sensor.energy_ats_status` и отдельный пользовательский `sensor.energy_ats_health` со светофором `green / yellow / red`;
 - корректное восстановление после временной недоступности или перезапуска Home Assistant без дублирования аварийных событий.
@@ -50,18 +51,23 @@ EnergySupervisor          единственный владелец систем
     +-- UPS Run           локальная battery/wait/cycle policy
     +-- LoadManager       локальное управление G1/G2
     |
-    +-- GeneratorController A/B   lifecycle двигателя
-    +-- PowerTransferController   Grid / Generator break-before-make
+    +-- GeneratorController A/B   observe physical state -> plan engine actions
+    +-- PowerTransferController   observe feedback -> plan break-before-make step
 
 GeneratorBusTracker       фактический FIFO-owner общей generator bus
-operator_status.py        чистое пользовательское представление health/weekly summary
-HomeAssistantAdapter      HA observations, hardware actions, background diagnostics
-main.py                   composition/runtime dispatch, без второго policy layer
+GeneratorRunMonitor       общая физическая история RUNNING и qualifying facts
+runtime_observations.py   чистые DTO builders для отдельных subsystem
+operator_status.py        чистая проекция status / health / runtime log / weekly summary
+StateStore                schema/restore/snapshot/dedup/atomic persistence boundary
+HomeAssistantAdapter      HA snapshot, hardware actions и publications
+main.py                   composition root: observe -> decide -> plan -> execute -> publish
 ```
+
+Ключевая runtime-граница — `observe -> decide -> plan`. В начале tick GC/TPC ровно один раз принимают physical feedback через `observe()` и не формируют новые команды. После локальных Exercise/UPS Run facts только `EnergySupervisor` принимает общесистемное решение; затем GC/TPC выполняют один `plan()` pass и формируют разрешённые actions. Старый двойной вызов mutating `step()` до и после Supervisor в application loop больше не используется.
 
 Recovery arbitration находится в `EnergySupervisor`: Supervisor решает, можно ли выполнять reset, какие owned generators допустимо остановить и задаёт порядок `Grid path -> owned shutdown -> complete`. `main.py` только исполняет директивы TPC/GC.
 
-Обычные status/health/Logbook/user publications выполняются best-effort вне критического control path и не должны задерживать аппаратную FSM на сетевой timeout. Исключение — предупреждение перед forced Scheduled Exercise: его доставка является safety prerequisite и подтверждается синхронно.
+Persistence policy вынесена из `main.py` в `StateStore`, а пользовательские status/health/runtime-log projections — в `operator_status.py`. Эти слои не имеют права продвигать управляющие FSM или принимать силовые решения.
 
 Подробно: [`docs/ARCHITECTURE_RU.md`](docs/ARCHITECTURE_RU.md).
 
@@ -82,7 +88,7 @@ Logbook предназначен не только для фиксации ко�
 
 App log является полным последовательным журналом и содержит основные и диагностические события, аппаратные команды и отправляемые пользовательские сообщения. Основной поток Home Assistant Logbook намеренно короче: в него публикуются только существенные MAIN events. После фактического возврата дома на Grid итоговое подтверждение питания от основной сети также относится к MAIN.
 
-Раз в ISO-неделю после понедельника 09:00 по локальному времени Home Assistant в MAIN Logbook публикуется одна сводка Scheduled Exercise. Для каждого генератора она показывает последний успешный qualifying run, дату следующего пробного запуска и понятный относительный срок. Если App не работал в понедельник утром, сводка публикуется при первом последующем tick этой недели; сохранённый ключ недели не допускает дублей после restart.
+Раз в ISO-неделю после понедельника 09:00 по локальному времени Home Assistant в MAIN Logbook публикуется одна сводка. Для каждого генератора она показывает последний фактический запуск с доступной длительностью/типом/результатом и следующую плановую дату Exercise с понятным относительным сроком. Если истории запусков ещё нет, используется fallback на последний qualifying run Scheduler-а. Если App не работал в понедельник утром, сводка публикуется при первом последующем tick этой недели; сохранённый ключ недели не допускает дублей после restart.
 
 При временной недоступности Home Assistant один реальный разрыв связи считается одним интервалом outage: повторные reconnect/HTTP 502 не создают новые аварийные события. После восстановления публикуется одна сводка с длительностью разрыва и количеством попыток подключения. Уже существующий `RECOVERY_REQUIRED` не выдаётся за следствие потери HA; `CRITICAL` создаётся только если связь действительно была потеряна во время незавершённой физической операции Supervisor/TPC.
 
@@ -124,6 +130,8 @@ Ordinary Exercise требует подтверждённого отсутств
 
 Если во время уже RUNNING Exercise возникает manual request или реальный outage, пригодный generator может быть явно передан соответствующей managed session без бессмысленного stop/cold-start.
 
+Qualifying RUNNING больше не вычисляется Scheduler-ом параллельно общей истории. Единый `GeneratorRunMonitor` наблюдает физическую непрерывность RUNNING, fault и требуемую длительность и передаёт Scheduler только подтверждённый qualifying timestamp.
+
 ## Load Manager
 
 Load Manager управляет только двумя явно заданными некритичными группами:
@@ -158,7 +166,7 @@ sensor.energy_ats_status
 sensor.energy_ats_health
 ```
 
-`sensor.energy_ats_status` показывает фактический source, Supervisor phase, generator/bus owner, managed session, PRIMARY, fallback, Exercise, UPS Run и Load Manager state. Во время базовой задержки после исчезновения сети пользовательский статус — «Проверка отсутствия сети», а после перехода Delayed Start в ожидание на батареях — «Питание от UPS».
+`sensor.energy_ats_status` показывает фактический source, Supervisor phase, generator/bus owner, managed session, PRIMARY, fallback, Exercise, UPS Run, Load Manager и компактную статистику фактических запусков генераторов. Полный bounded history намеренно не публикуется в HA attributes, чтобы не раздувать Recorder.
 
 `sensor.energy_ats_health` отвечает на более простой вопрос «нужно ли человеку сейчас вмешиваться?»:
 
@@ -218,6 +226,6 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-CI запускает полный Python suite, собирает реальный add-on Docker image и внутри него выполняет production smoke через локальный test Home Assistant WebSocket/REST endpoint.
+CI запускает полный Python suite, отдельно проверяет границу `observe -> plan`, собирает реальный add-on Docker image и внутри него выполняет production smoke через локальный test Home Assistant WebSocket/REST endpoint.
 
 Зелёный CI подтверждает программную модель и production packaging, но не заменяет commissioning на реальных генераторах, контакторах, DKG116, MAP, meter и G1/G2.
