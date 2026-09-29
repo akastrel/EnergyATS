@@ -208,15 +208,9 @@ class ExerciseScheduler:
         self.active_attempt: ExerciseAttempt | None = None
         self.history: list[dict[str, Any]] = []
 
-        # Эти поля намеренно не persist-ятся. Для обычного observed run после
-        # restart непрерывность доказывается заново. Active exercise имеет свой
-        # persisted started_at/run_until. Повтор due-сообщения после restart
-        # допустим: оно информативно и не влияет на schedule/ownership.
-        self._run_started_at: dict[GeneratorSlot, float | None] = {
-            slot: None for slot in SLOTS
-        }
-        self._run_faulted = {slot: False for slot in SLOTS}
-        self._run_qualified = {slot: False for slot in SLOTS}
+        # Повтор due-сообщения после restart допустим: оно информативно и не
+        # влияет на schedule/ownership. Физическую RUNNING-непрерывность здесь
+        # намеренно не отслеживаем: единственный её источник — GeneratorRunHistory.
         self._due_announced_for: dict[GeneratorSlot, str | None] = {
             slot: None for slot in SLOTS
         }
@@ -247,12 +241,28 @@ class ExerciseScheduler:
     def owns(self, slot: GeneratorSlot) -> bool:
         return self.active_attempt is not None and self.active_attempt.slot == slot
 
+    def record_qualifying_runs(
+        self,
+        qualifying_runs: Mapping[GeneratorSlot, datetime],
+    ) -> None:
+        """Применить доказанные общим run-tracker qualifying runs к расписанию."""
+        for slot, observed_at in qualifying_runs.items():
+            if slot not in SLOTS:
+                raise ValueError(f"Неизвестный GeneratorSlot: {slot!r}")
+            if observed_at.tzinfo is None:
+                raise ValueError("qualifying run должен содержать timezone")
+            current_value = self.states[slot].last_qualifying_run
+            if current_value is not None:
+                current = datetime.fromisoformat(current_value)
+                if current >= observed_at:
+                    continue
+            self.states[slot].last_qualifying_run = observed_at.isoformat()
+
     def step(self, o: ExerciseObservation) -> ExerciseDecision:
         events: list[SupervisorEvent] = []
         warnings: list[ExerciseWarning] = []
 
         self._initialize_references(o.local_now)
-        self._track_qualifying_runs(o)
         events.extend(self._due_events(o))
 
         if self.active_attempt is not None:
@@ -483,38 +493,6 @@ class ExerciseScheduler:
         for slot in SLOTS:
             if self.states[slot].initial_reference_time is None:
                 self.states[slot].initial_reference_time = value
-
-    def _track_qualifying_runs(self, o: ExerciseObservation) -> None:
-        for slot in SLOTS:
-            status = o.generators[slot]
-            if status.running is not True:
-                self._run_started_at[slot] = None
-                self._run_faulted[slot] = False
-                self._run_qualified[slot] = False
-                continue
-
-            if self._run_started_at[slot] is None:
-                attempt = self.active_attempt
-                self._run_started_at[slot] = (
-                    attempt.started_at
-                    if attempt is not None
-                    and attempt.slot == slot
-                    and attempt.started_at is not None
-                    else o.now
-                )
-
-            if status.fault is not None:
-                self._run_faulted[slot] = True
-
-            if self._run_qualified[slot] or self._run_faulted[slot]:
-                continue
-
-            started_at = self._run_started_at[slot]
-            assert started_at is not None
-            required = self.configs[slot].run_minutes * 60
-            if o.now - started_at >= required:
-                self.states[slot].last_qualifying_run = o.local_now.isoformat()
-                self._run_qualified[slot] = True
 
     def _due_events(self, o: ExerciseObservation) -> list[SupervisorEvent]:
         events: list[SupervisorEvent] = []

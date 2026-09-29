@@ -307,10 +307,13 @@ class EnergySupervisorApp:
         self._sync_generator_configuration(hardware)
         self._refresh_component_views(now, hardware)
 
-        if await self._tick_recovery(now, hardware):
+        observation = self._supervisor_observation(hardware)
+        run_update = self._observe_generator_runs(now, observation)
+        self.exercise_scheduler.record_qualifying_runs(run_update.qualifying_runs)
+
+        if await self._tick_recovery(now, hardware, run_update.events):
             return
 
-        observation = self._supervisor_observation(hardware)
         exercise_observation = self._exercise_observation(now, hardware, observation)
         exercise_decision = self.exercise_scheduler.step(exercise_observation)
         exercise_events = list(exercise_decision.events)
@@ -443,6 +446,7 @@ class EnergySupervisorApp:
             hardware,
             tuple(
                 (
+                    *run_update.events,
                     *decision.events,
                     *exercise_events,
                     *ups_run_decision.events,
@@ -779,7 +783,12 @@ class EnergySupervisorApp:
 
     # Recovery --------------------------------------------------------
 
-    async def _tick_recovery(self, now: float, hardware: HardwareSnapshot) -> bool:
+    async def _tick_recovery(
+        self,
+        now: float,
+        hardware: HardwareSnapshot,
+        run_events: tuple[SupervisorEvent, ...] = (),
+    ) -> bool:
         """Механически исполнить RecoveryDecision EnergySupervisor.
 
         Здесь нет выбора owner/приоритета/порядка восстановления: main только
@@ -839,7 +848,11 @@ class EnergySupervisorApp:
 
         # FINISH_TICK намеренно не выполняет hardware actions: Supervisor уже
         # отклонил/завершил текущий recovery decision и вернул событие пользователю.
-        await self._finish_tick(now, hardware, self.supervisor.take_events())
+        await self._finish_tick(
+            now,
+            hardware,
+            (*run_events, *self.supervisor.take_events()),
+        )
         return True
 
     def _grid_path_confirmed(self, hardware: HardwareSnapshot) -> bool:
@@ -1251,23 +1264,6 @@ class EnergySupervisorApp:
     ) -> None:
         observation = self._supervisor_observation(hardware)
         local_now = datetime.fromtimestamp(now, self.local_time_zone)
-        run_update = self.generator_runs.step(
-            now=now,
-            local_now=local_now,
-            running={
-                slot: status.running for slot, status in observation.generators.items()
-            },
-            faults={
-                slot: status.fault for slot, status in observation.generators.items()
-            },
-            run_types=self._generator_run_types(),
-            generator_names={
-                slot: self._profile(slot).display_name for slot in GeneratorSlot
-            },
-        )
-        if run_update.events:
-            events = (*events, *run_update.events)
-
         exercise_attributes = self.exercise_scheduler.status_attributes(local_now, now)
         run_attributes = self.generator_runs.status_attributes()
         weekly = build_weekly_exercise_summary(
@@ -1511,6 +1507,28 @@ class EnergySupervisorApp:
         if owner.slot is not None:
             return self._profile(owner.slot).display_name
         return "none" if owner == GeneratorBusOwner.NONE else "unknown"
+
+    def _observe_generator_runs(self, now: float, observation: SupervisorObservation):
+        """Observe physical RUNNING once and feed both stats and Exercise schedule."""
+        local_now = datetime.fromtimestamp(now, self.local_time_zone)
+        return self.generator_runs.step(
+            now=now,
+            local_now=local_now,
+            running={
+                slot: status.running for slot, status in observation.generators.items()
+            },
+            faults={
+                slot: status.fault for slot, status in observation.generators.items()
+            },
+            run_types=self._generator_run_types(),
+            generator_names={
+                slot: self._profile(slot).display_name for slot in GeneratorSlot
+            },
+            qualifying_seconds={
+                slot: self.exercise_scheduler.configs[slot].run_minutes * 60
+                for slot in GeneratorSlot
+            },
+        )
 
     def _generator_run_types(self) -> dict[GeneratorSlot, GeneratorRunType]:
         """Classify observed start edges from already-existing ATS ownership facts."""

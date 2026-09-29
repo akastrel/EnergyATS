@@ -1,9 +1,14 @@
 """Persisted history and aggregate statistics for physical generator runs.
 
 This module is observational only. It never requests starts/stops and never
-participates in ATS arbitration. A run is created only when EnergyATS observes a
-clean OFF -> RUNNING transition. Observation gaps intentionally break continuity:
-we prefer missing one partial run to inventing a start time or runtime.
+participates in ATS arbitration. It is also the single owner of physical RUNNING
+continuity used by Scheduled Exercise to decide whether a run qualifies.
+
+A historical run is created only when EnergyATS observes a clean OFF -> RUNNING
+transition. If observation begins while a generator is already RUNNING, elapsed
+runtime before that baseline is unknown and is never added to history. The
+continuously observed part may still become a qualifying run after the full
+configured interval has been re-proven after restart/reconnect.
 """
 
 from __future__ import annotations
@@ -33,11 +38,13 @@ class GeneratorRunResult(str, Enum):
 
 @dataclass
 class ActiveGeneratorRun:
-    started_at: float
-    started_at_local: str
+    observed_since: float
+    observed_since_local: str
     run_type: GeneratorRunType
+    start_edge_observed: bool
     faulted: bool = False
     fault_reason: str | None = None
+    qualified: bool = False
 
 
 @dataclass
@@ -72,10 +79,11 @@ class GeneratorRunStats:
 @dataclass(frozen=True)
 class GeneratorRunUpdate:
     events: tuple[SupervisorEvent, ...]
+    qualifying_runs: Mapping[GeneratorSlot, datetime]
 
 
 class GeneratorRunHistory:
-    """Observe RUNNING edges and retain completed run history/statistics."""
+    """Observe physical RUNNING continuity and retain run history/statistics."""
 
     def __init__(self) -> None:
         self.stats = {slot: GeneratorRunStats() for slot in SLOTS}
@@ -100,43 +108,73 @@ class GeneratorRunHistory:
         faults: Mapping[GeneratorSlot, str | None],
         run_types: Mapping[GeneratorSlot, GeneratorRunType],
         generator_names: Mapping[GeneratorSlot, str],
+        qualifying_seconds: Mapping[GeneratorSlot, float] | None = None,
     ) -> GeneratorRunUpdate:
+        """Process one physical snapshot.
+
+        ``qualifying_seconds`` is optional because history/statistics do not
+        depend on Scheduled Exercise. When provided, a slot is returned in
+        ``qualifying_runs`` once after a continuous fault-free observed interval
+        reaches its configured threshold.
+        """
         events: list[SupervisorEvent] = []
+        qualifying: dict[GeneratorSlot, datetime] = {}
+        thresholds = qualifying_seconds or {}
 
         for slot in SLOTS:
             current = running.get(slot)
             previous = self._previous_running[slot]
 
             if current is None:
-                # Unknown feedback means continuity is no longer provable for this
-                # slot. Do not close a run with guessed stop time.
+                # Unknown feedback invalidates continuity. Do not guess a stop
+                # time or continue a qualifying timer through the gap.
                 self._previous_running[slot] = None
                 self._active[slot] = None
                 continue
 
             if previous is None:
-                # First valid snapshot is a baseline, not an observed start edge.
+                # First valid snapshot is the new observation baseline. If the
+                # generator is already RUNNING, its real start is unknown, so it
+                # must never create a historical start/runtime entry. We still
+                # observe from this moment so a full new qualifying interval can
+                # be proven after restart/reconnect.
                 self._previous_running[slot] = current
+                if current:
+                    self._begin_observation(
+                        slot,
+                        now=now,
+                        local_now=local_now,
+                        run_type=run_types[slot],
+                        start_edge_observed=False,
+                    )
+                    self._capture_fault(slot, faults.get(slot))
                 continue
 
             if not previous and current:
-                self._begin_run(
+                self._begin_observation(
                     slot,
                     now=now,
                     local_now=local_now,
                     run_type=run_types[slot],
+                    start_edge_observed=True,
                 )
+                self.stats[slot].total_starts += 1
 
             active = self._active[slot]
             if current and active is not None:
-                fault = faults.get(slot)
-                if fault is not None:
-                    active.faulted = True
-                    if active.fault_reason is None:
-                        active.fault_reason = str(fault)
+                self._capture_fault(slot, faults.get(slot))
+                threshold = float(thresholds.get(slot, 0.0))
+                if (
+                    threshold > 0
+                    and not active.qualified
+                    and not active.faulted
+                    and now - active.observed_since >= threshold
+                ):
+                    active.qualified = True
+                    qualifying[slot] = local_now
 
             if previous and not current:
-                event = self._finish_run(
+                event = self._finish_observation(
                     slot,
                     now=now,
                     local_now=local_now,
@@ -148,24 +186,33 @@ class GeneratorRunHistory:
 
             self._previous_running[slot] = current
 
-        return GeneratorRunUpdate(tuple(events))
+        return GeneratorRunUpdate(tuple(events), qualifying)
 
-    def _begin_run(
+    def _begin_observation(
         self,
         slot: GeneratorSlot,
         *,
         now: float,
         local_now: datetime,
         run_type: GeneratorRunType,
+        start_edge_observed: bool,
     ) -> None:
-        self.stats[slot].total_starts += 1
         self._active[slot] = ActiveGeneratorRun(
-            started_at=now,
-            started_at_local=local_now.isoformat(),
+            observed_since=now,
+            observed_since_local=local_now.isoformat(),
             run_type=run_type,
+            start_edge_observed=start_edge_observed,
         )
 
-    def _finish_run(
+    def _capture_fault(self, slot: GeneratorSlot, fault: str | None) -> None:
+        active = self._active[slot]
+        if active is None or fault is None:
+            return
+        active.faulted = True
+        if active.fault_reason is None:
+            active.fault_reason = str(fault)
+
+    def _finish_observation(
         self,
         slot: GeneratorSlot,
         *,
@@ -176,24 +223,20 @@ class GeneratorRunHistory:
     ) -> SupervisorEvent | None:
         active = self._active[slot]
         self._active[slot] = None
-        if active is None:
-            # RUNNING existed before our valid observation window. Its start and
-            # duration are unknown, so do not fabricate a history record.
+        if active is None or not active.start_edge_observed:
+            # RUNNING existed before the current valid observation window. Its
+            # physical start/runtime are unknowable, so no history is invented.
             return None
 
-        if final_fault is not None:
-            active.faulted = True
-            if active.fault_reason is None:
-                active.fault_reason = str(final_fault)
-
-        duration = max(0, int(now - active.started_at))
+        self._capture_fault_for(active, final_fault)
+        duration = max(0, int(now - active.observed_since))
         result = (
             GeneratorRunResult.FAILED
             if active.faulted
             else GeneratorRunResult.SUCCESS
         )
         record = {
-            "start_time": active.started_at_local,
+            "start_time": active.observed_since_local,
             "end_time": local_now.isoformat(),
             "duration_seconds": duration,
             "type": active.run_type.value,
@@ -214,6 +257,14 @@ class GeneratorRunHistory:
                 result,
             ),
         )
+
+    @staticmethod
+    def _capture_fault_for(active: ActiveGeneratorRun, fault: str | None) -> None:
+        if fault is None:
+            return
+        active.faulted = True
+        if active.fault_reason is None:
+            active.fault_reason = str(fault)
 
     def status_attributes(self) -> dict[str, Any]:
         attrs: dict[str, Any] = {}
@@ -249,8 +300,8 @@ class GeneratorRunHistory:
         return attrs
 
     def to_dict(self) -> dict[str, Any]:
-        # Active runs are deliberately not persisted. Restart is an observation
-        # gap, so runtime continuity must be proven again from new feedback.
+        # Active observations are deliberately not persisted. Restart is an
+        # observation gap, so continuity must be proven again from fresh feedback.
         return {
             "slots": {
                 slot.value: self.stats[slot].to_dict()
