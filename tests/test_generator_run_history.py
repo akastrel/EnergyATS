@@ -20,7 +20,6 @@ def step(
     b_fault=None,
     a_type=GeneratorRunType.AUTOMATIC,
     b_type=GeneratorRunType.EXTERNAL,
-    threshold=600,
 ):
     return tracker.step(
         now=when.timestamp(),
@@ -29,7 +28,6 @@ def step(
         faults={GeneratorSlot.A: a_fault, GeneratorSlot.B: b_fault},
         run_types={GeneratorSlot.A: a_type, GeneratorSlot.B: b_type},
         generator_names={GeneratorSlot.A: "Elemax", GeneratorSlot.B: "Вепрь"},
-        qualifying_seconds={GeneratorSlot.A: threshold, GeneratorSlot.B: threshold},
     )
 
 
@@ -55,7 +53,6 @@ def test_completed_automatic_run_is_persisted_and_emits_summary_event():
     stats = tracker.stats[GeneratorSlot.A]
     assert stats.total_starts == 1
     assert stats.total_runtime_seconds == 46 * 60
-    assert stats.history is not None
     assert stats.history[-1]["type"] == GeneratorRunType.AUTOMATIC.value
     assert stats.history[-1]["result"] == GeneratorRunResult.SUCCESS.value
     assert stats.history[-1]["duration_seconds"] == 46 * 60
@@ -109,57 +106,6 @@ def test_fault_during_run_marks_completed_run_failed():
     assert "зафиксирована ошибка" in update.events[0].message
 
 
-def test_qualifying_run_is_reported_once_after_threshold_without_fault():
-    tracker = GeneratorRunHistory()
-    start = datetime(2026, 9, 29, 12, 0, tzinfo=timezone.utc)
-    step(tracker, start)
-    step(tracker, start + timedelta(seconds=1), a_running=True, threshold=600)
-
-    before = step(
-        tracker,
-        start + timedelta(minutes=9),
-        a_running=True,
-        threshold=600,
-    )
-    qualified = step(
-        tracker,
-        start + timedelta(minutes=10, seconds=1),
-        a_running=True,
-        threshold=600,
-    )
-    repeated = step(
-        tracker,
-        start + timedelta(minutes=11),
-        a_running=True,
-        threshold=600,
-    )
-
-    assert before.qualifying_runs == {}
-    assert GeneratorSlot.A in qualified.qualifying_runs
-    assert repeated.qualifying_runs == {}
-
-
-def test_fault_before_threshold_prevents_qualification():
-    tracker = GeneratorRunHistory()
-    start = datetime(2026, 9, 29, 12, 0, tzinfo=timezone.utc)
-    step(tracker, start)
-    step(tracker, start + timedelta(seconds=1), a_running=True, threshold=600)
-    step(
-        tracker,
-        start + timedelta(minutes=5),
-        a_running=True,
-        a_fault="fault",
-        threshold=600,
-    )
-    update = step(
-        tracker,
-        start + timedelta(minutes=15),
-        a_running=True,
-        threshold=600,
-    )
-    assert update.qualifying_runs == {}
-
-
 def test_observation_gap_discards_active_continuity_instead_of_inventing_runtime():
     tracker = GeneratorRunHistory()
     start = datetime(2026, 9, 29, 12, 0, tzinfo=timezone.utc)
@@ -206,9 +152,9 @@ def test_history_is_limited_to_100_records_but_aggregate_counters_continue():
 
     for _ in range(105):
         cursor += timedelta(seconds=1)
-        step(tracker, cursor, a_running=True, threshold=999999)
+        step(tracker, cursor, a_running=True)
         cursor += timedelta(seconds=1)
-        step(tracker, cursor, a_running=False, threshold=999999)
+        step(tracker, cursor, a_running=False)
 
     stats = tracker.stats[GeneratorSlot.A]
     assert stats.total_starts == 105

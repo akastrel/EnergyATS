@@ -8,7 +8,7 @@ we prefer missing one partial run to inventing a start time or runtime.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Any, Mapping
@@ -38,24 +38,19 @@ class ActiveGeneratorRun:
     run_type: GeneratorRunType
     faulted: bool = False
     fault_reason: str | None = None
-    qualified: bool = False
 
 
 @dataclass
 class GeneratorRunStats:
     total_starts: int = 0
     total_runtime_seconds: int = 0
-    history: list[dict[str, Any]] | None = None
-
-    def __post_init__(self) -> None:
-        if self.history is None:
-            self.history = []
+    history: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "total_starts": self.total_starts,
             "total_runtime_seconds": self.total_runtime_seconds,
-            "history": list((self.history or [])[-_HISTORY_LIMIT:]),
+            "history": list(self.history[-_HISTORY_LIMIT:]),
         }
 
     @classmethod
@@ -77,7 +72,6 @@ class GeneratorRunStats:
 @dataclass(frozen=True)
 class GeneratorRunUpdate:
     events: tuple[SupervisorEvent, ...]
-    qualifying_runs: Mapping[GeneratorSlot, str]
 
 
 class GeneratorRunHistory:
@@ -106,11 +100,8 @@ class GeneratorRunHistory:
         faults: Mapping[GeneratorSlot, str | None],
         run_types: Mapping[GeneratorSlot, GeneratorRunType],
         generator_names: Mapping[GeneratorSlot, str],
-        qualifying_seconds: Mapping[GeneratorSlot, float] | None = None,
     ) -> GeneratorRunUpdate:
         events: list[SupervisorEvent] = []
-        qualifying: dict[GeneratorSlot, str] = {}
-        thresholds = qualifying_seconds or {}
 
         for slot in SLOTS:
             current = running.get(slot)
@@ -144,16 +135,6 @@ class GeneratorRunHistory:
                     if active.fault_reason is None:
                         active.fault_reason = str(fault)
 
-                threshold = float(thresholds.get(slot, 0.0))
-                if (
-                    threshold > 0
-                    and not active.qualified
-                    and not active.faulted
-                    and now - active.started_at >= threshold
-                ):
-                    active.qualified = True
-                    qualifying[slot] = local_now.isoformat()
-
             if previous and not current:
                 event = self._finish_run(
                     slot,
@@ -167,7 +148,7 @@ class GeneratorRunHistory:
 
             self._previous_running[slot] = current
 
-        return GeneratorRunUpdate(tuple(events), qualifying)
+        return GeneratorRunUpdate(tuple(events))
 
     def _begin_run(
         self,
@@ -220,7 +201,6 @@ class GeneratorRunHistory:
             "failure_reason": active.fault_reason,
         }
         stats = self.stats[slot]
-        assert stats.history is not None
         stats.history.append(record)
         stats.history = stats.history[-_HISTORY_LIMIT:]
         stats.total_runtime_seconds += duration
@@ -240,8 +220,7 @@ class GeneratorRunHistory:
         for slot in SLOTS:
             prefix = f"generator_{slot.value.lower()}"
             stats = self.stats[slot]
-            history = stats.history or []
-            last = history[-1] if history else None
+            last = stats.history[-1] if stats.history else None
             attrs.update(
                 {
                     f"{prefix}_total_starts": stats.total_starts,
