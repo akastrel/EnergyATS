@@ -46,7 +46,7 @@ from runtime_observations import (
 from state_store import StateStore
 from ups_run import UPSRunConfig
 
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.3.0"
 STATE_SCHEMA_VERSION = 3
 
 DEFAULT_OPTIONS: dict[str, Any] = {
