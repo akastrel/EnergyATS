@@ -76,6 +76,7 @@ ENTITIES = {
 
 ENERGY_ATS_LOG_ENTITY = "update.energy_ats_update"
 ENERGY_ATS_STATUS_ENTITY = "sensor.energy_ats_status"
+ENERGY_ATS_HEALTH_ENTITY = "sensor.energy_ats_health"
 
 
 @dataclass(frozen=True)
@@ -135,7 +136,7 @@ class HomeAssistantAdapter:
         self.log = logger or logging.getLogger(__name__)
         self.family_presence_entity = (
             family_presence_entity.strip()
-            if isinstance(family_presence_entity, str) and family_presence_entity.strip()
+            if isinstance(family_presence_entity, str) and self.family_presence_entity.strip()
             else None
         )
         # Presence — мягкий input только для Exercise Scheduler. Даже когда
@@ -148,13 +149,12 @@ class HomeAssistantAdapter:
         # synchronous publish_user_notification() method instead.
         self._publication_tasks: set[asyncio.Task[None]] = set()
 
-        # Status отличается от прочих best-effort публикаций: это одно текущее
-        # состояние, поэтому параллельные REST writes недопустимы. Храним только
-        # последний desired payload, публикуем последовательно и повторяем
-        # временную ошибку. Промежуточные устаревшие значения можно coalesce.
-        self._status_desired: tuple[str, dict[str, Any]] | None = None
-        self._status_delivered: tuple[str, dict[str, Any]] | None = None
-        self._status_publisher_task: asyncio.Task[None] | None = None
+        # REST-created operator sensors (status/health) используют один общий
+        # последовательный latest-wins publisher. Так retry/reconnect semantics
+        # не дублируются и старый медленный write не может обогнать новый.
+        self._state_desired: dict[str, tuple[str, dict[str, Any]]] = {}
+        self._state_delivered: dict[str, tuple[str, dict[str, Any]]] = {}
+        self._state_publisher_task: asyncio.Task[None] | None = None
         self._cancelling_publications = False
 
     def snapshot(self) -> HardwareSnapshot:
@@ -376,7 +376,7 @@ class HomeAssistantAdapter:
 
         for action in generator_actions:
             if not self.armed:
-                self.log.info("DISARMED: подавлена команда %s", action)
+                self.log.info("DISARMED: подавлена команда Load Manager %s", action)
                 continue
             self._assert_generator_action_safe(action)
             entity_id, domain, service = self._generator_service(action)
@@ -525,74 +525,98 @@ class HomeAssistantAdapter:
             self.log.warning("Не удалось отправить уведомление: %s", exc)
 
     async def publish_status(self, state: str, attributes: dict[str, Any]) -> None:
-        """Принять новый desired status без ожидания REST delivery.
-
-        Отдельный последовательный publisher хранит последнее желаемое значение,
-        повторяет временные ошибки и гарантирует, что старый медленный write не
-        завершится после уже отправленного нового статуса.
-        """
-        self._status_desired = (state, dict(attributes))
-        self._ensure_status_publisher()
-        await asyncio.sleep(0)
-
-    def _ensure_status_publisher(self) -> None:
-        task = self._status_publisher_task
-        if task is not None and not task.done():
-            return
-        self._status_publisher_task = self._schedule_publication(
-            self._status_publisher_loop(),
-            "status",
-            done_callback=self._status_publisher_done,
+        await self._publish_operator_state(
+            ENERGY_ATS_STATUS_ENTITY,
+            state,
+            attributes,
         )
 
-    async def _status_publisher_loop(self) -> None:
-        while self._status_desired != self._status_delivered:
-            desired = self._status_desired
-            if desired is None:
-                return
-            state, attributes = desired
-            try:
-                await self.client.set_state(
-                    ENERGY_ATS_STATUS_ENTITY,
-                    state,
-                    attributes=attributes,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self.log.warning(
-                    "Не удалось опубликовать %s: %s; повторим попытку.",
-                    ENERGY_ATS_STATUS_ENTITY,
-                    exc,
-                )
-                # Ограничиваем retry rate; если за это время desired изменится,
-                # после паузы будет отправлено уже последнее значение.
-                await asyncio.sleep(1.0)
-                continue
-            self._status_delivered = desired
+    async def publish_health(self, state: str, attributes: dict[str, Any]) -> None:
+        await self._publish_operator_state(
+            ENERGY_ATS_HEALTH_ENTITY,
+            state,
+            attributes,
+        )
 
-    def _status_publisher_done(self, task: asyncio.Task[None]) -> None:
-        if self._status_publisher_task is task:
-            self._status_publisher_task = None
+    async def _publish_operator_state(
+        self,
+        entity_id: str,
+        state: str,
+        attributes: dict[str, Any],
+    ) -> None:
+        """Принять новый desired payload REST-created operator sensor."""
+        self._state_desired[entity_id] = (state, dict(attributes))
+        self._ensure_state_publisher()
+        await asyncio.sleep(0)
+
+    def _ensure_state_publisher(self) -> None:
+        task = self._state_publisher_task
+        if task is not None and not task.done():
+            return
+        self._state_publisher_task = self._schedule_publication(
+            self._state_publisher_loop(),
+            "operator-state",
+            done_callback=self._state_publisher_done,
+        )
+
+    async def _state_publisher_loop(self) -> None:
+        while True:
+            pending = [
+                (entity_id, desired)
+                for entity_id, desired in self._state_desired.items()
+                if self._state_delivered.get(entity_id) != desired
+            ]
+            if not pending:
+                return
+
+            failed = False
+            for entity_id, desired in pending:
+                state, attributes = desired
+                try:
+                    await self.client.set_state(
+                        entity_id,
+                        state,
+                        attributes=attributes,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    failed = True
+                    self.log.warning(
+                        "Не удалось опубликовать %s: %s; повторим попытку.",
+                        entity_id,
+                        exc,
+                    )
+                    continue
+                self._state_delivered[entity_id] = desired
+
+            if failed:
+                await asyncio.sleep(1.0)
+
+    def _state_publisher_done(self, task: asyncio.Task[None]) -> None:
+        if self._state_publisher_task is task:
+            self._state_publisher_task = None
         self._publication_done(task)
-        # Закрываем редкую гонку: desired мог измениться между последней
-        # проверкой loop и completion task.
+        # Desired мог измениться между последней проверкой loop и completion.
         if (
             not self._cancelling_publications
             and not task.cancelled()
-            and self._status_desired != self._status_delivered
+            and any(
+                self._state_delivered.get(entity_id) != desired
+                for entity_id, desired in self._state_desired.items()
+            )
         ):
-            self._ensure_status_publisher()
+            self._ensure_state_publisher()
 
     async def cancel_background_publications(self) -> None:
         """Отменить незавершённый best-effort I/O перед закрытием HA transport."""
-        # sensor.energy_ats_status создаётся через REST set_state и не переживает
-        # restart HA Core. После разрыва transport старый successful write больше
-        # не доказывает, что entity существует в новом runtime Home Assistant.
-        self._status_delivered = None
+        # REST-created entities не переживают restart HA Core. После разрыва
+        # transport прошлые successful writes больше не доказывают, что status
+        # и health существуют в новом runtime Home Assistant.
+        self._state_delivered.clear()
         tasks = tuple(self._publication_tasks)
         if not tasks:
-            self._status_publisher_task = None
+            self._state_publisher_task = None
             return
         self._cancelling_publications = True
         try:
@@ -600,7 +624,7 @@ class HomeAssistantAdapter:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             self._publication_tasks.clear()
-            self._status_publisher_task = None
+            self._state_publisher_task = None
         finally:
             self._cancelling_publications = False
 
