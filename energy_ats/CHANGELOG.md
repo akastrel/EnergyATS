@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.2.0
+
+Пользовательский слой наблюдаемости АВР без изменения силовой policy: отдельный светофор состояния и регулярная сводка плановых проверок генераторов.
+
+- Добавлен read-only `sensor.energy_ats_health` со состояниями `green / yellow / red`, кратким `summary` и списком текущих `reasons`. Health вычисляется только из уже существующих фактов Supervisor/Generator Controller/TPC/UPS Run/Load Manager и не является вторым policy layer.
+- `green` означает полностью работоспособный автоматический резерв без причин для внимания; `yellow` — core АВР остаётся работоспособным, но есть конкретная локальная проблема/деградация; `red` — автоматическое безопасное резервирование сейчас нельзя считать работоспособным.
+- Штатный полный Grid outage сам по себе не ухудшает health; `grid_input_state=partial` отображается как `yellow`. Fault одного разрешённого генератора при доступном втором — `yellow`; fault всех разрешённых генераторов, `RECOVERY_REQUIRED`, E-stop, неизвестные обязательные feedback, `armed=false` или отключённый automatic transfer — `red`.
+- Раз в ISO-неделю после понедельника 09:00 по локальному времени Home Assistant в MAIN Logbook публикуется одна человекочитаемая сводка Scheduled Exercise: последний успешный qualifying run и следующая плановая дата каждого генератора с относительным сроком. Если App не работал в понедельник утром, сводка публикуется при первом последующем tick той же недели.
+- Weekly summary использует существующие данные `ExerciseScheduler`; отдельного расписания/таймера запусков не добавлено. Ключ последней опубликованной недели сохраняется в optional `operator_status` persistent payload и предотвращает дубли после restart.
+- Ежедневное объяснение отложенного due-запуска из-за присутствия/неизвестного presence остаётся существующей ответственностью Exercise Scheduler: не более одной пользовательской записи на календарное окно запуска в день.
+- `sensor.energy_ats_status` и `sensor.energy_ats_health` используют один общий последовательный latest-wins REST publisher с retry и общей reconnect-семантикой; после restart/reconnect Home Assistant оба REST-created sensor создаются заново.
+- README, встроенная Home Assistant Documentation и `ENTITIES_RU.md` синхронизированы с health/weekly summary; номера релизов в README/DOCS не добавляются.
+- Добавлены unit и integration regression tests health-классификации, weekly formatting/deduplication, persistence через restart, общего REST publisher и восстановления status/health после reconnect.
+- Финальный Python suite перед release housekeeping: `372 passed`; production `addon-container-smoke` проходит.
+- App и add-on version подняты до `1.2.0`; persistent `schema_version` остаётся `3`, новое поле `operator_status` является optional и обратно совместимо внутри текущей schema.
+
+---
+
 ## 1.1.0
 
 Первый minor release после production-hardening: уточнён публичный HA-контракт входной сети и устранена ложная аварийная блокировка при потере отдельной фазы.
@@ -187,7 +205,7 @@ Runtime hardening после диагностического review 1.0.1 и и
 - Добавлены группы `G1 = switch.non_critical_loads_first_floor` и `G2 = switch.non_critical_loads_basement_floor`; восстановление выполняется `G1 -> G2`, overload `LOAD_SHEDDING` — `G2 -> G1`.
 - Перед managed transfer Load Manager после прогрева генератора поочерёдно отключает доступные некритичные группы и только затем разрешает TPC подключить дом к generator bus.
 - После transfer нагрузки возвращаются по одной с отдельным stabilization window и проверкой запаса относительно Nominal Power.
-- Load Manager непрерывно контролирует generator power во всё время питания дома от generator bus; sustained nominal overload и подтверждённое превышение Maximum Power вызывают поэтапный `LOAD_SHEDDING`.
+- Load Manager непрерывно контролирует generator power, а не только startup; sustained nominal overload и подтверждённое превышение Maximum Power вызывают поэтапный `LOAD_SHEDDING`.
 - Generator meter, G1/G2 и паспортные power metadata являются soft dependencies: их отказ переводит только Load Manager в `DEGRADED` и не создаёт `RECOVERY_REQUIRED` основной ATS-логики.
 - Добавлены per-generator numeric metadata `Nominal Power` / `Maximum Power`; фактические limits выбираются по текущему `GeneratorBusOwner`.
 - Добавлен hysteresis/retry для повторного admission, persistence собственного `shed_by_energy_ats` ownership и восстановление только собственных отключений после подтверждённого возврата Grid.

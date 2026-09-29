@@ -10,11 +10,11 @@ Home Assistant App для управления резервным электро
 - корректная работа с двумя одновременно RUNNING генераторами и аппаратным FIFO-owner общей шины;
 - `UPS_ONLY` без отдельного Battery contactor;
 - **UPS Run**: Delayed Start и charge cycling для длительных отключений;
-- **Scheduled Exercise** для периодических пробных запусков A/B;
+- **Scheduled Exercise** для периодических пробных запусков A/B и еженедельная пользовательская сводка плановых проверок;
 - **Load Manager** для двух некритичных групп G1/G2;
 - Recovery при неоднозначном физическом состоянии;
 - причинно-следственный Logbook с отдельными trigger/action/feedback/result событиями;
-- persistent state и диагностический `sensor.energy_ats_status`.
+- persistent state, диагностический `sensor.energy_ats_status` и светофорный `sensor.energy_ats_health`.
 
 ## Важно перед включением ARMED
 
@@ -24,7 +24,7 @@ EnergyATS управляет реальными генераторами и ко
 armed: false
 ```
 
-В этом режиме App читает Home Assistant, восстанавливает внутреннюю модель и публикует status, но не должна выдавать аппаратные команды.
+В этом режиме App читает Home Assistant, восстанавливает внутреннюю модель и публикует status/health, но не должна выдавать аппаратные команды.
 
 Перед `armed: true` проверьте:
 
@@ -52,6 +52,10 @@ Manual request имеет приоритет над ожиданием/cycle sto
 ## Scheduled Exercise
 
 Плановые пробные запуски настраиваются отдельно для A и B и по умолчанию выключены. Ordinary Exercise выполняется только при подтверждённом отсутствии семьи; forced run после grace требует заранее успешно доставленного warning. Exercise не переводит дом с Grid на generator bus и не имеет maintenance fallback.
+
+Раз в ISO-неделю после понедельника 09:00 локального времени Home Assistant App публикует одну MAIN-запись с последним успешным qualifying run и следующей плановой датой каждого генератора. Если App не работал в понедельник утром, запись появляется при первом последующем tick недели; persisted week key предотвращает повтор после restart.
+
+Если due-запуск отложен из-за присутствия семьи или неизвестного presence, Scheduler сообщает об этом один раз в соответствующее календарное окно запуска; на следующий день причина откладывания снова будет видна.
 
 ## Load Manager
 
@@ -93,15 +97,24 @@ reset
 
 `reset` запускает контролируемое Recovery. Это не безусловный сброс ошибки: внешний generator, E-stop или неоднозначное физическое состояние могут блокировать восстановление.
 
-## Status
+## Status и Health
 
-App публикует:
+App публикует два read-only sensor:
 
 ```text
 sensor.energy_ats_status
+sensor.energy_ats_health
 ```
 
-Он показывает фактический source, phase, generator/bus owner, PRIMARY, managed session, Exercise, UPS Run и Load Manager state. Status является диагностикой и не используется как управляющий input.
+`energy_ats_status` показывает фактический source, phase, generator/bus owner, PRIMARY, managed session, Exercise, UPS Run и Load Manager state.
+
+`energy_ats_health` — максимально высокоуровневый светофор:
+
+- `green` — АВР работоспособен, причин для внимания нет;
+- `yellow` — основная функция АВР сохраняется, но есть конкретная проблема/локальная деградация;
+- `red` — автоматическое безопасное резервирование сейчас нельзя считать работоспособным.
+
+Полный blackout при корректной работе АВР не является неисправностью и сам по себе не меняет health с `green`. Частичная потеря фаз (`partial`) даёт `yellow`. Оба сенсора являются диагностикой и не используются как управляющий input.
 
 ## Документация
 

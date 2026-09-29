@@ -14,11 +14,12 @@ Home Assistant App для управления резервным электро
 - `UPS_ONLY` без вымышленного Battery contactor: МАП самостоятельно поддерживает критическую UPS-линию;
 - **UPS Run** для длительных outage: Delayed Start и опциональные charge cycles по SoC/TTG/времени;
 - **Scheduled Exercise** для периодических пробных запусков A/B с presence/grace/warning и сохранением ownership через restart;
+- еженедельная пользовательская сводка Scheduled Exercise с последним успешным и следующим плановым запуском каждого генератора;
 - **Load Manager** для двух некритичных групп G1/G2 с pre-transfer shedding, последовательным admission и continuous overload control;
 - Recovery при неоднозначном физическом состоянии или незавершённой hardware transaction;
 - persisted session/bus/exercise/load/UPS Run state;
 - причинно-следственный Logbook: trigger -> решение -> аппаратная команда -> подтверждённое физическое состояние;
-- диагностический `sensor.energy_ats_status`, Logbook и notifications;
+- диагностический `sensor.energy_ats_status` и отдельный пользовательский `sensor.energy_ats_health` со светофором `green / yellow / red`;
 - корректное восстановление после временной недоступности или перезапуска Home Assistant без дублирования аварийных событий.
 
 Все дополнительные функции — UPS Run, Scheduled Exercise и Load Manager — не создают отдельного центра принятия решений. Системный конфликт Manual / Outage / Exercise / Recovery разрешает только `EnergySupervisor`.
@@ -53,13 +54,14 @@ EnergySupervisor          единственный владелец систем
     +-- PowerTransferController   Grid / Generator break-before-make
 
 GeneratorBusTracker       фактический FIFO-owner общей generator bus
+operator_status.py        чистое пользовательское представление health/weekly summary
 HomeAssistantAdapter      HA observations, hardware actions, background diagnostics
 main.py                   composition/runtime dispatch, без второго policy layer
 ```
 
 Recovery arbitration находится в `EnergySupervisor`: Supervisor решает, можно ли выполнять reset, какие owned generators допустимо остановить и задаёт порядок `Grid path -> owned shutdown -> complete`. `main.py` только исполняет директивы TPC/GC.
 
-Обычные status/Logbook/user publications выполняются best-effort вне критического control path и не должны задерживать аппаратную FSM на сетевой timeout. Исключение — предупреждение перед forced Scheduled Exercise: его доставка является safety prerequisite и подтверждается синхронно.
+Обычные status/health/Logbook/user publications выполняются best-effort вне критического control path и не должны задерживать аппаратную FSM на сетевой timeout. Исключение — предупреждение перед forced Scheduled Exercise: его доставка является safety prerequisite и подтверждается синхронно.
 
 Подробно: [`docs/ARCHITECTURE_RU.md`](docs/ARCHITECTURE_RU.md).
 
@@ -79,6 +81,8 @@ Logbook предназначен не только для фиксации ко�
 Отдельно журналируются потеря/возврат Grid, ручные команды, переходы UPS Run, Scheduled Exercise, Recovery, изменения RUNNING/REMOTE, PowerPath/PowerSource, generator bus owner и Emergency Stop. Первый snapshot после start/reconnect считается baseline и не создаёт ложных событий.
 
 App log является полным последовательным журналом и содержит основные и диагностические события, аппаратные команды и отправляемые пользовательские сообщения. Основной поток Home Assistant Logbook намеренно короче: в него публикуются только существенные MAIN events. После фактического возврата дома на Grid итоговое подтверждение питания от основной сети также относится к MAIN.
+
+Раз в ISO-неделю после понедельника 09:00 по локальному времени Home Assistant в MAIN Logbook публикуется одна сводка Scheduled Exercise. Для каждого генератора она показывает последний успешный qualifying run, дату следующего пробного запуска и понятный относительный срок. Если App не работал в понедельник утром, сводка публикуется при первом последующем tick этой недели; сохранённый ключ недели не допускает дублей после restart.
 
 При временной недоступности Home Assistant один реальный разрыв связи считается одним интервалом outage: повторные reconnect/HTTP 502 не создают новые аварийные события. После восстановления публикуется одна сводка с длительностью разрыва и количеством попыток подключения. Уже существующий `RECOVERY_REQUIRED` не выдаётся за следствие потери HA; `CRITICAL` создаётся только если связь действительно была потеряна во время незавершённой физической операции Supervisor/TPC.
 
@@ -116,6 +120,8 @@ B: interval 45 дней, start 15:00, run 10 мин, presence grace 14 дней
 
 Ordinary Exercise требует подтверждённого отсутствия семьи непосредственно до REMOTE ON. После grace presence перестаёт блокировать forced run, но safety prerequisites сохраняются; forced run требует заранее подтверждённой доставки warning. Exercise не переводит дом на generator bus и не имеет fallback на второй generator.
 
+Если пробный запуск уже due и откладывается из-за присутствия семьи или неизвестного presence, Scheduler создаёт не более одной пользовательской записи на календарное окно запуска в день. На следующий день причина откладывания снова будет видна.
+
 Если во время уже RUNNING Exercise возникает manual request или реальный outage, пригодный generator может быть явно передан соответствующей managed session без бессмысленного stop/cold-start.
 
 ## Load Manager
@@ -149,9 +155,18 @@ App публикует read-only:
 
 ```text
 sensor.energy_ats_status
+sensor.energy_ats_health
 ```
 
-Status показывает фактический source, Supervisor phase, generator/bus owner, managed session, PRIMARY, fallback, Exercise, UPS Run и Load Manager state. Во время базовой задержки после исчезновения сети пользовательский статус — «Проверка отсутствия сети», а после перехода Delayed Start в ожидание на батареях — «Питание от UPS». Status sensor не является входом управляющей логики.
+`sensor.energy_ats_status` показывает фактический source, Supervisor phase, generator/bus owner, managed session, PRIMARY, fallback, Exercise, UPS Run и Load Manager state. Во время базовой задержки после исчезновения сети пользовательский статус — «Проверка отсутствия сети», а после перехода Delayed Start в ожидание на батареях — «Питание от UPS».
+
+`sensor.energy_ats_health` отвечает на более простой вопрос «нужно ли человеку сейчас вмешиваться?»:
+
+- `green` — АВР работоспособен, причин для внимания нет;
+- `yellow` — основная функция АВР сохраняется, но есть конкретная проблема/деградация для проверки;
+- `red` — автоматическое безопасное резервирование сейчас нельзя считать работоспособным.
+
+Обычный полный outage при корректно работающем АВР сам по себе не ухудшает health: работа от генератора в этом случае является штатным выполнением задачи. Частичная потеря фаз (`partial`) отображается как `yellow`. Health и Status — только диагностические выходы и не являются входами управляющей логики.
 
 ## Установка
 
@@ -186,7 +201,7 @@ reset
 | [`docs/PHYSICAL_POWER_TOPOLOGY_RU.md`](docs/PHYSICAL_POWER_TOPOLOGY_RU.md) | фактическая силовая схема и физические сигналы |
 | [`docs/REQUIREMENTS_RU.md`](docs/REQUIREMENTS_RU.md) | **нормативное поведение EnergyATS**, `REQ-*` / `TC-*` |
 | [`docs/ARCHITECTURE_RU.md`](docs/ARCHITECTURE_RU.md) | программные компоненты и границы ответственности |
-| [`docs/ENTITIES_RU.md`](docs/ENTITIES_RU.md) | Home Assistant contract и status attributes |
+| [`docs/ENTITIES_RU.md`](docs/ENTITIES_RU.md) | Home Assistant contract и status/health attributes |
 | [`docs/INSTALL_RU.md`](docs/INSTALL_RU.md) | установка, обновление и безопасный первый запуск |
 | [`docs/USER_TESTS_RU.md`](docs/USER_TESTS_RU.md) | физический commissioning |
 | [`energy_ats/DOCS.md`](energy_ats/DOCS.md) | пользовательская справка, показываемая вместе с HA App |
