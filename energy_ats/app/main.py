@@ -51,6 +51,13 @@ from load_manager import (
     LoadManager,
     LoadManagerConfig,
     LoadManagerObservation,
+    LoadManagerPhase,
+)
+from operator_status import (
+    GeneratorHealth,
+    HealthInputs,
+    build_weekly_exercise_summary,
+    evaluate_health,
 )
 from ups_run import (
     UPSRun,
@@ -61,7 +68,7 @@ from ups_run import (
 from power_transfer import PowerTransferController, TransferAction, TransferPhase
 from state_store import StateStore
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 STATE_SCHEMA_VERSION = 3
 
 DEFAULT_OPTIONS: dict[str, Any] = {
@@ -159,11 +166,22 @@ class EnergySupervisorApp:
             ups_run_config,
         )
 
+        operator_state = (
+            saved.get("operator_status")
+            if isinstance(saved, dict) and isinstance(saved.get("operator_status"), dict)
+            else {}
+        )
+        weekly_key = operator_state.get("last_weekly_exercise_summary")
+        self._last_weekly_exercise_summary = (
+            str(weekly_key) if weekly_key is not None else None
+        )
+
         self._pending_action_records: list[dict[str, str]] = []
         self._saved_state_signature: str | None = None
         self._last_runtime_signature: tuple[str, ...] | None = None
         self._last_generator_config_signature: tuple[Any, ...] | None = None
         self._last_status_payload: dict[str, Any] | None = None
+        self._last_health_payload: dict[str, Any] | None = None
         # Один интервал недоступности HA должен давать одно safety-событие,
         # независимо от числа последующих reconnect attempts.
         self._ha_outage_started_at: float | None = None
@@ -238,6 +256,7 @@ class EnergySupervisorApp:
             try:
                 await self.client.connect()
                 self._last_status_payload = None
+                self._last_health_payload = None
                 self._set_home_assistant_timezone(await self.client.get_time_zone())
                 await self._wait_until_required_entities_ready()
                 if self.stop_event.is_set():
@@ -988,6 +1007,9 @@ class EnergySupervisorApp:
             "exercise_scheduler": self.exercise_scheduler.to_dict(),
             "load_manager": self.load_manager.to_dict(),
             "ups_run": self.ups_run.to_dict(),
+            "operator_status": {
+                "last_weekly_exercise_summary": self._last_weekly_exercise_summary,
+            },
             "pending_actions": list(self._pending_action_records),
         }
         signature = json.dumps(payload, ensure_ascii=False, sort_keys=True)
@@ -1197,9 +1219,24 @@ class EnergySupervisorApp:
         events: tuple[SupervisorEvent, ...],
     ) -> None:
         observation = self._supervisor_observation(hardware)
+        local_now = datetime.fromtimestamp(now, self.local_time_zone)
+        exercise_attributes = self.exercise_scheduler.status_attributes(local_now, now)
+        weekly = build_weekly_exercise_summary(
+            local_now=local_now,
+            exercise_attributes=exercise_attributes,
+            generator_names={
+                slot: self._profile(slot).display_name for slot in GeneratorSlot
+            },
+            last_week_key=self._last_weekly_exercise_summary,
+        )
+        if weekly is not None:
+            events = (*events, weekly.event)
+            self._last_weekly_exercise_summary = weekly.week_key
+
         await self.adapter.publish_events(events)
         self._log_runtime_if_changed(observation)
         await self._publish_status(now, observation, hardware)
+        await self._publish_health(observation, hardware)
         self._save_state()
 
     async def _publish_status(
@@ -1215,6 +1252,64 @@ class EnergySupervisorApp:
         # Это last submitted desired payload. Факт успешной REST delivery хранит
         # последовательный publisher HomeAssistantAdapter и сам выполняет retry.
         self._last_status_payload = payload
+
+    async def _publish_health(
+        self,
+        observation: SupervisorObservation,
+        hardware: HardwareSnapshot,
+    ) -> None:
+        health = evaluate_health(self._health_inputs(observation, hardware))
+        payload = {
+            "state": health.level.value,
+            "attributes": health.attributes(),
+        }
+        if payload == self._last_health_payload:
+            return
+        await self.adapter.publish_health(payload["state"], payload["attributes"])
+        self._last_health_payload = payload
+
+    def _health_inputs(
+        self,
+        observation: SupervisorObservation,
+        hardware: HardwareSnapshot,
+    ) -> HealthInputs:
+        bus = self.generator_bus.status()
+        any_running = any(
+            status.running is True for status in observation.generators.values()
+        )
+        return HealthInputs(
+            armed=self.armed,
+            automatic_transfer_enabled=hardware.automatic_transfer_enabled,
+            emergency_stop=hardware.emergency_stop,
+            required_states_known=observation.required_states_known,
+            recovery_required=(
+                self.supervisor.phase == SupervisorPhase.RECOVERY_REQUIRED
+            ),
+            recovery_reason=self.supervisor.recovery_reason,
+            grid_input_state=hardware.grid_input_state,
+            generators=tuple(
+                GeneratorHealth(
+                    name=self._profile(slot).display_name,
+                    enabled=self.supervisor.config.generator_enabled(slot),
+                    running=status.running,
+                    fault=status.fault,
+                )
+                for slot, status in observation.generators.items()
+            ),
+            bus_owner_unknown_while_running=(
+                any_running and bus.owner == GeneratorBusOwner.UNKNOWN
+            ),
+            ups_run_enabled=self.ups_run.enabled,
+            ups_run_degraded=(self.ups_run.state == UPSRunState.DEGRADED),
+            ups_run_reason=self.ups_run.last_reason,
+            load_manager_enabled=self.load_manager.config.enabled,
+            load_manager_degraded=(
+                self.load_manager.phase == LoadManagerPhase.DEGRADED
+            ),
+            load_manager_reason=(
+                self.load_manager.degraded_reason or self.load_manager.last_reason
+            ),
+        )
 
     def _status_payload(
         self,
