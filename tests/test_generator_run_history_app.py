@@ -4,8 +4,6 @@ from datetime import datetime, timedelta, timezone
 
 from domain import GeneratorSlot, SessionReason
 from energy_supervisor import GeneratorSession, SupervisorPhase
-from generator_bus import GeneratorRunContext
-from generator_run_history import GeneratorRunType
 from ha_adapter import ENTITIES
 from main import DEFAULT_OPTIONS, EnergySupervisorApp
 from state_store import StateStore
@@ -66,49 +64,48 @@ def make_app(tmp_path) -> EnergySupervisorApp:
     return app
 
 
-def complete_run(app: EnergySupervisorApp) -> None:
-    start = datetime(2026, 9, 29, 12, 0, tzinfo=timezone.utc)
-    common = {
-        "faults": {GeneratorSlot.A: None, GeneratorSlot.B: None},
-        "run_types": {
-            GeneratorSlot.A: GeneratorRunType.AUTOMATIC,
-            GeneratorSlot.B: GeneratorRunType.EXTERNAL,
-        },
-        "generator_names": {GeneratorSlot.A: "Elemax", GeneratorSlot.B: "Вепрь"},
-    }
-    app.generator_runs.step(
-        now=start.timestamp(),
-        local_now=start,
-        running={GeneratorSlot.A: False, GeneratorSlot.B: False},
-        **common,
-    )
-    app.generator_runs.step(
-        now=(start + timedelta(seconds=1)).timestamp(),
-        local_now=start + timedelta(seconds=1),
-        running={GeneratorSlot.A: True, GeneratorSlot.B: False},
-        **common,
-    )
-    app.generator_runs.step(
-        now=(start + timedelta(minutes=46, seconds=1)).timestamp(),
-        local_now=start + timedelta(minutes=46, seconds=1),
-        running={GeneratorSlot.A: False, GeneratorSlot.B: False},
-        **common,
-    )
-
-
-def normal_observation(app: EnergySupervisorApp, now: float):
+def runtime_observation(app: EnergySupervisorApp, when: datetime):
     hardware = app.adapter.snapshot()
     app._sync_generator_configuration(hardware)
     hardware = app._apply_bus_model(hardware)
-    app._refresh_component_views(now, hardware)
-    observation = app._supervisor_observation(hardware)
+    app._refresh_component_views(when.timestamp(), hardware)
+    return app._supervisor_observation(hardware), hardware
+
+
+def observe_a(app: EnergySupervisorApp, when: datetime, *, running: bool):
+    app.client.states[ENTITIES["generator_a_running"]] = "on" if running else "off"
+    observation, _ = runtime_observation(app, when)
+    return app.generator_runs.observe(
+        now=when.timestamp(),
+        local_now=when,
+        observation=observation,
+        session=app.supervisor.session,
+    )
+
+
+def complete_automatic_run(app: EnergySupervisorApp) -> None:
+    start = datetime(2026, 9, 29, 12, 0, tzinfo=timezone.utc)
+    app.supervisor.session = GeneratorSession.begin(
+        SessionReason.GRID_OUTAGE,
+        GeneratorSlot.A,
+        grid_was_unavailable=True,
+    )
+    observe_a(app, start, running=False)
+    observe_a(app, start + timedelta(seconds=1), running=True)
+    observe_a(app, start + timedelta(minutes=46, seconds=1), running=False)
+    app.supervisor.session = None
+
+
+def normal_observation(app: EnergySupervisorApp, now: float):
+    when = datetime.fromtimestamp(now, timezone.utc)
+    observation, hardware = runtime_observation(app, when)
     app.supervisor.step(now, observation)
     return app._supervisor_observation(hardware), hardware
 
 
 def test_status_payload_exposes_compact_run_statistics(tmp_path):
     app = make_app(tmp_path)
-    complete_run(app)
+    complete_automatic_run(app)
     observation, hardware = normal_observation(app, 100.0)
 
     attrs = app._status_payload(100.0, observation, hardware)["attributes"]
@@ -125,7 +122,7 @@ def test_status_payload_exposes_compact_run_statistics(tmp_path):
 
 def test_generator_run_history_survives_app_restart(tmp_path):
     app = make_app(tmp_path)
-    complete_run(app)
+    complete_automatic_run(app)
     app._save_state(force=True)
 
     restored = EnergySupervisorApp(
@@ -156,65 +153,21 @@ def test_corrupt_run_history_is_soft_failure_not_core_recovery(tmp_path):
     assert restored.generator_runs.status_attributes()["generator_a_total_starts"] == 0
 
 
-def test_run_type_uses_existing_ats_ownership_facts(tmp_path):
+def test_connection_gap_invalidates_active_run_continuity(tmp_path):
     app = make_app(tmp_path)
-
+    start = datetime(2026, 9, 29, 12, 0, tzinfo=timezone.utc)
     app.supervisor.session = GeneratorSession.begin(
         SessionReason.GRID_OUTAGE,
         GeneratorSlot.A,
         grid_was_unavailable=True,
     )
-    assert app._generator_run_types()[GeneratorSlot.A] == GeneratorRunType.AUTOMATIC
-    assert app._generator_run_types()[GeneratorSlot.B] == GeneratorRunType.EXTERNAL
 
-    app.supervisor.session = GeneratorSession.begin(
-        SessionReason.MANUAL_GENERATOR_START,
-        GeneratorSlot.A,
-        grid_was_unavailable=False,
-    )
-    assert app._generator_run_types()[GeneratorSlot.A] == GeneratorRunType.MANUAL
-
-    app.generator_bus.run_contexts[GeneratorSlot.A] = GeneratorRunContext.TEST_RUN
-    assert app._generator_run_types()[GeneratorSlot.A] == GeneratorRunType.EXERCISE
-
-
-def test_connection_gap_invalidates_active_run_continuity(tmp_path):
-    app = make_app(tmp_path)
-    start = datetime(2026, 9, 29, 12, 0, tzinfo=timezone.utc)
-    common = {
-        "faults": {GeneratorSlot.A: None, GeneratorSlot.B: None},
-        "run_types": {
-            GeneratorSlot.A: GeneratorRunType.AUTOMATIC,
-            GeneratorSlot.B: GeneratorRunType.EXTERNAL,
-        },
-        "generator_names": {GeneratorSlot.A: "Elemax", GeneratorSlot.B: "Вепрь"},
-    }
-    app.generator_runs.step(
-        now=start.timestamp(),
-        local_now=start,
-        running={GeneratorSlot.A: False, GeneratorSlot.B: False},
-        **common,
-    )
-    app.generator_runs.step(
-        now=(start + timedelta(seconds=1)).timestamp(),
-        local_now=start + timedelta(seconds=1),
-        running={GeneratorSlot.A: True, GeneratorSlot.B: False},
-        **common,
-    )
+    observe_a(app, start, running=False)
+    observe_a(app, start + timedelta(seconds=1), running=True)
 
     app.generator_runs.invalidate_observation_history()
-    app.generator_runs.step(
-        now=(start + timedelta(hours=1)).timestamp(),
-        local_now=start + timedelta(hours=1),
-        running={GeneratorSlot.A: True, GeneratorSlot.B: False},
-        **common,
-    )
-    update = app.generator_runs.step(
-        now=(start + timedelta(hours=2)).timestamp(),
-        local_now=start + timedelta(hours=2),
-        running={GeneratorSlot.A: False, GeneratorSlot.B: False},
-        **common,
-    )
+    observe_a(app, start + timedelta(hours=1), running=True)
+    events = observe_a(app, start + timedelta(hours=2), running=False)
 
-    assert update.events == ()
+    assert events == ()
     assert app.generator_runs.status_attributes()["generator_a_total_runtime_seconds"] == 0
