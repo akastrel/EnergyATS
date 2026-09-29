@@ -4,7 +4,7 @@
 уже известные факты EnergyATS в два удобных представления:
 
 * светофорный health: green / yellow / red;
-* одну человекочитаемую сводку Scheduled Exercise в неделю.
+* одну человекочитаемую сводку состояния генераторов в неделю.
 """
 
 from __future__ import annotations
@@ -164,12 +164,14 @@ def build_weekly_exercise_summary(
     exercise_attributes: Mapping[str, Any],
     generator_names: Mapping[GeneratorSlot, str],
     last_week_key: str | None,
+    run_attributes: Mapping[str, Any] | None = None,
 ) -> WeeklyExerciseSummary | None:
     """Сформировать одну MAIN-сводку за ISO-неделю после понедельника 09:00.
 
     Если App не работал в понедельник утром, сводка публикуется при первом
     последующем tick этой же недели. Ключ недели сохраняется App, поэтому restart
-    не создаёт повторную запись.
+    не создаёт повторную запись. При наличии общей истории запусков показывается
+    последний фактический запуск; иначе используется прежний qualifying run.
     """
 
     iso = local_now.isocalendar()
@@ -186,16 +188,18 @@ def build_weekly_exercise_summary(
     if not any_enabled:
         return None
 
+    run_attrs = run_attributes or {}
     parts = [
         _generator_summary(
             slot,
             local_now,
             exercise_attributes,
+            run_attrs,
             generator_names.get(slot, f"Generator {slot.value}"),
         )
         for slot in GeneratorSlot
     ]
-    message = f"Плановые проверки генераторов. {' '.join(parts)}"
+    message = f"Генераторы. {' '.join(parts)}"
     return WeeklyExerciseSummary(week_key, SupervisorEvent("info", message))
 
 
@@ -203,16 +207,36 @@ def _generator_summary(
     slot: GeneratorSlot,
     local_now: datetime,
     attrs: Mapping[str, Any],
+    run_attrs: Mapping[str, Any],
     name: str,
 ) -> str:
     prefix = f"generator_{slot.value.lower()}_exercise"
+    run_prefix = f"generator_{slot.value.lower()}"
     enabled = bool(attrs.get(f"{prefix}_enabled"))
-    last_run = _parse_datetime(attrs.get(f"{prefix}_last_qualifying_run"))
 
-    if last_run is None:
-        last_text = "успешных запусков ещё не было"
+    actual_start = _parse_datetime(run_attrs.get(f"{run_prefix}_last_run_start"))
+    duration = _parse_non_negative_int(
+        run_attrs.get(f"{run_prefix}_last_run_duration_seconds")
+    )
+    run_type = run_attrs.get(f"{run_prefix}_last_run_type")
+    run_result = run_attrs.get(f"{run_prefix}_last_run_result")
+
+    if actual_start is not None:
+        details = [_format_date_ru(actual_start)]
+        if duration is not None:
+            details.append(_duration_text(duration))
+        type_text = _run_type_text(run_type)
+        if type_text is not None:
+            details.append(type_text)
+        if run_result == "failed":
+            details.append("с ошибкой")
+        last_text = f"последний запуск — {', '.join(details)}"
     else:
-        last_text = f"последний успешный запуск — {_format_date_ru(last_run)}"
+        last_run = _parse_datetime(attrs.get(f"{prefix}_last_qualifying_run"))
+        if last_run is None:
+            last_text = "успешных запусков ещё не было"
+        else:
+            last_text = f"последний успешный запуск — {_format_date_ru(last_run)}"
 
     if not enabled:
         return f"{name}: {last_text}; автоматические пробные пуски отключены."
@@ -236,6 +260,35 @@ def _parse_datetime(value: Any) -> datetime | None:
         return datetime.fromisoformat(str(value))
     except ValueError:
         return None
+
+
+def _parse_non_negative_int(value: Any) -> int | None:
+    if value in (None, "", "unknown", "unavailable"):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _run_type_text(value: Any) -> str | None:
+    return {
+        "automatic": "автоматический",
+        "manual": "ручной",
+        "exercise": "пробный",
+        "external": "внешний",
+    }.get(str(value))
+
+
+def _duration_text(seconds: int) -> str:
+    hours, remainder = divmod(max(0, seconds), 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours} ч {minutes} мин" if minutes else f"{hours} ч"
+    if minutes:
+        return f"{minutes} мин {secs} с" if secs else f"{minutes} мин"
+    return f"{secs} с"
 
 
 _MONTHS_RU = (
