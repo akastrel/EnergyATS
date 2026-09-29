@@ -1,10 +1,8 @@
 """Высокоуровневое представление состояния АВР для пользователя.
 
 Модуль ничего не управляет и не участвует в safety/policy. Он только переводит
-уже известные факты EnergyATS в два удобных представления:
-
-* светофорный health: green / yellow / red;
-* одну человекочитаемую сводку состояния генераторов в неделю.
+уже известные факты АВР в пользовательские status/health/log представления и
+периодическую сводку генераторов.
 """
 
 from __future__ import annotations
@@ -12,9 +10,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 from enum import Enum
+import math
 from typing import Any, Mapping
 
-from domain import GeneratorSlot, GridInputState, SupervisorEvent
+from domain import GeneratorSlot, GridInputState, PowerPath, PowerSource, SupervisorEvent
+from energy_supervisor import EnergySupervisor, SupervisorObservation, SupervisorPhase
+from generator_bus import GeneratorBusOwner, GeneratorBusStatus
+from generator_controller import GeneratorController, GeneratorPhase
+from ha_adapter import HardwareSnapshot
+from load_manager import LoadManager, LoadManagerPhase
+from power_transfer import PowerTransferController, TransferPhase
+from ups_run import UPSRun, UPSRunState
 
 
 class HealthLevel(str, Enum):
@@ -156,6 +162,428 @@ def evaluate_health(inputs: HealthInputs) -> HealthStatus:
 class WeeklyExerciseSummary:
     week_key: str
     event: SupervisorEvent
+
+
+@dataclass(frozen=True)
+class OperatorOutput:
+    status_state: str
+    status_attributes: Mapping[str, Any]
+    health_state: str
+    health_attributes: Mapping[str, Any]
+    runtime_signature: tuple[str, ...]
+    runtime_message: str
+    weekly_summary: WeeklyExerciseSummary | None
+
+
+_GENERATOR_PHASE_TEXT = {
+    GeneratorPhase.WAITING_FOR_DATA: "ожидание данных",
+    GeneratorPhase.IDLE: "остановлен",
+    GeneratorPhase.PREPARING: "подготовка к запуску",
+    GeneratorPhase.WAITING_FOR_RUNNING: "запуск",
+    GeneratorPhase.HOLDING_COLD_START_CHOKE: "запущен, заслонка",
+    GeneratorPhase.WARMING_UP: "прогрев",
+    GeneratorPhase.READY_FOR_LOAD: "готов",
+    GeneratorPhase.WAITING_FOR_LOAD_RELEASE: "ожидание снятия нагрузки",
+    GeneratorPhase.COOLING_DOWN: "охлаждение",
+    GeneratorPhase.WAITING_FOR_STOP: "остановка",
+    GeneratorPhase.EXTERNAL_RUNNING: "внешний запуск",
+    GeneratorPhase.FAULT: "АВАРИЯ",
+}
+
+
+def build_operator_output(
+    *,
+    now: float,
+    local_now: datetime,
+    armed: bool,
+    observation: SupervisorObservation,
+    hardware: HardwareSnapshot,
+    supervisor: EnergySupervisor,
+    bus_status: GeneratorBusStatus,
+    generator_controllers: Mapping[GeneratorSlot, GeneratorController],
+    power_transfer: PowerTransferController,
+    exercise_scheduler: Any,
+    generator_runs: Any,
+    load_manager: LoadManager,
+    ups_run: UPSRun,
+    last_weekly_exercise_summary: str | None,
+) -> OperatorOutput:
+    """Построить все операторские представления одного tick без side effects."""
+    generator_names = {
+        slot: controller.profile.display_name
+        for slot, controller in generator_controllers.items()
+    }
+    exercise_attributes = exercise_scheduler.status_attributes(local_now, now)
+    run_attributes = generator_runs.status_attributes()
+
+    weekly = build_weekly_exercise_summary(
+        local_now=local_now,
+        exercise_attributes=exercise_attributes,
+        run_attributes=run_attributes,
+        generator_names=generator_names,
+        last_week_key=last_weekly_exercise_summary,
+    )
+
+    status_state = _status_text(
+        armed=armed,
+        supervisor=supervisor,
+        observation=observation,
+        ups_run=ups_run,
+    )
+    status_attributes = _status_attributes(
+        now=now,
+        local_now=local_now,
+        armed=armed,
+        observation=observation,
+        hardware=hardware,
+        supervisor=supervisor,
+        bus_status=bus_status,
+        generator_controllers=generator_controllers,
+        power_transfer=power_transfer,
+        exercise_scheduler=exercise_scheduler,
+        exercise_attributes=exercise_attributes,
+        run_attributes=run_attributes,
+        generator_runs=generator_runs,
+        load_manager=load_manager,
+        ups_run=ups_run,
+    )
+
+    health = evaluate_health(
+        _health_inputs(
+            armed=armed,
+            observation=observation,
+            hardware=hardware,
+            supervisor=supervisor,
+            bus_status=bus_status,
+            generator_controllers=generator_controllers,
+            load_manager=load_manager,
+            ups_run=ups_run,
+        )
+    )
+    runtime_signature = _runtime_signature(
+        armed=armed,
+        observation=observation,
+        supervisor=supervisor,
+        bus_status=bus_status,
+        generator_controllers=generator_controllers,
+        load_manager=load_manager,
+        ups_run=ups_run,
+        exercise_scheduler=exercise_scheduler,
+    )
+    return OperatorOutput(
+        status_state=status_state,
+        status_attributes=status_attributes,
+        health_state=health.level.value,
+        health_attributes=health.attributes(),
+        runtime_signature=runtime_signature,
+        runtime_message="; ".join(runtime_signature) + ".",
+        weekly_summary=weekly,
+    )
+
+
+def _status_attributes(
+    *,
+    now: float,
+    local_now: datetime,
+    armed: bool,
+    observation: SupervisorObservation,
+    hardware: HardwareSnapshot,
+    supervisor: EnergySupervisor,
+    bus_status: GeneratorBusStatus,
+    generator_controllers: Mapping[GeneratorSlot, GeneratorController],
+    power_transfer: PowerTransferController,
+    exercise_scheduler: Any,
+    exercise_attributes: Mapping[str, Any],
+    run_attributes: Mapping[str, Any],
+    generator_runs: Any,
+    load_manager: LoadManager,
+    ups_run: UPSRun,
+) -> dict[str, Any]:
+    del local_now, generator_runs
+    actual_slot = (
+        bus_status.owner_slot
+        if observation.power.actual_source == PowerSource.GENERATOR
+        else None
+    )
+    managed_slot = (
+        supervisor.session.generator if supervisor.session is not None else None
+    )
+    primary = supervisor.config.primary_generator
+    session = supervisor.session
+    attrs: dict[str, Any] = {
+        "friendly_name": "Energy ATS Status",
+        "icon": "mdi:transfer-switch",
+        "source": observation.power.actual_source.value,
+        "grid_input_state": (
+            hardware.grid_input_state.value
+            if hardware.grid_input_state is not None
+            else "unknown"
+        ),
+        "phase": supervisor.phase.value,
+        "generator": (
+            generator_controllers[actual_slot].profile.display_name
+            if actual_slot is not None
+            else None
+        ),
+        "generator_model": (
+            generator_controllers[actual_slot].profile.model
+            if actual_slot is not None
+            else None
+        ),
+        "generator_slot": actual_slot.value if actual_slot is not None else None,
+        "managed_generator": (
+            generator_controllers[managed_slot].profile.display_name
+            if managed_slot is not None
+            else None
+        ),
+        "bus_owner": _format_bus_owner(bus_status, generator_controllers),
+        "generator_a_run_context": bus_status.run_contexts[GeneratorSlot.A].value,
+        "generator_b_run_context": bus_status.run_contexts[GeneratorSlot.B].value,
+        "primary_generator": generator_controllers[primary].profile.display_name,
+        "remaining_seconds": _remaining_seconds(
+            now=now,
+            observation=observation,
+            supervisor=supervisor,
+            generator_controllers=generator_controllers,
+            power_transfer=power_transfer,
+            ups_run=ups_run,
+        ),
+        "session_reason": session.reason.value if session is not None else None,
+        "fallback_used": bool(session and session.fallback_used),
+        "cycle_session_owned_by_energy_ats": bool(session and session.cycle_owned),
+        "session_manual_override": bool(session and session.manual_override),
+        "armed": armed,
+    }
+    attrs.update(exercise_attributes)
+    attrs.update(run_attributes)
+    attrs.update(load_manager.status_attributes())
+    attrs.update(ups_run.status_attributes(now, hardware.battery))
+    exercise_slot = exercise_scheduler.owned_slot
+    attrs["exercise_active_generator"] = (
+        generator_controllers[exercise_slot].profile.display_name
+        if exercise_slot is not None
+        else None
+    )
+    return attrs
+
+
+def _health_inputs(
+    *,
+    armed: bool,
+    observation: SupervisorObservation,
+    hardware: HardwareSnapshot,
+    supervisor: EnergySupervisor,
+    bus_status: GeneratorBusStatus,
+    generator_controllers: Mapping[GeneratorSlot, GeneratorController],
+    load_manager: LoadManager,
+    ups_run: UPSRun,
+) -> HealthInputs:
+    any_running = any(
+        status.running is True for status in observation.generators.values()
+    )
+    return HealthInputs(
+        armed=armed,
+        automatic_transfer_enabled=hardware.automatic_transfer_enabled,
+        emergency_stop=hardware.emergency_stop,
+        required_states_known=observation.required_states_known,
+        recovery_required=(supervisor.phase == SupervisorPhase.RECOVERY_REQUIRED),
+        recovery_reason=supervisor.recovery_reason,
+        grid_input_state=hardware.grid_input_state,
+        generators=tuple(
+            GeneratorHealth(
+                name=generator_controllers[slot].profile.display_name,
+                enabled=supervisor.config.generator_enabled(slot),
+                running=status.running,
+                fault=status.fault,
+            )
+            for slot, status in observation.generators.items()
+        ),
+        bus_owner_unknown_while_running=(
+            any_running and bus_status.owner == GeneratorBusOwner.UNKNOWN
+        ),
+        ups_run_enabled=ups_run.enabled,
+        ups_run_degraded=(ups_run.state == UPSRunState.DEGRADED),
+        ups_run_reason=ups_run.last_reason,
+        load_manager_enabled=load_manager.config.enabled,
+        load_manager_degraded=(load_manager.phase == LoadManagerPhase.DEGRADED),
+        load_manager_reason=(
+            load_manager.degraded_reason or load_manager.last_reason
+        ),
+    )
+
+
+def _runtime_signature(
+    *,
+    armed: bool,
+    observation: SupervisorObservation,
+    supervisor: EnergySupervisor,
+    bus_status: GeneratorBusStatus,
+    generator_controllers: Mapping[GeneratorSlot, GeneratorController],
+    load_manager: LoadManager,
+    ups_run: UPSRun,
+    exercise_scheduler: Any,
+) -> tuple[str, ...]:
+    status = _status_text(
+        armed=armed,
+        supervisor=supervisor,
+        observation=observation,
+        ups_run=ups_run,
+    )
+    grid = (
+        "ON"
+        if observation.grid_ready is True
+        else "OFF"
+        if observation.grid_ready is False
+        else "UNKNOWN"
+    )
+    parts = [
+        f"Состояние: {status}",
+        f"Grid={grid}",
+        f"AVR={'ON' if observation.automatic_transfer_enabled else 'OFF'}",
+        f"power={_format_power(observation, bus_status, generator_controllers)}",
+        f"bus={_format_bus_owner(bus_status, generator_controllers)}",
+    ]
+    transfer = _format_transfer(observation)
+    if transfer:
+        parts.append(f"transfer={transfer}")
+    if load_manager.config.enabled:
+        parts.append(f"load_manager={load_manager.phase.value}")
+    if ups_run.enabled:
+        parts.append(f"ups_run={ups_run.state.value}")
+    exercise_slot = exercise_scheduler.owned_slot
+    if exercise_slot is not None and exercise_scheduler.active_attempt is not None:
+        parts.append(
+            f"exercise={generator_controllers[exercise_slot].profile.display_name}:"
+            f"{exercise_scheduler.active_attempt.phase.value}"
+        )
+    parts.extend(
+        f"{generator_controllers[slot].profile.display_name}: "
+        f"{_format_generator_state(slot, observation, bus_status)}"
+        for slot in GeneratorSlot
+    )
+    parts.append(
+        f"primary={generator_controllers[supervisor.config.primary_generator].profile.display_name}"
+    )
+    return tuple(parts)
+
+
+def _status_text(
+    *,
+    armed: bool,
+    supervisor: EnergySupervisor,
+    observation: SupervisorObservation,
+    ups_run: UPSRun,
+) -> str:
+    if not armed:
+        return "DISARMED — только наблюдение"
+    if supervisor.phase == SupervisorPhase.RECOVERY_REQUIRED:
+        return supervisor.status_text(observation)
+    if ups_run.state == UPSRunState.WAITING_ON_UPS:
+        return "Питание от UPS"
+    return supervisor.status_text(observation)
+
+
+def _remaining_seconds(
+    *,
+    now: float,
+    observation: SupervisorObservation,
+    supervisor: EnergySupervisor,
+    generator_controllers: Mapping[GeneratorSlot, GeneratorController],
+    power_transfer: PowerTransferController,
+    ups_run: UPSRun,
+) -> int | None:
+    if observation.power.transition_in_progress and power_transfer.deadline is not None:
+        return _seconds_left(power_transfer.deadline - now)
+
+    if supervisor.session is not None:
+        deadline = generator_controllers[supervisor.session.generator].deadline
+        if deadline is not None:
+            return _seconds_left(deadline - now)
+
+    if ups_run.state == UPSRunState.WAITING_ON_UPS and ups_run.waiting_since is not None:
+        return _seconds_left(
+            ups_run.config.max_start_delay - (now - ups_run.waiting_since)
+        )
+
+    if (
+        supervisor.phase == SupervisorPhase.GRID_FAILURE_DELAY
+        and supervisor.grid_failed_since is not None
+    ):
+        return _seconds_left(
+            supervisor.config.grid_failure_delay
+            - (now - supervisor.grid_failed_since)
+        )
+
+    if (
+        supervisor.session is not None
+        and supervisor.session.grid_was_unavailable
+        and observation.grid_ready is True
+        and supervisor.grid_ready_since is not None
+        and supervisor.phase == SupervisorPhase.ON_GENERATOR
+    ):
+        return _seconds_left(
+            supervisor.config.grid_restore_stable_time
+            - (now - supervisor.grid_ready_since)
+        )
+    return None
+
+
+def _format_power(
+    observation: SupervisorObservation,
+    bus_status: GeneratorBusStatus,
+    generator_controllers: Mapping[GeneratorSlot, GeneratorController],
+) -> str:
+    source = observation.power.actual_source
+    if source == PowerSource.GRID:
+        return "Grid"
+    if source == PowerSource.UPS_ONLY:
+        return "UPS only"
+    if source == PowerSource.NO_POWER:
+        return "NO POWER"
+    if source == PowerSource.GENERATOR:
+        owner = bus_status.owner_slot
+        return (
+            f"Generator {generator_controllers[owner].profile.display_name}"
+            if owner is not None
+            else "Generator Unknown"
+        )
+    return "Unknown"
+
+
+def _format_transfer(observation: SupervisorObservation) -> str | None:
+    return {
+        TransferPhase.DISCONNECTING_GRID: "disconnecting Grid",
+        TransferPhase.CONNECTING_GRID: "connecting Grid",
+        TransferPhase.SELECTING_GENERATOR: "connecting generator bus",
+        TransferPhase.DISCONNECTING_GENERATOR: "disconnecting generator bus",
+        TransferPhase.RECOVERY_REQUIRED: "recovery required",
+    }.get(observation.power.phase)
+
+
+def _format_generator_state(
+    slot: GeneratorSlot,
+    observation: SupervisorObservation,
+    bus_status: GeneratorBusStatus,
+) -> str:
+    if (
+        observation.power.actual_path == PowerPath.GENERATOR
+        and bus_status.owner_slot == slot
+    ):
+        return "под нагрузкой"
+    return _GENERATOR_PHASE_TEXT[observation.generators[slot].phase]
+
+
+def _format_bus_owner(
+    bus_status: GeneratorBusStatus,
+    generator_controllers: Mapping[GeneratorSlot, GeneratorController],
+) -> str:
+    if bus_status.owner.slot is not None:
+        return generator_controllers[bus_status.owner.slot].profile.display_name
+    return "none" if bus_status.owner == GeneratorBusOwner.NONE else "unknown"
+
+
+def _seconds_left(value: float) -> int:
+    return max(0, int(math.ceil(value)))
 
 
 def build_weekly_exercise_summary(
