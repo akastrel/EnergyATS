@@ -136,7 +136,7 @@ class HomeAssistantAdapter:
         self.log = logger or logging.getLogger(__name__)
         self.family_presence_entity = (
             family_presence_entity.strip()
-            if isinstance(family_presence_entity, str) and self.family_presence_entity.strip()
+            if isinstance(family_presence_entity, str) and family_presence_entity.strip()
             else None
         )
         # Presence — мягкий input только для Exercise Scheduler. Даже когда
@@ -376,7 +376,7 @@ class HomeAssistantAdapter:
 
         for action in generator_actions:
             if not self.armed:
-                self.log.info("DISARMED: подавлена команда Load Manager %s", action)
+                self.log.info("DISARMED: подавлена команда %s", action)
                 continue
             self._assert_generator_action_safe(action)
             entity_id, domain, service = self._generator_service(action)
