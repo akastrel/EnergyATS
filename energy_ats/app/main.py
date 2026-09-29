@@ -20,6 +20,7 @@ from domain import (
     GeneratorSlot,
     PowerPath,
     PowerSource,
+    SessionReason,
     SupervisorEvent,
 )
 from energy_supervisor import (
@@ -37,7 +38,11 @@ from exercise_scheduler import (
     ExerciseObservation,
     ExerciseScheduler,
 )
-from generator_bus import GeneratorBusOwner, GeneratorBusTracker
+from generator_bus import (
+    GeneratorBusOwner,
+    GeneratorBusTracker,
+    GeneratorRunContext,
+)
 from generator_controller import (
     GeneratorAction,
     GeneratorController,
@@ -45,6 +50,7 @@ from generator_controller import (
     GeneratorProfile,
     default_generator_profiles,
 )
+from generator_run_history import GeneratorRunHistory, GeneratorRunType
 from ha_adapter import HardwareSnapshot, HomeAssistantAdapter
 from ha_client import HomeAssistantClient, HomeAssistantConnectionError
 from load_manager import (
@@ -165,6 +171,7 @@ class EnergySupervisorApp:
             load_manager_config,
             ups_run_config,
         )
+        self.generator_runs = self._restore_generator_runs(saved)
 
         operator_state = (
             saved.get("operator_status")
@@ -998,12 +1005,35 @@ class EnergySupervisorApp:
 
         return bus, supervisor, scheduler, manager, ups_run
 
+    def _restore_generator_runs(
+        self,
+        saved: dict[str, Any] | None,
+    ) -> GeneratorRunHistory:
+        """Restore optional observability state without affecting core safety."""
+        if not isinstance(saved, dict):
+            return GeneratorRunHistory()
+        payload = saved.get("generator_runs")
+        if payload is None:
+            return GeneratorRunHistory()
+        try:
+            if not isinstance(payload, dict):
+                raise ValueError("generator_runs должен быть object")
+            return GeneratorRunHistory.from_dict(payload)
+        except Exception as exc:
+            self.log.warning(
+                "Не удалось восстановить историю запусков генераторов; "
+                "используем пустую статистику: %s",
+                exc,
+            )
+            return GeneratorRunHistory()
+
     def _save_state(self, *, force: bool = False) -> None:
         payload = {
             "schema_version": STATE_SCHEMA_VERSION,
             "app_version": APP_VERSION,
             "supervisor": self.supervisor.to_dict(),
             "generator_bus": self.generator_bus.to_dict(),
+            "generator_runs": self.generator_runs.to_dict(),
             "exercise_scheduler": self.exercise_scheduler.to_dict(),
             "load_manager": self.load_manager.to_dict(),
             "ups_run": self.ups_run.to_dict(),
@@ -1079,6 +1109,7 @@ class EnergySupervisorApp:
         self.supervisor.grid_ready_since = None
         self.supervisor.grid_failed_since = None
         self.generator_bus.invalidate_observation_history()
+        self.generator_runs.invalidate_observation_history()
 
         self.power_transfer.mark_interrupted(
             timestamp, "Потеряна связь с Home Assistant."
@@ -1220,10 +1251,29 @@ class EnergySupervisorApp:
     ) -> None:
         observation = self._supervisor_observation(hardware)
         local_now = datetime.fromtimestamp(now, self.local_time_zone)
+        run_update = self.generator_runs.step(
+            now=now,
+            local_now=local_now,
+            running={
+                slot: status.running for slot, status in observation.generators.items()
+            },
+            faults={
+                slot: status.fault for slot, status in observation.generators.items()
+            },
+            run_types=self._generator_run_types(),
+            generator_names={
+                slot: self._profile(slot).display_name for slot in GeneratorSlot
+            },
+        )
+        if run_update.events:
+            events = (*events, *run_update.events)
+
         exercise_attributes = self.exercise_scheduler.status_attributes(local_now, now)
+        run_attributes = self.generator_runs.status_attributes()
         weekly = build_weekly_exercise_summary(
             local_now=local_now,
             exercise_attributes=exercise_attributes,
+            run_attributes=run_attributes,
             generator_names={
                 slot: self._profile(slot).display_name for slot in GeneratorSlot
             },
@@ -1357,6 +1407,7 @@ class EnergySupervisorApp:
         }
         local_now = datetime.fromtimestamp(now, self.local_time_zone)
         attributes.update(self.exercise_scheduler.status_attributes(local_now, now))
+        attributes.update(self.generator_runs.status_attributes())
         attributes.update(self.load_manager.status_attributes())
         attributes.update(self.ups_run.status_attributes(now, hardware.battery))
         exercise_slot = self.exercise_scheduler.owned_slot
@@ -1460,6 +1511,24 @@ class EnergySupervisorApp:
         if owner.slot is not None:
             return self._profile(owner.slot).display_name
         return "none" if owner == GeneratorBusOwner.NONE else "unknown"
+
+    def _generator_run_types(self) -> dict[GeneratorSlot, GeneratorRunType]:
+        """Classify observed start edges from already-existing ATS ownership facts."""
+        session = self.supervisor.session
+        contexts = self.generator_bus.status().run_contexts
+        result: dict[GeneratorSlot, GeneratorRunType] = {}
+        for slot in GeneratorSlot:
+            if contexts[slot] == GeneratorRunContext.TEST_RUN:
+                result[slot] = GeneratorRunType.EXERCISE
+            elif session is not None and session.generator == slot:
+                result[slot] = (
+                    GeneratorRunType.AUTOMATIC
+                    if session.reason == SessionReason.GRID_OUTAGE
+                    else GeneratorRunType.MANUAL
+                )
+            else:
+                result[slot] = GeneratorRunType.EXTERNAL
+        return result
 
     def _log_runtime_if_changed(self, observation: SupervisorObservation) -> None:
         status = (
