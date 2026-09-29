@@ -199,7 +199,7 @@ def build_weekly_exercise_summary(
         )
         for slot in GeneratorSlot
     ]
-    message = f"Генераторы. {' '.join(parts)}"
+    message = f"Плановые проверки генераторов. {' '.join(parts)}"
     return WeeklyExerciseSummary(week_key, SupervisorEvent("info", message))
 
 

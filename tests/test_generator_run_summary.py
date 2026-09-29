@@ -31,7 +31,7 @@ def test_weekly_summary_prefers_actual_run_history_over_exercise_fallback():
     )
 
     assert summary is not None
-    assert summary.event.message.startswith("Генераторы. ")
+    assert summary.event.message.startswith("Плановые проверки генераторов. ")
     assert "Elemax: последний запуск — 29 сентября, 46 мин, автоматический" in summary.event.message
     assert "следующий пробный запуск — 29 октября" in summary.event.message
     assert "Вепрь: успешных запусков ещё не было" in summary.event.message
