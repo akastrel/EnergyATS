@@ -46,7 +46,7 @@ from runtime_observations import (
 from state_store import StateStore
 from ups_run import UPSRunConfig
 
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 STATE_SCHEMA_VERSION = 3
 
 DEFAULT_OPTIONS: dict[str, Any] = {
@@ -68,7 +68,6 @@ DEFAULT_OPTIONS: dict[str, Any] = {
     "generator_charge_cycle_enabled": False,
     "generator_start_soc": 40,
     "generator_target_charge_soc": 80,
-    "generator_min_ttg_before_start": 60,
     "generator_max_start_delay_hours": 6,
     "family_presence_entity": "group.family",
     "generator_a_exercise_enabled": False,
@@ -903,9 +902,6 @@ class EnergySupervisorApp:
             ),
             start_soc=float(self.options["generator_start_soc"]),
             target_soc=float(self.options["generator_target_charge_soc"]),
-            min_ttg_before_start=float(
-                self.options["generator_min_ttg_before_start"]
-            ),
             max_start_delay=round(
                 float(self.options["generator_max_start_delay_hours"]) * 60 * 60,
                 6,
@@ -1072,6 +1068,8 @@ def load_options(path: str | Path = "/data/options.json") -> dict[str, Any]:
 def _merge_options(options: dict[str, Any]) -> dict[str, Any]:
     """Объединить options с defaults и перенести старое значение секунд в часы."""
     normalized = dict(options)
+    # Старый параметр больше не влияет на решения UPS Run.
+    normalized.pop("generator_min_ttg_before_start", None)
     if "generator_max_start_delay_hours" not in normalized:
         legacy_seconds = normalized.pop("generator_max_start_delay", None)
         if legacy_seconds is not None:

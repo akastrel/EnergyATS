@@ -146,7 +146,7 @@ Safety / Recovery
 
 **Ситуация:** Grid отсутствует, EnergyATS намеренно ждёт в `UPS_ONLY`, а пользователь запрашивает резервное питание.
 
-**Решение:** автоматическое ожидание немедленно прекращается и начинается ручная managed session. Пользователь не должен ждать SoC/TTG/max-delay.
+**Решение:** автоматическое ожидание немедленно прекращается и начинается ручная managed session. Пользователь не должен ждать SoC/max-delay.
 
 ### REQ-BEH-03. Exercise ещё не начался, появилась более важная задача
 
@@ -560,7 +560,7 @@ UPS Run не дублирует start/stop lifecycle generator, силовой t
 
 #### REQ-DELAY-03. Когда можно ждать в UPS_ONLY
 
-После `grid_failure_delay` ожидание разрешено только если Delayed Start включён, Grid всё ещё отсутствует, батарейные данные пригодны, нет critical battery state и пользователь не потребовал generator сейчас.
+После `grid_failure_delay` ожидание разрешено только если Delayed Start включён, Grid всё ещё отсутствует, SoC достоверен и пользователь не потребовал generator сейчас.
 
 #### REQ-DELAY-04. Условия automatic start
 
@@ -568,7 +568,6 @@ UPS Run не дублирует start/stop lifecycle generator, силовой t
 
 ```text
 battery_soc <= generator_start_soc
-OR battery_ttg <= generator_min_ttg_before_start
 OR current_ups_wait >= generator_max_start_delay_hours
 ```
 
@@ -576,15 +575,15 @@ OR current_ups_wait >= generator_max_start_delay_hours
 
 #### REQ-DELAY-05. Fail-safe при плохих battery data
 
-Delayed Start является оптимизацией, а не hard dependency core ATS. Если необходимые battery data отсутствуют, stale, `unknown/unavailable` либо явно некорректны, бесконечно ждать запрещено: используется обычный safe managed generator start.
+Delayed Start является оптимизацией, а не hard dependency core ATS. Если SoC отсутствует, устарел или некорректен, бесконечно ждать запрещено: используется обычный safe managed generator start.
 
-#### REQ-DELAY-06. Critical battery немедленно отменяет ожидание
+#### REQ-DELAY-06. Производный `ups_ready` не влияет на решения UPS Run
 
-Critical battery state требует начать обычный generator start без ожидания SoC/TTG/max-delay, если запуск не запрещён более высоким safety-state.
+`binary_sensor.ups_ready` в HA определяется условием SoC > 10% и не является независимым источником защиты. Его значение `OFF`, `UNKNOWN` или отсутствие не должны создавать дополнительный запуск генератора, запрещать ожидание на UPS или блокировать штатную остановку cycle-owned сессии по достоверному Target SoC. Независимые аппаратные защиты МАП остаются вне области управления UPS Run.
 
-#### REQ-DELAY-07. TTG учитывается только при реальном разряде
+#### REQ-DELAY-07. TTG не используется для автоматического запуска
 
-TTG участвует в решении только при реальном discharge и конечном числовом значении. Зарядка/float/бесконечный/неосмысленный TTG не должен создавать ложный start condition.
+Оценка Time To Go (TTG) не участвует в решениях АВР. Её отсутствие, устаревание или малое значение не создают условия для запуска генератора. Статус `ups_running_on_battery` не является обязательным входом для Delayed Start.
 
 #### REQ-DELAY-08. Grid restore во время ожидания
 
@@ -610,7 +609,7 @@ Manual reserve request во время UPS-only wait немедленно пре
 
 #### REQ-CYCLE-04. Stop по Target только для cycle-owned session
 
-Автоматическая остановка по Target разрешена только для managed outage-session, происхождение и продолжающаяся ответственность UPS Run однозначно известны. Manual/external/Exercise run не становится cycle-owned только из-за подходящих SoC/TTG.
+Автоматическая остановка по Target разрешена только для managed outage-session, происхождение и продолжающаяся ответственность UPS Run однозначно известны. Manual/external/Exercise run не становится cycle-owned только из-за подходящего SoC.
 
 #### REQ-CYCLE-05. Manual override
 
@@ -630,7 +629,7 @@ Grid restore во время charge cycle использует обычный Ge
 
 #### REQ-CYCLE-09. External/manual run не захватывается cycling
 
-SoC/TTG/outage не создают право UPS Run остановить external либо manual generator. Отдельный outage-related cleanup после Grid restore остаётся независимым правилом.
+SoC/outage не создают право UPS Run остановить external либо manual generator. Отдельный outage-related cleanup после Grid restore остаётся независимым правилом.
 
 ### 7.4. Default configuration
 
@@ -639,7 +638,6 @@ delayed_generator_start_enabled = false
 generator_charge_cycle_enabled = false
 generator_start_soc = 40 %
 generator_target_charge_soc = 80 %
-generator_min_ttg_before_start = 60 min
 generator_max_start_delay_hours = 6 h
 ```
 
@@ -647,14 +645,14 @@ generator_max_start_delay_hours = 6 h
 
 - `TC-UPS-01` (legacy #78) — при достаточном battery reserve после `grid_failure_delay` EnergyATS остаётся в `UPS_ONLY`, generator не стартует.
 - `TC-UPS-02` (legacy #79) — достижение Start SoC начинает обычный managed generator start.
-- `TC-UPS-03` (legacy #80) — достижение TTG threshold раньше SoC также начинает generator start.
-- `TC-UPS-04` (legacy #81) — истечение max UPS wait запускает generator даже при достаточном SoC/TTG.
+- `TC-UPS-03` (legacy #80) — низкий/недостоверный/отсутствующий TTG не вызывает запуск при достаточном достоверном SoC.
+- `TC-UPS-04` (legacy #81) — истечение max UPS wait запускает generator даже при достаточном SoC.
 - `TC-UPS-05` (legacy #82) — потеря достоверности обязательных battery data прекращает Delayed Start fail-safe запуском generator.
-- `TC-UPS-06` (legacy #83) — critical battery немедленно отменяет автоматическое ожидание.
+- `TC-UPS-06` (legacy #83) — `ups_ready=OFF/UNKNOWN` либо отсутствие этого HA-флага не запускает генератор при достаточном SoC и не запрещает остановку цикла по Target SoC.
 - `TC-UPS-07` (legacy #84) — stable Grid restore во время UPS wait предотвращает ненужный generator start.
 - `TC-UPS-08` (legacy #85) — manual reserve request во время UPS wait начинает generator без дальнейшей delayed pause.
 - `TC-UPS-09` (legacy #86) — cycle-owned session на Target SoC безопасно возвращает дом в `UPS_ONLY` и штатно останавливает generator.
-- `TC-UPS-10` (legacy #87) — после automatic stop новый Start SoC/TTG/max-delay запускает следующий cycle.
+- `TC-UPS-10` (legacy #87) — после automatic stop новый Start SoC/max-delay запускает следующий cycle.
 - `TC-UPS-11` (legacy #88) — Grid restore во время charge cycle возвращает дом на Grid без ожидания Target.
 - `TC-UPS-12` (legacy #89) — при disabled Charge Cycling обычный automatic outage generator не останавливается по Target SoC.
 - `TC-UPS-13` (legacy #90) — manual run во время outage не завершается автоматически по Target SoC.
@@ -1212,7 +1210,6 @@ recovery state / reason
 delayed_start_enabled
 charge_cycle_enabled
 battery_soc
-battery_ttg_minutes
 start/target thresholds
 current UPS wait elapsed/remaining
 reason why generator is or is not required

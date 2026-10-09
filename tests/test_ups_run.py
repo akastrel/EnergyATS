@@ -16,7 +16,6 @@ def cfg(**overrides):
         "charge_cycle_enabled": True,
         "start_soc": 40,
         "target_soc": 80,
-        "min_ttg_before_start": 60,
         "max_start_delay": 3600,
         "telemetry_stale_time": 300,
     }
@@ -24,8 +23,8 @@ def cfg(**overrides):
     return UPSRunConfig(**values)
 
 
-def battery(soc=70, ttg=180, *, discharging=True, ready=True, sample=1):
-    return BatteryObservation(soc, ttg, discharging, ready, sample)
+def battery(soc=70, *, discharging=True, sample=1):
+    return BatteryObservation(soc, discharging, sample)
 
 
 def obs(
@@ -74,27 +73,20 @@ def test_wait_starts_only_after_core_grid_failure_delay():
     assert p.waiting_since == 60
 
 
-def test_high_soc_and_ttg_keep_generator_off():
+def test_high_soc_keeps_generator_off():
     p = UPSRun(cfg())
-    d = p.step(obs(100, b=battery(75, 240)))
+    d = p.step(obs(100, b=battery(75)))
     assert d.defer_automatic_start
     assert d.outage_delay_already_satisfied
     assert p.state == UPSRunState.WAITING_ON_UPS
 
 
-@pytest.mark.parametrize(
-    "b, now, expected_text",
-    [
-        (battery(40, 240), 10, "SoC"),
-        (battery(70, 60), 10, "TTG"),
-    ],
-)
-def test_soc_or_ttg_threshold_requires_generator(b, now, expected_text):
+def test_soc_threshold_requires_generator():
     p = UPSRun(cfg())
-    d = p.step(obs(now, b=b))
+    d = p.step(obs(10, b=battery(40)))
     assert not d.defer_automatic_start
     assert d.claim_new_outage_session
-    assert expected_text in (d.reason or "")
+    assert "SoC" in (d.reason or "")
 
 
 def test_max_wait_requires_generator():
@@ -110,10 +102,8 @@ def test_max_wait_requires_generator():
     [
         battery(soc=None),
         battery(soc=101),
-        battery(ready=None),
-        battery(ready=False),
-        battery(discharging=None),
-        battery(ttg=None, discharging=True),
+        battery(soc=-1),
+        battery(soc=float('nan')),
     ],
 )
 def test_bad_required_battery_data_fails_safe_to_generator(bad_battery):
@@ -124,9 +114,9 @@ def test_bad_required_battery_data_fails_safe_to_generator(bad_battery):
     assert p.state == UPSRunState.GENERATOR_REQUIRED
 
 
-def test_ttg_is_not_required_when_battery_is_not_discharging():
+def test_discharge_status_is_not_required_for_wait():
     p = UPSRun(cfg())
-    d = p.step(obs(10, b=battery(70, None, discharging=False)))
+    d = p.step(obs(10, b=battery(70, discharging=None)))
     assert d.defer_automatic_start
 
 
@@ -175,7 +165,7 @@ def test_cycle_owned_session_stops_at_target_soc():
     d = p.step(
         obs(
             100,
-            b=battery(80, None, discharging=False),
+            b=battery(80, discharging=False),
             reason=SessionReason.GRID_OUTAGE,
             active=True,
             on_generator=True,
@@ -191,7 +181,7 @@ def test_cycle_does_not_stop_before_target():
     d = p.step(
         obs(
             100,
-            b=battery(70, None, discharging=False),
+            b=battery(70, discharging=False),
             reason=SessionReason.GRID_OUTAGE,
             active=True,
             on_generator=True,
@@ -217,7 +207,7 @@ def test_manual_external_or_unowned_session_is_never_stopped_by_target(
     d = p.step(
         obs(
             100,
-            b=battery(95, None, discharging=False),
+            b=battery(95, discharging=False),
             reason=reason,
             active=True,
             on_generator=True,
@@ -272,11 +262,13 @@ def test_restart_wait_preserves_max_delay_elapsed_time():
 
 def test_status_exposes_wait_and_battery_information():
     p = UPSRun(cfg(max_start_delay=100))
-    b = battery(71, 123)
+    b = battery(71)
     p.step(obs(10, b=b))
     attrs = p.status_attributes(40, b)
     assert attrs["charge_cycle_state"] == "waiting_on_ups"
     assert attrs["battery_soc"] == 71
+    assert "battery_ttg_minutes" not in attrs
+    assert "battery_ready" not in attrs
     assert attrs["delayed_start_elapsed_seconds"] == 30
     assert attrs["delayed_start_remaining_seconds"] == 70
 

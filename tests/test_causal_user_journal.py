@@ -28,7 +28,6 @@ def _ups_config(**overrides):
         "charge_cycle_enabled": True,
         "start_soc": 40,
         "target_soc": 80,
-        "min_ttg_before_start": 60,
         "max_start_delay": 3600,
         "telemetry_stale_time": 300,
     }
@@ -36,8 +35,8 @@ def _ups_config(**overrides):
     return UPSRunConfig(**values)
 
 
-def _battery(soc=70, ttg=180, *, discharging=True, ready=True, sample=1):
-    return BatteryObservation(soc, ttg, discharging, ready, sample)
+def _battery(soc=70, *, discharging=True, sample=1):
+    return BatteryObservation(soc, discharging, sample)
 
 
 def _ups_obs(
@@ -78,7 +77,7 @@ def test_ups_wait_explains_why_generator_is_not_started():
 
 def test_ups_soc_threshold_explains_why_generator_is_required():
     ups = UPSRun(_ups_config())
-    decision = ups.step(_ups_obs(10, battery=_battery(39, 180)))
+    decision = ups.step(_ups_obs(10, battery=_battery(39)))
 
     assert decision.claim_new_outage_session
     assert user_message(
@@ -86,13 +85,15 @@ def test_ups_soc_threshold_explains_why_generator_is_required():
     ) in _messages(decision.events)
 
 
-def test_ups_ttg_threshold_explains_why_generator_is_required():
-    ups = UPSRun(_ups_config())
-    decision = ups.step(_ups_obs(10, battery=_battery(70, 55)))
+def test_ups_max_wait_explains_why_generator_is_required():
+    """Истечение максимального ожидания явно записывается в пользовательский журнал. Причина запуска не зависит от несуществующего TTG-порога."""
+    ups = UPSRun(_ups_config(max_start_delay=10))
+    ups.step(_ups_obs(10, battery=_battery(70)))
+    decision = ups.step(_ups_obs(20, battery=_battery(70, sample=2)))
 
     assert decision.claim_new_outage_session
     assert user_message(
-        "ups_start_ttg_reached", ttg=55, threshold=60
+        "ups_max_wait_elapsed", duration="10 с"
     ) in _messages(decision.events)
 
 
@@ -101,7 +102,7 @@ def test_ups_target_charge_message_uses_human_charge_language():
     decision = ups.step(
         _ups_obs(
             100,
-            battery=_battery(81, None, discharging=False),
+            battery=_battery(81, discharging=False),
             active=True,
             on_generator=True,
             cycle_owned=True,
