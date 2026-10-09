@@ -63,7 +63,7 @@ observe physical state
 
 UPS Run определяет стратегию длительного outage. Две функции включаются независимо и по умолчанию выключены:
 
-- **Delayed Start** — после обычного `grid_failure_delay` можно продолжать работу только от UPS до порога SoC/TTG/max-delay;
+- **Delayed Start** — после обычного `grid_failure_delay` можно продолжать работу только от UPS до порога SoC/max-delay;
 - **Charge Cycling** — cycle-owned automatic outage session можно завершить при Target SoC, перейти в `UPS_ONLY`, остановить generator и позже запустить следующий цикл.
 
 Manual request имеет приоритет над ожиданием/cycle stop. Stable Grid имеет приоритет над Target SoC. При плохой battery telemetry EnergyATS отказывается от задержки и использует обычный безопасный generator start.

@@ -80,7 +80,7 @@ observe -> decide -> plan -> execute -> publish/persist
 | `power_transfer.py` | Grid/Generator break-before-make; отдельные `observe()` feedback и `plan()` следующего силового шага |
 | `energy_supervisor.py` | **Единая системная логика:** `REQ-BEH-*`, managed-session, manual/outage, fallback, return, Recovery и разрешение пересечений режимов |
 | `exercise_scheduler.py` | Локальная логика Scheduled Exercise: schedule/history/warning/duration/result и ответственность за собственный auto-run до явного handoff |
-| `ups_run.py` | UPS Run subsystem: оценка battery/TTG/time, ожидание в `UPS_ONLY`, условия начала/окончания charge cycle. Не является вторым Supervisor |
+| `ups_run.py` | UPS Run subsystem: оценка battery SoC/time, ожидание в `UPS_ONLY`, условия начала/окончания charge cycle. Не является вторым Supervisor |
 | `load_manager.py` | G1/G2: pre-transfer shedding, admission, continuous overload control, own-OFF ownership и локальный DEGRADED |
 | `runtime_observations.py` | Чистые application-layer builders DTO для Supervisor, Exercise, UPS Run и Load Manager; state и policy не хранит |
 | `operator_status.py` | Чистая пользовательская проекция одного tick: status, health, runtime-log signature и weekly summary; управляющих решений не принимает |
@@ -414,7 +414,6 @@ prove no blocker
 
 - разрешено ли после `grid_failure_delay` продолжать `UPS_ONLY`;
 - достигнут ли Start SoC;
-- достигнут ли минимальный TTG;
 - истёк ли max wait;
 - батарейные данные валидны или нужен fail-safe generator start;
 - достигнут ли Target SoC для cycle-owned session;
@@ -718,7 +717,7 @@ Core status attributes включают source/phase/generator/model/managed/bus
 
 Exercise публикует для A/B due/history/forced-warning/active/result state. Общая история генераторов добавляет totals и последний фактический запуск без публикации полного bounded history в HA attributes.
 
-UPS Run публикует как минимум enabled state, battery SoC/TTG validity, current UPS wait, reason и cycle ownership/thresholds.
+UPS Run публикует как минимум enabled state, battery SoC/readiness validity, current UPS wait, reason и cycle ownership/thresholds.
 
 Load Manager публикует enabled/phase, degraded reason, measured power, active owner limits, G1/G2 state/ownership, overload timers, restore retry и last reason.
 

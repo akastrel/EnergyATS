@@ -150,7 +150,6 @@ Generator требуется, если выполняется хотя бы од
 
 ```text
 SoC <= generator_start_soc
-OR TTG <= generator_min_ttg_before_start
 OR UPS wait >= generator_max_start_delay_hours
 ```
 
@@ -158,7 +157,6 @@ Defaults:
 
 ```text
 generator_start_soc = 40 %
-generator_min_ttg_before_start = 60 min
 generator_max_start_delay_hours = 6 h
 ```
 
@@ -196,14 +194,12 @@ Manual request отменяет automatic Target stop для текущей sess
 
 ```text
 sensor.ups_battery_charge_level_soc
-sensor.ups_battery_time_remaining_minutes_ttg
-binary_sensor.ups_running_on_battery
 binary_sensor.ups_ready
 ```
 
-Это soft dependencies core ATS. Если UPS Run выключен, они не влияют на обычный ATS.
+Это soft dependencies core ATS. `binary_sensor.ups_running_on_battery` используется только для диагностики и не блокирует ожидание. Если UPS Run выключен, батарейные данные не влияют на обычный ATS.
 
-Если UPS Run включён, stale/invalid telemetry считается основанием прекратить ожидание и использовать обычный безопасный generator start. TTG участвует в решении только при реальном discharge.
+Если UPS Run включён, недоступный/устаревший SoC или неизвестная/критическая готовность UPS прекращают ожидание и вызывают обычный безопасный generator start.
 
 ## 7. Scheduled Exercise
 
@@ -367,7 +363,7 @@ trigger / физическое изменение
   -> подтверждённый feedback / результат
 ```
 
-Например, потеря Grid, начало ожидания на UPS, достижение SoC/TTG-порога, старт генератора, изменение RUNNING/REMOTE, выбор generator bus, возврат Grid и завершение сессии журналируются раздельно. Это позволяет понять не только «что переключилось», но и почему EnergyATS сделал именно это.
+Например, потеря Grid, начало ожидания на UPS, достижение порога SoC, старт генератора, изменение RUNNING/REMOTE, выбор generator bus, возврат Grid и завершение сессии журналируются раздельно. Это позволяет понять не только «что переключилось», но и почему EnergyATS сделал именно это.
 
 Физически наблюдаемые изменения фиксируются только при реальном изменении state. Первый snapshot после start или reconnect задаёт baseline и намеренно не создаёт ложный поток событий. Внешний запуск генератора отличается от запуска, которым управляет EnergyATS.
 

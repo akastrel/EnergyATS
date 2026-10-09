@@ -12,7 +12,7 @@ Home Assistant App для управления резервным электро
 - корректная работа физической схемы, в которой A и B могут одновременно быть RUNNING, но общей generator bus владеет только один аппаратно выбранный generator;
 - безопасный Grid / Generator transfer с break-before-make и подтверждением каждого шага;
 - `UPS_ONLY` без вымышленного Battery contactor: МАП самостоятельно поддерживает критическую UPS-линию;
-- **UPS Run** для длительных outage: Delayed Start и опциональные charge cycles по SoC/TTG/времени;
+- **UPS Run** для длительных outage: Delayed Start и опциональные charge cycles по SoC/времени;
 - **Scheduled Exercise** для периодических пробных запусков A/B с presence/grace/warning и сохранением ownership через restart;
 - общая история физических запусков каждого генератора с total starts/runtime и последним запуском в status;
 - еженедельная пользовательская сводка с последним фактическим запуском и следующей плановой проверкой каждого генератора;
@@ -105,7 +105,6 @@ UPS Run — стратегия работы при длительном отсу
 
 ```text
 SoC <= generator_start_soc
-OR TTG <= generator_min_ttg_before_start
 OR UPS wait >= generator_max_start_delay_hours
 ```
 

@@ -207,7 +207,6 @@ sensor.generator_b_maximum_power
 
 ```text
 sensor.ups_battery_charge_level_soc
-sensor.ups_battery_time_remaining_minutes_ttg
 binary_sensor.ups_running_on_battery
 binary_sensor.ups_ready
 ```
@@ -217,13 +216,12 @@ binary_sensor.ups_ready
 Смысл:
 
 - `ups_battery_charge_level_soc` — SoC 0–100 %;
-- `ups_battery_time_remaining_minutes_ttg` — расчётное оставшееся время работы в минутах;
 - `ups_running_on_battery` — `ON`, когда батарея реально разряжается; при заряде/поддержании должен быть `OFF`;
 - `ups_ready` — способность UPS/АКБ продолжать работу, включая отсутствие критического состояния батареи.
 
 Если функция работы от UPS выключена, эти сущности не влияют на обычную работу АВР.
 
-При включённом отложенном запуске недостоверные или устаревшие данные прекращают ожидание и приводят к безопасному запуску генератора. TTG учитывается только при фактическом разряде.
+При включённом отложенном запуске недостоверный или устаревший SoC, а также отсутствие подтверждения готовности UPS прекращают ожидание и приводят к безопасному запуску генератора. `ups_running_on_battery` носит диагностический характер и не является обязательным условием ожидания.
 
 ## 7. Управление некритичными нагрузками
 
@@ -448,7 +446,6 @@ charge_cycle_enabled
 charge_cycle_state
 delayed_start_reason
 battery_soc
-battery_ttg_minutes
 battery_discharging
 battery_ready
 generator_start_soc

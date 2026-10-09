@@ -36,7 +36,6 @@ class UPSRunConfig:
     charge_cycle_enabled: bool = False
     start_soc: float = 40.0
     target_soc: float = 80.0
-    min_ttg_before_start: float = 60.0
     max_start_delay: float = 6 * 60 * 60
     telemetry_stale_time: float = 300.0
 
@@ -45,7 +44,6 @@ class UPSRunConfig:
         values = (
             self.start_soc,
             self.target_soc,
-            self.min_ttg_before_start,
             self.max_start_delay,
             self.telemetry_stale_time,
         )
@@ -60,8 +58,6 @@ class UPSRunConfig:
                 f"уровень запуска генератора ({self.start_soc:.0f}%) должен быть "
                 f"ниже уровня остановки ({self.target_soc:.0f}%)."
             )
-        if self.min_ttg_before_start < 0:
-            return "порог оставшегося времени UPS не может быть отрицательным."
         if self.max_start_delay < 0:
             return "максимальное время ожидания на UPS не может быть отрицательным."
         if self.telemetry_stale_time <= 0:
@@ -76,13 +72,10 @@ class UPSRunConfig:
 @dataclass(frozen=True)
 class BatteryObservation:
     soc: float | None
-    ttg_minutes: float | None
     discharging: bool | None
     ready: bool | None
     sample_id: Hashable | None = None
-    ttg_sample_id: Hashable | None = None
     soc_updated_at: float | None = None
-    ttg_updated_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -123,12 +116,9 @@ class UPSRun:
         self.post_cycle_wait = False
         self.last_reason: str | None = None
 
-        # SoC и TTG проверяются отдельно: обновление одного сигнала не делает
-        # второй свежим. При restart используем также timestamps из HA cache.
+        # При restart используем timestamps SoC из HA cache.
         self._last_sample_id: Hashable | None = None
         self._last_sample_at: float | None = None
-        self._last_ttg_sample_id: Hashable | None = None
-        self._last_ttg_sample_at: float | None = None
         self._last_event_key: str | None = None
 
     @property
@@ -148,14 +138,6 @@ class UPSRun:
     def step(self, o: UPSRunObservation) -> UPSRunDecision:
         events: list[SupervisorEvent] = []
         self._observe_sample(o.now, o.battery.sample_id)
-        ttg_sample = (
-            o.battery.ttg_sample_id
-            if o.battery.ttg_sample_id is not None
-            else o.battery.sample_id
-        )
-        if ttg_sample is not None and ttg_sample != self._last_ttg_sample_id:
-            self._last_ttg_sample_id = ttg_sample
-            self._last_ttg_sample_at = o.now
 
         # Ошибка конфигурации должна быть видна сразу после запуска App, а не
         # впервые во время реального отключения сети. Это локальная деградация
@@ -255,7 +237,7 @@ class UPSRun:
 
         # При отключённом Delayed Start первый automatic run начинается сразу
         # после core delay. Но последующие cycling intervals всё равно обязаны
-        # ждать Start SoC/TTG/max-delay, иначе generator тут же перезапустится.
+        # ждать Start SoC/max-delay, иначе generator тут же перезапустится.
         if not should_wait_on_battery:
             self.state = UPSRunState.GENERATOR_REQUIRED
             self.last_reason = "Delayed Start выключен."
@@ -298,21 +280,6 @@ class UPSRun:
                 "ups_start_soc_reached",
                 soc=o.battery.soc,
                 threshold=self.config.start_soc,
-            )
-        elif (
-            o.battery.discharging is True
-            and o.battery.ttg_minutes is not None
-            and o.battery.ttg_minutes <= self.config.min_ttg_before_start
-        ):
-            reason = (
-                f"TTG {o.battery.ttg_minutes:.0f} мин достиг порога "
-                f"{self.config.min_ttg_before_start:.0f} мин."
-            )
-            event_key = "start_ttg"
-            event_message = user_message(
-                "ups_start_ttg_reached",
-                ttg=o.battery.ttg_minutes,
-                threshold=self.config.min_ttg_before_start,
             )
         elif elapsed >= self.config.max_start_delay:
             reason = "Достигнута максимальная задержка запуска генератора."
@@ -453,13 +420,6 @@ class UPSRun:
             return "SoC батареи недоступен или некорректен."
         if self._telemetry_stale(o.now, b.soc_updated_at):
             return "телеметрия SoC батареи устарела."
-        if b.discharging is None:
-            return "неизвестно, разряжается ли батарея."
-        if b.discharging:
-            if not _valid_nonnegative(b.ttg_minutes):
-                return "TTG батареи недоступен или некорректен при разряде."
-            if self._stale(o.now, self._last_ttg_sample_at, b.ttg_updated_at):
-                return "телеметрия TTG батареи устарела."
         return None
 
     def _observe_sample(self, now: float, sample_id: Hashable | None) -> None:
@@ -523,9 +483,6 @@ class UPSRun:
             "charge_cycle_state": self.state.value,
             "delayed_start_reason": self.last_reason,
             "battery_soc": battery.soc if _valid_soc(battery.soc) else None,
-            "battery_ttg_minutes": (
-                battery.ttg_minutes if _valid_nonnegative(battery.ttg_minutes) else None
-            ),
             "battery_discharging": battery.discharging,
             "battery_ready": battery.ready,
             "generator_start_soc": self.config.start_soc,
@@ -572,9 +529,6 @@ class UPSRun:
 def _valid_soc(value: float | None) -> bool:
     return value is not None and math.isfinite(value) and 0 <= value <= 100
 
-
-def _valid_nonnegative(value: float | None) -> bool:
-    return value is not None and math.isfinite(value) and value >= 0
 
 
 def _format_duration(seconds: float) -> str:

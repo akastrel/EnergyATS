@@ -69,7 +69,6 @@ ENTITIES = {
     # Battery inputs UPS Run. Это soft dependencies: отсутствие любого из них
     # не должно блокировать core ATS.
     "ups_battery_soc": "sensor.ups_battery_charge_level_soc",
-    "ups_battery_ttg_minutes": "sensor.ups_battery_time_remaining_minutes_ttg",
     "ups_running_on_battery": "binary_sensor.ups_running_on_battery",
     "ups_ready": "binary_sensor.ups_ready",
 }
@@ -265,13 +264,10 @@ class HomeAssistantAdapter:
 
         battery = BatteryObservation(
             soc=self.float_state(ENTITIES["ups_battery_soc"]),
-            ttg_minutes=self.float_state(ENTITIES["ups_battery_ttg_minutes"]),
             discharging=self.bool_state(ENTITIES["ups_running_on_battery"]),
             ready=self.bool_state(ENTITIES["ups_ready"]),
             sample_id=self.state_revision(ENTITIES["ups_battery_soc"]),
-            ttg_sample_id=self.state_revision(ENTITIES["ups_battery_ttg_minutes"]),
             soc_updated_at=self.state_updated_at(ENTITIES["ups_battery_soc"]),
-            ttg_updated_at=self.state_updated_at(ENTITIES["ups_battery_ttg_minutes"]),
         )
 
         return HardwareSnapshot(

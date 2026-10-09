@@ -23,11 +23,10 @@ from test_end_to_end_scenarios import (
 )
 
 
-def battery(fake, *, soc=70, ttg=180, discharging=True, ready=True):
+def battery(fake, *, soc=70, discharging=True, ready=True):
     fake.states.update(
         {
             ENTITIES["ups_battery_soc"]: str(soc),
-            ENTITIES["ups_battery_ttg_minutes"]: str(ttg),
             ENTITIES["ups_running_on_battery"]: "on" if discharging else "off",
             ENTITIES["ups_ready"]: "on" if ready else "off",
         }
@@ -83,7 +82,7 @@ async def on_generator(app, fake, now=3):
 
 
 async def complete_cycle(app, fake, now):
-    battery(fake, soc=80, ttg="unknown", discharging=False)
+    battery(fake, soc=80, discharging=False)
     now = await drive(app, fake, now, lambda: app.supervisor.session is None)
     battery(fake, soc=79)
     await app._tick(now)
@@ -111,17 +110,15 @@ async def test_78_wait_on_ups_has_no_hardware_commands(tmp_path):
     assert attrs["delayed_start_remaining_seconds"] == 100
 
 
-@pytest.mark.parametrize("trigger", ["soc", "ttg", "max_delay"])
+@pytest.mark.parametrize("trigger", ["soc", "max_delay"])
 @pytest.mark.asyncio
 async def test_79_81_each_start_threshold_runs_normal_transfer(tmp_path, trigger):
-    """Каждый из трёх порогов независимо завершает ожидание: низкий SoC, малый TTG или максимальная задержка. Затем проходят обычные запуск, прогрев и подтверждённый перевод дома на генератор."""
+    """Низкий SoC и максимальная задержка независимо завершают ожидание. Затем проходят штатный запуск, прогрев и подтверждённый перевод дома на генератор."""
     app, fake = setup(tmp_path)
     await wait_on_ups(app, fake)
     now = 3
     if trigger == "soc":
         battery(fake, soc=40)
-    elif trigger == "ttg":
-        battery(fake, ttg=60)
     else:
         now = 102
     await drive(
@@ -166,9 +163,6 @@ async def test_soc_delayed_start_primary_failure_falls_back_to_secondary(tmp_pat
     [
         ("ups_battery_soc", "unavailable"),
         ("ups_battery_soc", "101"),
-        ("ups_battery_ttg_minutes", "unknown"),
-        ("ups_battery_ttg_minutes", "inf"),
-        ("ups_running_on_battery", "unavailable"),
         ("ups_ready", "unknown"),
         ("ups_ready", "off"),
     ],
@@ -246,12 +240,12 @@ async def test_86_target_releases_load_then_cools_and_stops(tmp_path):
     assert all(fake.pending_seen_before_hardware)
 
 
-@pytest.mark.parametrize("trigger", ["soc", "ttg", "max_delay"])
+@pytest.mark.parametrize("trigger", ["soc", "max_delay"])
 @pytest.mark.asyncio
 async def test_87_next_cycle_waits_even_without_initial_delayed_start(
     tmp_path, trigger
 ):
-    """Cycling работает независимо от задержки первого запуска. После остановки новый интервал UPS не вызывает немедленного перезапуска; следующий цикл начинается по одному из тех же трёх порогов."""
+    """Cycling работает независимо от задержки первого запуска. После остановки новый интервал UPS не вызывает немедленного перезапуска; следующий цикл начинается по SoC или максимальному времени ожидания."""
     app, fake = setup(tmp_path, delayed_generator_start_enabled=False)
     now = await on_generator(app, fake)
     now = await complete_cycle(app, fake, now)
@@ -259,8 +253,6 @@ async def test_87_next_cycle_waits_even_without_initial_delayed_start(
     assert fake.states[ENTITIES["generator_a_remote"]] == "off"
     if trigger == "soc":
         battery(fake, soc=40)
-    elif trigger == "ttg":
-        battery(fake, ttg=60)
     else:
         now = wait_start + 100
     await drive(
@@ -274,6 +266,27 @@ async def test_87_next_cycle_waits_even_without_initial_delayed_start(
         )
         == 2
     )
+
+
+@pytest.mark.asyncio
+async def test_post_cycle_does_not_restart_after_30_minutes_with_healthy_soc(tmp_path):
+    """После завершения подзарядки даже TTG в 21 минуту не запускает генератор повторно через полчаса. При свежем SoC выше Start и неистёкшем Max Delay дом остаётся на UPS."""
+    app, fake = setup(tmp_path, generator_max_start_delay_hours=6)
+    now = await on_generator(app, fake)
+    now = await complete_cycle(app, fake, now)
+    fake.states["sensor.ups_battery_time_remaining_minutes_ttg"] = "21"
+    fake.states[ENTITIES["ups_battery_soc"]] = "78"
+    await app._tick(now + 1800)
+    assert app.supervisor.session is None
+    assert app.ups_run.state == UPSRunState.WAITING_ON_UPS
+
+
+@pytest.mark.asyncio
+async def test_old_ttg_option_does_not_affect_configuration(tmp_path):
+    """Сохранённый параметр старой версии игнорируется при обновлении АВР. Настройки SoC и максимального ожидания продолжают работать."""
+    app, fake = setup(tmp_path, generator_min_ttg_before_start=60)
+    assert "generator_min_ttg_before_start" not in app.options
+    await wait_on_ups(app, fake)
 
 
 @pytest.mark.asyncio
@@ -445,28 +458,28 @@ async def test_manual_override_after_cycle_engine_stopped_restarts_same_generato
 
 @pytest.mark.parametrize("discharging", [True, False])
 @pytest.mark.asyncio
-async def test_stale_soc_cannot_be_masked_by_new_ttg(tmp_path, discharging):
-    """Обновляющийся TTG не делает зависший SoC достоверным. Устаревший SoC прекращает ожидание и при разряде, и при заявленном режиме зарядки/поддержания."""
+async def test_stale_soc_fails_safe_regardless_of_discharge_mode(tmp_path, discharging):
+    """Устаревший SoC прекращает ожидание независимо от состояния сигнала разряда. Диагностический режим батареи не подменяет требование к свежести SoC."""
     app, fake = setup(tmp_path)
     app.ups_run.config = replace(app.ups_run.config, telemetry_stale_time=3)
     battery(fake, discharging=discharging)
     await wait_on_ups(app, fake)
-    fake.states[ENTITIES["ups_battery_ttg_minutes"]] = "170"
+    fake.states[ENTITIES["ups_running_on_battery"]] = "off" if discharging else "on"
     await app._tick(4)
     assert app.supervisor.session is not None
     assert "SoC" in app.ups_run.last_reason
 
 
 @pytest.mark.asyncio
-async def test_stale_ttg_cannot_be_masked_by_new_soc(tmp_path):
-    """Свежий SoC не скрывает остановившийся TTG во время разряда. Без достоверного прогноза времени работы ожидание прекращается штатным запуском."""
+async def test_fresh_soc_keeps_waiting_without_ttg(tmp_path):
+    """Обновление SoC при достаточном заряде позволяет ждать без данных TTG. Никакого досрочного запуска не происходит."""
     app, fake = setup(tmp_path)
     app.ups_run.config = replace(app.ups_run.config, telemetry_stale_time=3)
     await wait_on_ups(app, fake)
     fake.states[ENTITIES["ups_battery_soc"]] = "69"
     await app._tick(4)
-    assert app.supervisor.session is not None
-    assert "TTG" in app.ups_run.last_reason
+    assert app.supervisor.session is None
+    assert app.ups_run.state == UPSRunState.WAITING_ON_UPS
 
 
 @pytest.mark.asyncio
@@ -494,13 +507,19 @@ async def test_stale_target_does_not_stop_generator(tmp_path):
     assert fake.states[ENTITIES["house_generator"]] == "on"
 
 
-@pytest.mark.parametrize("ttg", ["unknown", "inf", "0"])
+@pytest.mark.parametrize("ttg", [None, "unknown", "unavailable", "inf", "0"])
 @pytest.mark.asyncio
-async def test_ttg_not_used_during_charge_or_float(tmp_path, ttg):
-    """Во время зарядки/поддержания TTG не служит порогом запуска и может быть неизвестным или бесконечным. При свежем достаточном SoC и готовой UPS система продолжает ожидать."""
+async def test_ttg_sensor_is_irrelevant_to_wait(tmp_path, ttg):
+    """При достаточном SoC любое значение TTG, включая 0 и отсутствие сенсора, не приводит к запуску. Показатель полностью исключён из наблюдений и status attributes АВР."""
     app, fake = setup(tmp_path)
-    battery(fake, ttg=ttg, discharging=False)
+    battery(fake)
+    if ttg is not None:
+        fake.states["sensor.ups_battery_time_remaining_minutes_ttg"] = ttg
     await wait_on_ups(app, fake)
+    await app._tick(3)
+    assert app.supervisor.session is None
+    assert app.ups_run.state == UPSRunState.WAITING_ON_UPS
+    assert "battery_ttg_minutes" not in fake.state_writes[-1][2]
     json.dumps(fake.state_writes[-1][2], allow_nan=False)
 
 
