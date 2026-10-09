@@ -221,7 +221,6 @@ def test_ups_target_soc_detail_does_not_duplicate_main_outcome():
             charge_cycle_enabled=True,
             start_soc=40,
             target_soc=80,
-            min_ttg_before_start=60,
             max_start_delay=3600,
             telemetry_stale_time=300,
         )
@@ -234,7 +233,6 @@ def test_ups_target_soc_detail_does_not_duplicate_main_outcome():
             core_delay_elapsed=True,
             battery=BatteryObservation(
                 soc=80,
-                ttg_minutes=None,
                 discharging=False,
                 ready=True,
                 sample_id=1,
