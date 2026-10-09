@@ -560,7 +560,7 @@ UPS Run не дублирует start/stop lifecycle generator, силовой t
 
 #### REQ-DELAY-03. Когда можно ждать в UPS_ONLY
 
-После `grid_failure_delay` ожидание разрешено только если Delayed Start включён, Grid всё ещё отсутствует, батарейные данные пригодны, нет critical battery state и пользователь не потребовал generator сейчас.
+После `grid_failure_delay` ожидание разрешено только если Delayed Start включён, Grid всё ещё отсутствует, SoC достоверен и пользователь не потребовал generator сейчас.
 
 #### REQ-DELAY-04. Условия automatic start
 
@@ -575,11 +575,11 @@ OR current_ups_wait >= generator_max_start_delay_hours
 
 #### REQ-DELAY-05. Fail-safe при плохих battery data
 
-Delayed Start является оптимизацией, а не hard dependency core ATS. Если SoC отсутствует, устарел или некорректен либо `ups_ready` неизвестен/критичен, бесконечно ждать запрещено: используется обычный safe managed generator start.
+Delayed Start является оптимизацией, а не hard dependency core ATS. Если SoC отсутствует, устарел или некорректен, бесконечно ждать запрещено: используется обычный safe managed generator start.
 
-#### REQ-DELAY-06. Critical battery немедленно отменяет ожидание
+#### REQ-DELAY-06. Производный `ups_ready` не влияет на решения UPS Run
 
-Critical battery state требует начать обычный generator start без ожидания SoC/max-delay, если запуск не запрещён более высоким safety-state.
+`binary_sensor.ups_ready` в HA определяется условием SoC > 10% и не является независимым источником защиты. Его значение `OFF`, `UNKNOWN` или отсутствие не должны создавать дополнительный запуск генератора, запрещать ожидание на UPS или блокировать штатную остановку cycle-owned сессии по достоверному Target SoC. Независимые аппаратные защиты МАП остаются вне области управления UPS Run.
 
 #### REQ-DELAY-07. TTG не используется для автоматического запуска
 
@@ -645,10 +645,10 @@ generator_max_start_delay_hours = 6 h
 
 - `TC-UPS-01` (legacy #78) — при достаточном battery reserve после `grid_failure_delay` EnergyATS остаётся в `UPS_ONLY`, generator не стартует.
 - `TC-UPS-02` (legacy #79) — достижение Start SoC начинает обычный managed generator start.
-- `TC-UPS-03` (legacy #80) — низкий/недостоверный/отсутствующий TTG не вызывает запуск при достаточном SoC и готовности UPS.
+- `TC-UPS-03` (legacy #80) — низкий/недостоверный/отсутствующий TTG не вызывает запуск при достаточном достоверном SoC.
 - `TC-UPS-04` (legacy #81) — истечение max UPS wait запускает generator даже при достаточном SoC.
 - `TC-UPS-05` (legacy #82) — потеря достоверности обязательных battery data прекращает Delayed Start fail-safe запуском generator.
-- `TC-UPS-06` (legacy #83) — critical battery немедленно отменяет автоматическое ожидание.
+- `TC-UPS-06` (legacy #83) — `ups_ready=OFF/UNKNOWN` либо отсутствие этого HA-флага не запускает генератор при достаточном SoC и не запрещает остановку цикла по Target SoC.
 - `TC-UPS-07` (legacy #84) — stable Grid restore во время UPS wait предотвращает ненужный generator start.
 - `TC-UPS-08` (legacy #85) — manual reserve request во время UPS wait начинает generator без дальнейшей delayed pause.
 - `TC-UPS-09` (legacy #86) — cycle-owned session на Target SoC безопасно возвращает дом в `UPS_ONLY` и штатно останавливает generator.

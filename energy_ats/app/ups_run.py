@@ -73,7 +73,6 @@ class UPSRunConfig:
 class BatteryObservation:
     soc: float | None
     discharging: bool | None
-    ready: bool | None
     sample_id: Hashable | None = None
     soc_updated_at: float | None = None
 
@@ -351,10 +350,9 @@ class UPSRun:
         if (
             not _valid_soc(soc)
             or self._telemetry_stale(o.now, o.battery.soc_updated_at)
-            or o.battery.ready is not True
         ):
             reason = (
-                "Данные уровня заряда или готовности UPS недостоверны; "
+                "Данные уровня заряда UPS недостоверны; "
                 "автоматическая остановка по уровню заряда запрещена."
             )
             self.state = UPSRunState.DEGRADED
@@ -412,10 +410,6 @@ class UPSRun:
 
     def _battery_problem(self, o: UPSRunObservation) -> str | None:
         b = o.battery
-        if b.ready is False:
-            return "UPS/Battery сообщает критическое состояние."
-        if b.ready is None:
-            return "состояние готовности UPS/Battery неизвестно."
         if not _valid_soc(b.soc):
             return "SoC батареи недоступен или некорректен."
         if self._telemetry_stale(o.now, b.soc_updated_at):
@@ -484,7 +478,6 @@ class UPSRun:
             "delayed_start_reason": self.last_reason,
             "battery_soc": battery.soc if _valid_soc(battery.soc) else None,
             "battery_discharging": battery.discharging,
-            "battery_ready": battery.ready,
             "generator_start_soc": self.config.start_soc,
             "generator_target_charge_soc": self.config.target_soc,
             "delayed_start_elapsed_seconds": elapsed,

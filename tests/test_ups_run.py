@@ -23,8 +23,8 @@ def cfg(**overrides):
     return UPSRunConfig(**values)
 
 
-def battery(soc=70, *, discharging=True, ready=True, sample=1):
-    return BatteryObservation(soc, discharging, ready, sample)
+def battery(soc=70, *, discharging=True, sample=1):
+    return BatteryObservation(soc, discharging, sample)
 
 
 def obs(
@@ -102,8 +102,8 @@ def test_max_wait_requires_generator():
     [
         battery(soc=None),
         battery(soc=101),
-        battery(ready=None),
-        battery(ready=False),
+        battery(soc=-1),
+        battery(soc=float('nan')),
     ],
 )
 def test_bad_required_battery_data_fails_safe_to_generator(bad_battery):
@@ -268,6 +268,7 @@ def test_status_exposes_wait_and_battery_information():
     assert attrs["charge_cycle_state"] == "waiting_on_ups"
     assert attrs["battery_soc"] == 71
     assert "battery_ttg_minutes" not in attrs
+    assert "battery_ready" not in attrs
     assert attrs["delayed_start_elapsed_seconds"] == 30
     assert attrs["delayed_start_remaining_seconds"] == 70
 

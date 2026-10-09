@@ -35,8 +35,8 @@ def _ups_config(**overrides):
     return UPSRunConfig(**values)
 
 
-def _battery(soc=70, *, discharging=True, ready=True, sample=1):
-    return BatteryObservation(soc, discharging, ready, sample)
+def _battery(soc=70, *, discharging=True, sample=1):
+    return BatteryObservation(soc, discharging, sample)
 
 
 def _ups_obs(

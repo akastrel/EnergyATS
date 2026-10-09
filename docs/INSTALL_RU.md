@@ -155,7 +155,6 @@ generator_max_start_delay_hours = 6 h
 
 ```text
 sensor.ups_battery_charge_level_soc
-binary_sensor.ups_ready
 ```
 
 Дополнительный `binary_sensor.ups_running_on_battery` отображает режим разряда для диагностики, но не участвует в принятии решения о запуске.
@@ -163,10 +162,9 @@ binary_sensor.ups_ready
 Проверьте, что:
 
 - SoC — число 0–100;
-- `ups_ready` отражает возможность продолжать работу от АКБ, включая critical state;
-- sensors действительно обновляются, а не остаются бесконечно со старым значением.
+- SoC действительно обновляется, а не остаётся бесконечно со старым значением.
 
-При invalid/stale telemetry Delayed Start fail-safe прекращается и используется обычный generator start. Эти inputs не являются hard dependency core ATS.
+При invalid/stale SoC Delayed Start fail-safe прекращается и используется обычный generator start. Сообщаемый HA флаг `binary_sensor.ups_ready` от SoC > 10% не нужен для UPS Run и может оставаться информационным. Эти inputs не являются hard dependency core ATS.
 
 Нормативные правила находятся в разделе **UPS Run** `REQUIREMENTS_RU.md`.
 

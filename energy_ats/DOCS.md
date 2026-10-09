@@ -194,12 +194,11 @@ Manual request отменяет automatic Target stop для текущей sess
 
 ```text
 sensor.ups_battery_charge_level_soc
-binary_sensor.ups_ready
 ```
 
 Это soft dependencies core ATS. `binary_sensor.ups_running_on_battery` используется только для диагностики и не блокирует ожидание. Если UPS Run выключен, батарейные данные не влияют на обычный ATS.
 
-Если UPS Run включён, недоступный/устаревший SoC или неизвестная/критическая готовность UPS прекращают ожидание и вызывают обычный безопасный generator start.
+Если UPS Run включён, недоступный, некорректный или устаревший SoC прекращает ожидание и вызывает обычный безопасный generator start. Внешний `binary_sensor.ups_ready` (логический порог SoC 10%) не участвует в управлении АВР.
 
 ## 7. Scheduled Exercise
 

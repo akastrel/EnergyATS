@@ -717,7 +717,7 @@ Core status attributes включают source/phase/generator/model/managed/bus
 
 Exercise публикует для A/B due/history/forced-warning/active/result state. Общая история генераторов добавляет totals и последний фактический запуск без публикации полного bounded history в HA attributes.
 
-UPS Run публикует как минимум enabled state, battery SoC/readiness validity, current UPS wait, reason и cycle ownership/thresholds.
+UPS Run публикует как минимум enabled state, battery SoC validity, current UPS wait, reason и cycle ownership/thresholds.
 
 Load Manager публикует enabled/phase, degraded reason, measured power, active owner limits, G1/G2 state/ownership, overload timers, restore retry и last reason.
 

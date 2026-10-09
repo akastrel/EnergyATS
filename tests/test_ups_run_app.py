@@ -23,12 +23,11 @@ from test_end_to_end_scenarios import (
 )
 
 
-def battery(fake, *, soc=70, discharging=True, ready=True):
+def battery(fake, *, soc=70, discharging=True):
     fake.states.update(
         {
             ENTITIES["ups_battery_soc"]: str(soc),
             ENTITIES["ups_running_on_battery"]: "on" if discharging else "off",
-            ENTITIES["ups_ready"]: "on" if ready else "off",
         }
     )
 
@@ -163,21 +162,45 @@ async def test_soc_delayed_start_primary_failure_falls_back_to_secondary(tmp_pat
     [
         ("ups_battery_soc", "unavailable"),
         ("ups_battery_soc", "101"),
-        ("ups_ready", "unknown"),
-        ("ups_ready", "off"),
     ],
 )
 @pytest.mark.asyncio
-async def test_82_83_invalid_or_critical_battery_starts_fail_safe(
+async def test_invalid_battery_soc_starts_fail_safe(
     tmp_path, entity, value
 ):
-    """Потеря необходимого батарейного сигнала или критическое состояние немедленно прекращает уже начатое ожидание. Core ATS остаётся работоспособным и запускает обычную автоматическую сессию."""
+    """Недостоверное значение SoC прекращает ожидание и запускает обычную автоматическую сессию. Core ATS при этом остаётся работоспособным."""
     app, fake = setup(tmp_path)
     await wait_on_ups(app, fake)
     fake.states[ENTITIES[entity]] = value
     await app._tick(3)
     assert app.supervisor.session is not None
     assert app.supervisor.phase == SupervisorPhase.STARTING_GENERATOR
+
+
+@pytest.mark.parametrize("ready", [None, "off", "unknown", "unavailable"])
+@pytest.mark.asyncio
+async def test_ups_ready_does_not_trigger_start(tmp_path, ready):
+    """Внешний индикатор ups_ready не является входом UPS Run. Его отсутствие, OFF или UNKNOWN не запускают генератор при достоверном достаточном SoC."""
+    app, fake = setup(tmp_path)
+    if ready is not None:
+        fake.states["binary_sensor.ups_ready"] = ready
+    await wait_on_ups(app, fake)
+    await app._tick(3)
+    assert app.supervisor.session is None
+    assert app.ups_run.state == UPSRunState.WAITING_ON_UPS
+    assert "battery_ready" not in fake.state_writes[-1][2]
+
+
+@pytest.mark.asyncio
+async def test_ups_ready_does_not_block_target_stop(tmp_path):
+    """Индикатор ups_ready=OFF не запрещает завершить собственный цикл зарядки, если SoC актуален и достиг Target. Аппаратный порядок остановки остаётся под контролем Supervisor."""
+    app, fake = setup(tmp_path)
+    now = await on_generator(app, fake)
+    battery(fake, soc=80, discharging=False)
+    fake.states["binary_sensor.ups_ready"] = "off"
+    await app._tick(now)
+    assert app.ups_run.state == UPSRunState.TARGET_REACHED
+    assert ("turn_off", ENTITIES["source_generator"]) in switch_calls(fake)
 
 
 @pytest.mark.asyncio
@@ -525,10 +548,10 @@ async def test_ttg_sensor_is_irrelevant_to_wait(tmp_path, ttg):
 
 @pytest.mark.parametrize("blocked", ["emergency", "disarmed", "automatic_off"])
 @pytest.mark.asyncio
-async def test_critical_battery_does_not_override_control_blocks(tmp_path, blocked):
-    """Критическая батарея отменяет экономию топлива, но не даёт права обойти E-stop, DISARMED или выключенную автоматику. В каждом таком режиме новых аппаратных команд запуска нет."""
+async def test_low_soc_does_not_override_control_blocks(tmp_path, blocked):
+    """Низкий SoC отменяет ожидание, но не даёт права обойти E-stop, DISARMED или выключенную автоматику. В каждом таком режиме новых аппаратных команд запуска нет."""
     app, fake = setup(tmp_path, armed=blocked != "disarmed")
-    battery(fake, soc=20, ready=False)
+    battery(fake, soc=20)
     if blocked == "emergency":
         fake.states[ENTITIES["emergency_stop"]] = "on"
     if blocked == "automatic_off":

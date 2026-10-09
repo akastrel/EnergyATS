@@ -234,7 +234,6 @@ def test_ups_target_soc_detail_does_not_duplicate_main_outcome():
             battery=BatteryObservation(
                 soc=80,
                 discharging=False,
-                ready=True,
                 sample_id=1,
             ),
             session_reason=SessionReason.GRID_OUTAGE,

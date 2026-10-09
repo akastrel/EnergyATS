@@ -66,11 +66,10 @@ ENTITIES = {
     "generator_frequency": "sensor.generator_frequency",
     "load_g1": "switch.non_critical_loads_first_floor",
     "load_g2": "switch.non_critical_loads_basement_floor",
-    # Battery inputs UPS Run. Это soft dependencies: отсутствие любого из них
-    # не должно блокировать core ATS.
+    # Battery inputs UPS Run: SoC для решений; режим разряда — диагностика.
+    # Отсутствие этих soft dependencies не блокирует core ATS.
     "ups_battery_soc": "sensor.ups_battery_charge_level_soc",
     "ups_running_on_battery": "binary_sensor.ups_running_on_battery",
-    "ups_ready": "binary_sensor.ups_ready",
 }
 
 ENERGY_ATS_LOG_ENTITY = "update.energy_ats_update"
@@ -265,7 +264,6 @@ class HomeAssistantAdapter:
         battery = BatteryObservation(
             soc=self.float_state(ENTITIES["ups_battery_soc"]),
             discharging=self.bool_state(ENTITIES["ups_running_on_battery"]),
-            ready=self.bool_state(ENTITIES["ups_ready"]),
             sample_id=self.state_revision(ENTITIES["ups_battery_soc"]),
             soc_updated_at=self.state_updated_at(ENTITIES["ups_battery_soc"]),
         )
