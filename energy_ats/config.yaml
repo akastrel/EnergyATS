@@ -20,6 +20,8 @@ options:
   armed: false
   tick_seconds: 1.0
   log_level: "info"
+  # Archive должен быть предварительно настроен в Home Assistant.
+  archive_events_enabled: false
 
   grid_failure_delay: 60
   grid_restore_stable_time: 60
@@ -69,6 +71,7 @@ schema:
   armed: bool
   tick_seconds: "float(0.2,10)"
   log_level: "list(debug|info|warning|error)"
+  archive_events_enabled: bool
 
   grid_failure_delay: "float(0,300)"
   grid_restore_stable_time: "float(0,900)"
