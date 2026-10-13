@@ -53,6 +53,7 @@ DEFAULT_OPTIONS: dict[str, Any] = {
     "armed": False,
     "tick_seconds": 1.0,
     "log_level": "info",
+    "archive_events_enabled": False,
     "grid_failure_delay": 60,
     "grid_restore_stable_time": 60,
     "generator_a_enabled": True,
@@ -100,6 +101,9 @@ class EnergySupervisorApp:
             armed=self.armed,
             logger=self.log,
             family_presence_entity=str(self.options["family_presence_entity"]),
+            archive_events_enabled=_boolean_option(
+                self.options, "archive_events_enabled"
+            ),
         )
         self.generator_controllers = {
             slot: GeneratorController(profile)
