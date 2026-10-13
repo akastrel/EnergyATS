@@ -10,6 +10,7 @@ import asyncio
 import logging
 from collections.abc import Coroutine
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Hashable
 
 from domain import EventVisibility, GeneratorSlot, GridInputState, SupervisorEvent
@@ -73,6 +74,7 @@ ENTITIES = {
 }
 
 ENERGY_ATS_LOG_ENTITY = "update.energy_ats_update"
+ENERGY_ATS_ARCHIVE_ENTITY = "notify.archive_energy_ats"
 ENERGY_ATS_STATUS_ENTITY = "sensor.energy_ats_status"
 ENERGY_ATS_HEALTH_ENTITY = "sensor.energy_ats_health"
 
@@ -128,6 +130,7 @@ class HomeAssistantAdapter:
         logger: logging.Logger | None = None,
         family_presence_entity: str | None = None,
         require_family_presence: bool = False,
+        archive_events_enabled: bool = False,
     ) -> None:
         self.client = client
         self.armed = armed
@@ -141,6 +144,7 @@ class HomeAssistantAdapter:
         # scheduled exercise включён, unknown/unavailable presence не должен
         # блокировать запуск самого ATS: Scheduler просто отложит обычный test.
         self.require_family_presence = require_family_presence
+        self.archive_events_enabled = archive_events_enabled
         # Routine Logbook/status/user publications are best-effort I/O. They
         # must not hold the 1-second control loop behind HA/network timeouts.
         # Safety-significant forced Exercise warning deliberately uses the
@@ -448,6 +452,19 @@ class HomeAssistantAdapter:
                 self._publish_event(event),
                 f"event:{event.level}",
             )
+            if self.archive_events_enabled:
+                self._schedule_publication(
+                    self._archive_record(
+                        "user_message",
+                        {
+                            "level": event.level,
+                            "visibility": event.visibility.value,
+                            "message": event.message,
+                        },
+                        datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                    ),
+                    "archive-event",
+                )
         # Дать быстрым fake/local calls выполниться, не ожидая медленный network I/O.
         await asyncio.sleep(0)
 
@@ -789,6 +806,27 @@ class HomeAssistantAdapter:
             return ENTITIES["source_generator"], "turn_on"
         return ENTITIES["source_generator"], "turn_off"
 
+    async def _archive_record(
+        self,
+        event_type: str,
+        data: dict[str, Any],
+        timestamp: str,
+    ) -> None:
+        """Best-effort запись в общий HA Archive без блокировки силового контура."""
+        try:
+            await self.client.call_service(
+                "script",
+                "archive_write",
+                service_data={
+                    "archive_entity": ENERGY_ATS_ARCHIVE_ENTITY,
+                    "event": event_type,
+                    "timestamp": timestamp,
+                    "record_data": data,
+                },
+            )
+        except Exception as exc:
+            self.log.warning("Не удалось записать событие АВР в Archive: %s", exc)
+
     async def _logbook(self, message: str, entity_id: str | None) -> None:
         service_data = {"name": "Energy ATS", "message": message}
         if entity_id is not None:
@@ -808,4 +846,13 @@ class HomeAssistantAdapter:
                 self._logbook(message, entity_id),
                 "logbook",
             )
+            if self.archive_events_enabled:
+                self._schedule_publication(
+                    self._archive_record(
+                        "hardware_command",
+                        {"message": message, "entity_id": entity_id},
+                        datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                    ),
+                    "archive-command",
+                )
         await asyncio.sleep(0)
