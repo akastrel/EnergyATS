@@ -106,6 +106,20 @@ Load Manager снимает некритичные нагрузки перед g
 
 App log является полным последовательным журналом: он содержит MAIN/DETAIL events, аппаратные команды и отправляемые пользовательские сообщения. Основной поток Home Assistant Logbook содержит только существенные MAIN events и не использует отдельную DETAIL-сущность.
 
+### Долговременный журнал через HA Archive
+
+Опциональный параметр App `archive_events_enabled` (по умолчанию `false`) дублирует MAIN/DETAIL пользовательские события и успешно отправленные аппаратные команды в универсальную подсистему Archive Home Assistant. Работа АВР и существующие App log / Logbook не зависят от Archive.
+
+Для включения сначала настройте в Home Assistant:
+
+1. Существующий скрипт `script.archive_write` с аргументами `archive_entity`, `event`, `timestamp`, `record_data`.
+2. File notify-сущность `notify.archive_energy_ats` с файлом `/config/archive/data/energy_ats.jsonl` (Timestamp выключен), по образцу существующих Archive-журналов.
+3. После проверки тестовой записи включите `archive_events_enabled: true` в настройках App.
+
+Каждая запись создаётся в формате Archive v1: `schema_version`, `timestamp` (UTC), `event` (`user_message` или `hardware_command`) и `data`. Для сообщений `data` содержит `level`, `visibility` (`main/detail`), `message`; для команд — `message`, `entity_id`.
+
+Запись выполняется асинхронно в отдельной background-задаче и **не задерживает силовые действия**. Это best-effort доставка: при недоступном HA/Archive или перезапуске App незаписанные события могут быть потеряны, а ошибка попадёт в App log. У этой интеграции нет собственного постоянного буфера и повторной отправки; не используйте Archive v1 как гарантированный аудит всех событий аварии.
+
 ## Управление
 
 Поддерживаются команды App:
