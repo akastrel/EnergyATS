@@ -384,3 +384,72 @@ async def test_adapter_logs_every_event_but_publishes_only_main_to_ha_logbook(ca
     ]
     assert "Основное" in caplog.messages
     assert "Подробное" in caplog.messages
+
+
+@pytest.mark.asyncio
+async def test_archive_writes_main_detail_and_commands_without_changing_logbook():
+    fake = FakeClient()
+    adapter = HomeAssistantAdapter(fake, armed=True, archive_events_enabled=True)
+    await adapter.publish_events(
+        (
+            SupervisorEvent("warning", "Основное"),
+            SupervisorEvent("info", "Подробное", EventVisibility.DETAIL),
+        )
+    )
+    await adapter._publish_log_entries([("Команда", "switch.grid_power")])
+
+    archive_calls = [
+        data for domain, service, data in fake.calls
+        if (domain, service) == ("script", "archive_write")
+    ]
+    assert len(archive_calls) == 3
+    assert [item["event"] for item in archive_calls] == [
+        "user_message", "user_message", "hardware_command"
+    ]
+    assert all(item["archive_entity"] == "notify.archive_energy_ats" for item in archive_calls)
+    assert all(datetime.fromisoformat(item["timestamp"]).tzinfo for item in archive_calls)
+    assert archive_calls[0]["record_data"] == {
+        "level": "warning", "visibility": "main", "message": "Основное"
+    }
+    assert archive_calls[1]["record_data"] == {
+        "level": "info", "visibility": "detail", "message": "Подробное"
+    }
+    assert archive_calls[2]["record_data"] == {
+        "message": "Команда", "entity_id": "switch.grid_power"
+    }
+    logbook_calls = [
+        data for domain, service, data in fake.calls
+        if (domain, service) == ("logbook", "log")
+    ]
+    assert [item["message"] for item in logbook_calls] == ["Основное", "Команда"]
+
+
+@pytest.mark.asyncio
+async def test_archive_disabled_by_default():
+    fake = FakeClient()
+    adapter = HomeAssistantAdapter(fake, armed=True)
+    await adapter.publish_events((SupervisorEvent("info", "Основное"),))
+    await adapter._publish_log_entries([("Команда", "switch.grid_power")])
+    assert not any(
+        domain == "script" and service == "archive_write"
+        for domain, service, _data in fake.calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_archive_failure_does_not_prevent_logbook_or_raise(caplog):
+    class FailingArchiveClient(FakeClient):
+        async def call_service(self, domain, service, *, service_data=None):
+            if (domain, service) == ("script", "archive_write"):
+                raise RuntimeError("archive unavailable")
+            await super().call_service(domain, service, service_data=service_data)
+
+    fake = FailingArchiveClient()
+    adapter = HomeAssistantAdapter(fake, armed=True, archive_events_enabled=True)
+    with caplog.at_level(logging.WARNING):
+        await adapter.publish_events((SupervisorEvent("warning", "Основное"),))
+    assert any("Не удалось записать событие АВР в Archive" in s for s in caplog.messages)
+    assert any(
+        domain == "logbook" and service == "log" and data["message"] == "Основное"
+        for domain, service, data in fake.calls
+    )
