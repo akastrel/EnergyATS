@@ -37,7 +37,6 @@ class UPSRunConfig:
     start_soc: float = 40.0
     target_soc: float = 80.0
     max_start_delay: float = 6 * 60 * 60
-    telemetry_stale_time: float = 300.0
 
     @property
     def validation_error(self) -> str | None:
@@ -45,7 +44,6 @@ class UPSRunConfig:
             self.start_soc,
             self.target_soc,
             self.max_start_delay,
-            self.telemetry_stale_time,
         )
         if not all(math.isfinite(value) for value in values):
             return "один из числовых параметров не является конечным числом."
@@ -60,8 +58,6 @@ class UPSRunConfig:
             )
         if self.max_start_delay < 0:
             return "максимальное время ожидания на UPS не может быть отрицательным."
-        if self.telemetry_stale_time <= 0:
-            return "допустимый возраст телеметрии должен быть больше нуля."
         return None
 
     @property
@@ -115,9 +111,6 @@ class UPSRun:
         self.post_cycle_wait = False
         self.last_reason: str | None = None
 
-        # При restart используем timestamps SoC из HA cache.
-        self._last_sample_id: Hashable | None = None
-        self._last_sample_at: float | None = None
         self._last_event_key: str | None = None
 
     @property
@@ -136,7 +129,6 @@ class UPSRun:
 
     def step(self, o: UPSRunObservation) -> UPSRunDecision:
         events: list[SupervisorEvent] = []
-        self._observe_sample(o.now, o.battery.sample_id)
 
         # Ошибка конфигурации должна быть видна сразу после запуска App, а не
         # впервые во время реального отключения сети. Это локальная деградация
@@ -347,10 +339,7 @@ class UPSRun:
             return UPSRunDecision(reason=self.last_reason)
 
         soc = o.battery.soc
-        if (
-            not _valid_soc(soc)
-            or self._telemetry_stale(o.now, o.battery.soc_updated_at)
-        ):
+        if not _valid_soc(soc):
             reason = (
                 "Данные уровня заряда UPS недостоверны; "
                 "автоматическая остановка по уровню заряда запрещена."
@@ -412,34 +401,7 @@ class UPSRun:
         b = o.battery
         if not _valid_soc(b.soc):
             return "SoC батареи недоступен или некорректен."
-        if self._telemetry_stale(o.now, b.soc_updated_at):
-            return "телеметрия SoC батареи устарела."
         return None
-
-    def _observe_sample(self, now: float, sample_id: Hashable | None) -> None:
-        if sample_id is None:
-            return
-        if sample_id != self._last_sample_id:
-            self._last_sample_id = sample_id
-            self._last_sample_at = now
-
-    def _telemetry_stale(self, now: float, updated_at: float | None = None) -> bool:
-        return self._stale(now, self._last_sample_at, updated_at)
-
-    def _stale(
-        self, now: float, observed_at: float | None, updated_at: float | None
-    ) -> bool:
-        return (
-            observed_at is None
-            or now - observed_at > self.config.telemetry_stale_time
-            or (
-                updated_at is not None
-                and (
-                    not math.isfinite(updated_at)
-                    or now - updated_at > self.config.telemetry_stale_time
-                )
-            )
-        )
 
     def _reset_wait(self) -> None:
         self.waiting_since = None
