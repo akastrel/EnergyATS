@@ -17,7 +17,6 @@ def cfg(**overrides):
         "start_soc": 40,
         "target_soc": 80,
         "max_start_delay": 3600,
-        "telemetry_stale_time": 300,
     }
     values.update(overrides)
     return UPSRunConfig(**values)
@@ -120,20 +119,16 @@ def test_discharge_status_is_not_required_for_wait():
     assert d.defer_automatic_start
 
 
-def test_stale_telemetry_fails_safe_while_discharging():
-    p = UPSRun(cfg(telemetry_stale_time=10))
-    assert p.step(obs(0, b=battery(sample=5))).defer_automatic_start
-    d = p.step(obs(11, b=battery(sample=5)))
-    assert not d.defer_automatic_start
-    assert "устарела" in (d.reason or "")
+def test_unchanged_valid_soc_is_not_misclassified_as_stale():
+    """Стабильный SoC может не менять HA state часами и остаётся достоверным."""
+    p = UPSRun(cfg(max_start_delay=3600))
+    assert p.step(obs(0, b=battery(99, sample=5))).defer_automatic_start
 
+    d = p.step(obs(600, b=battery(99, sample=5)))
 
-def test_fresh_sample_extends_telemetry_freshness():
-    p = UPSRun(cfg(telemetry_stale_time=10))
-    p.step(obs(0, b=battery(sample=5)))
-    d = p.step(obs(9, b=battery(sample=6)))
     assert d.defer_automatic_start
-    assert p.step(obs(18, b=battery(sample=6))).defer_automatic_start
+    assert p.state == UPSRunState.WAITING_ON_UPS
+    assert d.reason == "UPS продолжает питать критическую линию."
 
 
 def test_grid_return_cancels_wait():
