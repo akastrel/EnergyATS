@@ -37,6 +37,10 @@ class UPSRunConfig:
     start_soc: float = 40.0
     target_soc: float = 80.0
     max_start_delay: float = 6 * 60 * 60
+    # Legacy internal parameter retained for compatibility with older tests/callers.
+    # HA cannot prove freshness from the age of an unchanged numeric state, so
+    # this value is intentionally not used for UPS Run decisions.
+    telemetry_stale_time: float = 300.0
 
     @property
     def validation_error(self) -> str | None:
