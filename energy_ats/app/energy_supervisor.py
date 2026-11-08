@@ -555,9 +555,11 @@ class EnergySupervisor:
         if ordinary_new_outage and claim_new_outage_session:
             self.session.cycle_owned = True
 
-        # REQ-CYCLE-07 — после штатного cycle stop следующий UPS interval
-        # начинается сразу; повторный core grid_failure_delay не требуется.
-        if cycle_completion_candidate and self.session is None and o.grid_ready is False:
+        # REQ-CYCLE-07/10 — после штатного cycle stop следующий UPS interval
+        # начинается сразу. Если Grid успела появиться во время cooldown, но ещё
+        # не прошла stable-delay, обязанность вернуть сетевой ввод всё равно
+        # сохраняется до физического подтверждения Grid supply.
+        if cycle_completion_candidate and self.session is None:
             self._begin_post_cycle_wait = True
 
         if self.phase == SupervisorPhase.RECOVERY_REQUIRED:
