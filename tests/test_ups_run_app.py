@@ -292,6 +292,66 @@ async def test_87_next_cycle_waits_even_without_initial_delayed_start(
 
 
 @pytest.mark.asyncio
+async def test_unchanged_high_soc_does_not_start_generator_after_five_minutes(tmp_path):
+    """Неизменившийся высокий SoC не является stale: HA может не менять state при стабильных 99%."""
+    app, fake = setup(tmp_path, generator_max_start_delay_hours=6)
+    battery(fake, soc=99, discharging=False)
+
+    await app._tick(0)
+    await app._tick(2)
+    await app._tick(600)
+
+    assert app.supervisor.session is None
+    assert app.ups_run.state == UPSRunState.WAITING_ON_UPS
+    assert fake.states[ENTITIES["generator_a_remote"]] == "off"
+    assert fake.states[ENTITIES["generator_b_remote"]] == "off"
+
+
+@pytest.mark.asyncio
+async def test_grid_return_during_cycle_cooldown_is_restored_after_stable_delay(tmp_path):
+    """Grid, вернувшаяся после Target stop, но до конца cooldown, не теряет обязанность reconnect."""
+    app, fake = setup(tmp_path, grid_restore_stable_time=60)
+    app.generator_controllers[GeneratorSlot.A].profile = replace(
+        app.generator_controllers[GeneratorSlot.A].profile,
+        cooldown_seconds=5,
+    )
+    now = await on_generator(app, fake)
+
+    battery(fake, soc=80, discharging=False)
+    await app._tick(now)
+    assert fake.states[ENTITIES["house_generator"]] == "off"
+    assert fake.states[ENTITIES["grid_power"]] == "off"
+
+    # Grid появляется во время cooldown, но 60-секундная выдержка ещё не прошла.
+    grid_returns(fake)
+    now = await drive(
+        app,
+        fake,
+        now + 1,
+        lambda: app.supervisor.session is None,
+    )
+
+    assert fake.states[ENTITIES["grid_power"]] == "off"
+    assert fake.states[ENTITIES["house_grid"]] == "off"
+    assert app.ups_run.post_cycle_wait is True
+    assert app.supervisor.grid_ready_since is not None
+
+    stable_at = app.supervisor.grid_ready_since + 60
+    await drive(
+        app,
+        fake,
+        stable_at,
+        lambda: fake.states[ENTITIES["house_grid"]] == "on",
+    )
+    await app._tick(stable_at + 1)
+
+    assert fake.states[ENTITIES["grid_power"]] == "on"
+    assert fake.states[ENTITIES["house_grid"]] == "on"
+    assert app.ups_run.post_cycle_wait is False
+    assert app.ups_run.state == UPSRunState.IDLE
+
+
+@pytest.mark.asyncio
 async def test_post_cycle_does_not_restart_after_30_minutes_with_healthy_soc(tmp_path):
     """После завершения подзарядки даже TTG в 21 минуту не запускает генератор повторно через полчаса. При свежем SoC выше Start и неистёкшем Max Delay дом остаётся на UPS."""
     app, fake = setup(tmp_path, generator_max_start_delay_hours=6)
