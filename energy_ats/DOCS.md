@@ -198,7 +198,7 @@ sensor.ups_battery_charge_level_soc
 
 Это soft dependencies core ATS. `binary_sensor.ups_running_on_battery` используется только для диагностики и не блокирует ожидание. Если UPS Run выключен, батарейные данные не влияют на обычный ATS.
 
-Если UPS Run включён, недоступный, некорректный или устаревший SoC прекращает ожидание и вызывает обычный безопасный generator start. Внешний `binary_sensor.ups_ready` (логический порог SoC 10%) не участвует в управлении АВР.
+Если UPS Run включён, недоступный или некорректный SoC прекращает ожидание и вызывает обычный безопасный generator start. Стабильное неизменившееся значение SoC само по себе не считается устаревшим: Home Assistant может не менять state, пока значение не меняется. Максимальное ожидание всё равно ограничено `generator_max_start_delay_hours`. Внешний `binary_sensor.ups_ready` (логический порог SoC 10%) не участвует в управлении АВР.
 
 ## 7. Scheduled Exercise
 

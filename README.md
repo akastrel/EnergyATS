@@ -110,7 +110,7 @@ OR UPS wait >= generator_max_start_delay_hours
 
 `generator_max_start_delay_hours` задаётся в часах; default — `6`. Старое сохранённое значение `generator_max_start_delay` в секундах автоматически преобразуется при обновлении.
 
-Недостоверная или stale battery telemetry отменяет экономию топлива и приводит к обычному безопасному generator start. Manual request имеет приоритет. Stable Grid имеет приоритет над Target SoC.
+Недоступный или некорректный SoC отменяет экономию топлива и приводит к обычному безопасному generator start. Неизменившийся корректный SoC не считается stale только из-за возраста значения; максимальное время ожидания всё равно ограничено `generator_max_start_delay_hours`. Manual request имеет приоритет. Stable Grid имеет приоритет над Target SoC.
 
 Нормативное поведение и все параметры находятся в [`docs/REQUIREMENTS_RU.md`](docs/REQUIREMENTS_RU.md), HA entities — в [`docs/ENTITIES_RU.md`](docs/ENTITIES_RU.md), физические проверки — в [`docs/USER_TESTS_RU.md`](docs/USER_TESTS_RU.md). Отдельного feature-документа для Delayed Start больше нет, чтобы не поддерживать вторую копию тех же правил.
 

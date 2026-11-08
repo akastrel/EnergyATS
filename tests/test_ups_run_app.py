@@ -292,6 +292,66 @@ async def test_87_next_cycle_waits_even_without_initial_delayed_start(
 
 
 @pytest.mark.asyncio
+async def test_unchanged_high_soc_does_not_start_generator_after_five_minutes(tmp_path):
+    """Неизменившийся высокий SoC не является stale: HA может не менять state при стабильных 99%."""
+    app, fake = setup(tmp_path, generator_max_start_delay_hours=6)
+    battery(fake, soc=99, discharging=False)
+
+    await app._tick(0)
+    await app._tick(2)
+    await app._tick(600)
+
+    assert app.supervisor.session is None
+    assert app.ups_run.state == UPSRunState.WAITING_ON_UPS
+    assert fake.states[ENTITIES["generator_a_remote"]] == "off"
+    assert fake.states[ENTITIES["generator_b_remote"]] == "off"
+
+
+@pytest.mark.asyncio
+async def test_grid_return_during_cycle_cooldown_is_restored_after_stable_delay(tmp_path):
+    """Grid, вернувшаяся после Target stop, но до конца cooldown, не теряет обязанность reconnect."""
+    app, fake = setup(tmp_path, grid_restore_stable_time=60)
+    app.generator_controllers[GeneratorSlot.A].profile = replace(
+        app.generator_controllers[GeneratorSlot.A].profile,
+        cooldown_seconds=5,
+    )
+    now = await on_generator(app, fake)
+
+    battery(fake, soc=80, discharging=False)
+    await app._tick(now)
+    assert fake.states[ENTITIES["house_generator"]] == "off"
+    assert fake.states[ENTITIES["grid_power"]] == "off"
+
+    # Grid появляется во время cooldown, но 60-секундная выдержка ещё не прошла.
+    grid_returns(fake)
+    now = await drive(
+        app,
+        fake,
+        now + 1,
+        lambda: app.supervisor.session is None,
+    )
+
+    assert fake.states[ENTITIES["grid_power"]] == "off"
+    assert fake.states[ENTITIES["house_grid"]] == "off"
+    assert app.ups_run.post_cycle_wait is True
+    assert app.supervisor.grid_ready_since is not None
+
+    stable_at = app.supervisor.grid_ready_since + 60
+    await drive(
+        app,
+        fake,
+        stable_at,
+        lambda: fake.states[ENTITIES["house_grid"]] == "on",
+    )
+    await app._tick(stable_at + 1)
+
+    assert fake.states[ENTITIES["grid_power"]] == "on"
+    assert fake.states[ENTITIES["house_grid"]] == "on"
+    assert app.ups_run.post_cycle_wait is False
+    assert app.ups_run.state == UPSRunState.IDLE
+
+
+@pytest.mark.asyncio
 async def test_post_cycle_does_not_restart_after_30_minutes_with_healthy_soc(tmp_path):
     """После завершения подзарядки даже TTG в 21 минуту не запускает генератор повторно через полчаса. При свежем SoC выше Start и неистёкшем Max Delay дом остаётся на UPS."""
     app, fake = setup(tmp_path, generator_max_start_delay_hours=6)
@@ -481,23 +541,23 @@ async def test_manual_override_after_cycle_engine_stopped_restarts_same_generato
 
 @pytest.mark.parametrize("discharging", [True, False])
 @pytest.mark.asyncio
-async def test_stale_soc_fails_safe_regardless_of_discharge_mode(tmp_path, discharging):
-    """Устаревший SoC прекращает ожидание независимо от состояния сигнала разряда. Диагностический режим батареи не подменяет требование к свежести SoC."""
-    app, fake = setup(tmp_path)
-    app.ups_run.config = replace(app.ups_run.config, telemetry_stale_time=3)
-    battery(fake, discharging=discharging)
+async def test_unchanged_soc_remains_usable_regardless_of_discharge_mode(
+    tmp_path, discharging
+):
+    """Диагностический флаг разряда и возраст неизменившегося SoC не создают ложный запуск."""
+    app, fake = setup(tmp_path, generator_max_start_delay_hours=6)
+    battery(fake, soc=70, discharging=discharging)
     await wait_on_ups(app, fake)
     fake.states[ENTITIES["ups_running_on_battery"]] = "off" if discharging else "on"
-    await app._tick(4)
-    assert app.supervisor.session is not None
-    assert "SoC" in app.ups_run.last_reason
+    await app._tick(600)
+    assert app.supervisor.session is None
+    assert app.ups_run.state == UPSRunState.WAITING_ON_UPS
 
 
 @pytest.mark.asyncio
-async def test_fresh_soc_keeps_waiting_without_ttg(tmp_path):
-    """Обновление SoC при достаточном заряде позволяет ждать без данных TTG. Никакого досрочного запуска не происходит."""
+async def test_changed_valid_soc_keeps_waiting_without_ttg(tmp_path):
+    """Новое корректное значение SoC выше Start также продолжает ожидание; TTG не нужен."""
     app, fake = setup(tmp_path)
-    app.ups_run.config = replace(app.ups_run.config, telemetry_stale_time=3)
     await wait_on_ups(app, fake)
     fake.states[ENTITIES["ups_battery_soc"]] = "69"
     await app._tick(4)
@@ -506,28 +566,28 @@ async def test_fresh_soc_keeps_waiting_without_ttg(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_cached_old_battery_is_not_fresh_after_restart(tmp_path):
-    """Повторное получение старого HA cache после restart не является новым измерением батареи. Устаревший timestamp SoC отменяет ожидание, даже если новый процесс только начал наблюдение."""
-    app, fake = setup(tmp_path)
+async def test_old_last_updated_after_restart_does_not_invent_stale_soc(tmp_path):
+    """Возраст последнего изменения HA state не доказывает, что стабильный SoC недостоверен."""
+    app, fake = setup(tmp_path, generator_max_start_delay_hours=6)
     await wait_on_ups(app, fake)
     app, fake = _restart_app(tmp_path, fake.states, **app.options)
     fake.get_state_updated_at = lambda entity: -400.0
     await app._tick(3)
-    assert app.supervisor.session is not None
-    assert "устарела" in app.ups_run.last_reason
+    assert app.supervisor.session is None
+    assert app.ups_run.state == UPSRunState.WAITING_ON_UPS
 
 
 @pytest.mark.asyncio
-async def test_stale_target_does_not_stop_generator(tmp_path):
-    """Старое значение SoC выше цели не даёт права снять питание дома с генератора. Только cycling становится DEGRADED; действующая ATS-сессия продолжает работу."""
+async def test_old_last_updated_does_not_block_valid_target_stop(tmp_path):
+    """Корректный SoC выше Target остаётся основанием cycle stop даже без недавнего state_changed."""
     app, fake = setup(tmp_path)
     now = await on_generator(app, fake)
     battery(fake, soc=90, discharging=False)
     fake.get_state_updated_at = lambda entity: now - 400
     await app._tick(now)
-    assert app.ups_run.state == UPSRunState.DEGRADED
-    assert app.supervisor.phase == SupervisorPhase.ON_GENERATOR
-    assert fake.states[ENTITIES["house_generator"]] == "on"
+    assert app.ups_run.state == UPSRunState.TARGET_REACHED
+    assert app.supervisor.phase == SupervisorPhase.RETURNING_TO_UPS
+    assert fake.states[ENTITIES["house_generator"]] == "off"
 
 
 @pytest.mark.parametrize("ttg", [None, "unknown", "unavailable", "inf", "0"])
