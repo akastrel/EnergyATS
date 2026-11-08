@@ -560,7 +560,9 @@ UPS Run не дублирует start/stop lifecycle generator, силовой t
 
 #### REQ-DELAY-03. Когда можно ждать в UPS_ONLY
 
-После `grid_failure_delay` ожидание разрешено только если Delayed Start включён, Grid всё ещё отсутствует, SoC достоверен и пользователь не потребовал generator сейчас.
+После `grid_failure_delay` ожидание разрешено только если Delayed Start включён, Grid всё ещё отсутствует, SoC является доступным корректным числом 0–100% и пользователь не потребовал generator сейчас.
+
+Неизменившееся числовое значение SoC само по себе **не является признаком stale telemetry**: Home Assistant может не создавать новый `state_changed`, пока значение стабильно.
 
 #### REQ-DELAY-04. Условия automatic start
 
@@ -575,7 +577,9 @@ OR current_ups_wait >= generator_max_start_delay_hours
 
 #### REQ-DELAY-05. Fail-safe при плохих battery data
 
-Delayed Start является оптимизацией, а не hard dependency core ATS. Если SoC отсутствует, устарел или некорректен, бесконечно ждать запрещено: используется обычный safe managed generator start.
+Delayed Start является оптимизацией, а не hard dependency core ATS. Если SoC отсутствует, `unknown/unavailable`, не является конечным числом или выходит за диапазон 0–100%, используется обычный safe managed generator start.
+
+Возраст последнего **изменения значения** SoC не используется как freshness criterion: стабильные 99% и зависший на 99% sensor неразличимы по одному HA state. Бесконечное ожидание при замороженном, но формально корректном значении ограничивает `generator_max_start_delay_hours`.
 
 #### REQ-DELAY-06. Производный `ups_ready` не влияет на решения UPS Run
 
@@ -631,6 +635,12 @@ Grid restore во время charge cycle использует обычный Ge
 
 SoC/outage не создают право UPS Run остановить external либо manual generator. Отдельный outage-related cleanup после Grid restore остаётся независимым правилом.
 
+#### REQ-CYCLE-10. Cycle stop сохраняет обязанность вернуть Grid
+
+Если EnergyATS по Target SoC уже снял дом с generator bus и оставил его в `UPS_ONLY`, последующее появление Grid не должно терять обязанность восстановить сетевой ввод.
+
+Если Grid появилась во время cooldown/stop, но ещё не прошла `grid_restore_stable_time`, после завершения generator session EnergyATS продолжает ждать stable Grid и затем автоматически возвращает дом на Grid. Эта обязанность существует независимо от того, была ли Grid `OFF` или уже `ON` в точный момент подтверждённой остановки двигателя.
+
 ### 7.4. Default configuration
 
 ```text
@@ -660,6 +670,8 @@ generator_max_start_delay_hours = 6 h
 - `TC-UPS-15` (legacy #92) — restart во время UPS-only wait сохраняет истёкшее время и не создаёт необоснованный немедленный start.
 - `TC-UPS-16` (legacy #93) — restart cycle-owned session сохраняет достаточную ответственность для безопасного Target stop.
 - `TC-UPS-17` (legacy #94) — restart не превращает manual/external run в cycle-owned.
+- `TC-UPS-18` — неизменившийся корректный SoC выше Start не становится ложным stale condition и не запускает generator до Start SoC/max-delay.
+- `TC-UPS-19` — Grid, появившаяся во время cooldown после Target stop, после stable-delay автоматически подключается; дом не остаётся бесконечно в `UPS_ONLY`.
 
 ---
 
